@@ -20,6 +20,11 @@ pub enum SessionError {
     Io(#[from] std::io::Error),
     #[error("pairing failed: {0}")]
     Pairing(#[from] openair_pairing::PairingError),
+    /// HTTP 470 — device requires explicit user authorization (Apple TV access control).
+    /// User must approve the connection on the device screen, or check Home app
+    /// "Speakers & TV Access" setting.
+    #[error("device requires user authorization (HTTP 470) — approve on the device screen")]
+    AuthorizationRequired,
     #[error("unexpected HTTP status {0}")]
     Http(u16),
     #[error("empty response")]
@@ -82,6 +87,7 @@ pub fn pair_and_get_info(
 fn check_status(response: &[u8], expected: u16) -> Result<(), SessionError> {
     match connection::status_code(response) {
         Some(code) if code == expected => Ok(()),
+        Some(470) => Err(SessionError::AuthorizationRequired),
         Some(code) => Err(SessionError::Http(code)),
         None => Err(SessionError::EmptyResponse),
     }

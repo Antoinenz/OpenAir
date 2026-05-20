@@ -26,20 +26,27 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    println!("\nFound {} device(s). Pairing with device [0]...\n", devices.len());
-    let dev = &devices[0];
-    let addr: SocketAddr = format!("{}:{}", dev.addr, dev.port).parse()?;
-    let device_id = dev.txt.device_id.as_deref().unwrap_or("AA:BB:CC:DD:EE:FF");
+    println!("\nFound {} device(s). Attempting pairing...\n", devices.len());
 
-    match openair_rtsp::pair_and_get_info(addr, device_id) {
-        Ok(info) => {
-            println!("GET /info succeeded ({} bytes).", info.len());
-            if let Ok(s) = std::str::from_utf8(&info) {
-                println!("{}", &s[..s.len().min(512)]);
+    for dev in &devices {
+        let addr = SocketAddr::new(dev.addr, dev.port);
+        let device_id = dev.txt.device_id.as_deref().unwrap_or("AA:BB:CC:DD:EE:FF");
+        println!("→ Trying {} @ {} ...", dev.name, addr);
+
+        match openair_rtsp::pair_and_get_info(addr, device_id) {
+            Ok(info) => {
+                println!("  ✓ GET /info succeeded ({} bytes)\n", info.len());
+                if let Ok(s) = std::str::from_utf8(&info) {
+                    println!("{}", &s[..s.len().min(512)]);
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                println!("  ✗ {}\n", e);
             }
         }
-        Err(e) => eprintln!("Error: {}", e),
     }
 
+    println!("No devices paired successfully.");
     Ok(())
 }

@@ -13,8 +13,9 @@ const RAOP_SERVICE: &str = "_raop._tcp.local.";
 
 /// Browse for AirPlay 2 receivers on the local network.
 ///
-/// Calls `on_device` for each device found during the browse window.
-/// Browses both `_airplay._tcp` and `_raop._tcp` — deduplicates by device ID.
+/// Collects all `ServiceResolved` events for the full timeout window, then
+/// emits one device per unique ID — preferring IPv4 over link-local IPv6.
+/// Browsing both `_airplay._tcp` and `_raop._tcp`.
 pub fn browse(
     timeout: Duration,
     mut on_device: impl FnMut(AirPlayDevice),
@@ -25,7 +26,8 @@ pub fn browse(
     let raop_recv = daemon.browse(RAOP_SERVICE)?;
 
     let deadline = std::time::Instant::now() + timeout;
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // key = device_id (or "addr:port") → best device seen so far
+    let mut best: HashMap<String, AirPlayDevice> = HashMap::new();
 
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -33,7 +35,6 @@ pub fn browse(
             break;
         }
 
-        // Drain both channels with a short poll interval.
         for event in airplay_recv.try_iter().chain(raop_recv.try_iter()) {
             if let Some(device) = handle_event(event) {
                 let key = device
@@ -41,13 +42,31 @@ pub fn browse(
                     .device_id
                     .clone()
                     .unwrap_or_else(|| format!("{}:{}", device.addr, device.port));
-                if seen.insert(key) {
-                    on_device(device);
+
+                let entry = best.entry(key);
+                use std::collections::hash_map::Entry;
+                match entry {
+                    Entry::Vacant(v) => { v.insert(device); }
+                    Entry::Occupied(mut o) => {
+                        // Upgrade from IPv6 to IPv4 if a better address arrives.
+                        let existing_is_v6 = matches!(o.get().addr, IpAddr::V6(_));
+                        let new_is_v4 = matches!(device.addr, IpAddr::V4(_));
+                        if existing_is_v6 && new_is_v4 {
+                            o.insert(device);
+                        }
+                    }
                 }
             }
         }
 
         std::thread::sleep(Duration::from_millis(100).min(remaining));
+    }
+
+    // Emit all collected devices, sorted by name for stable output.
+    let mut devices: Vec<AirPlayDevice> = best.into_values().collect();
+    devices.sort_by(|a, b| a.name.cmp(&b.name));
+    for device in devices {
+        on_device(device);
     }
 
     // mdns-sd v0.11 has a benign race on shutdown — ignore the error.
@@ -65,16 +84,12 @@ fn handle_event(event: ServiceEvent) -> Option<AirPlayDevice> {
             let raw_txt: HashMap<String, String> = info
                 .get_properties()
                 .iter()
-                .filter_map(|p| {
-                    let val = p.val_str().to_string();
-                    Some((p.key().to_string(), val))
-                })
+                .map(|p| (p.key().to_string(), p.val_str().to_string()))
                 .collect();
 
             let txt = AirPlayTxt::parse(&raw_txt);
 
             if !txt.features.supports_airplay_audio() {
-                // Bit 9 not set — not a valid AirPlay audio receiver.
                 debug!(name = %name, "skipping: bit 9 (SupportsAirPlayAudio) not set");
                 return None;
             }
@@ -99,9 +114,9 @@ fn handle_event(event: ServiceEvent) -> Option<AirPlayDevice> {
     }
 }
 
-/// Prefer an IPv4 address; fall back to the first address available.
-/// Link-local IPv6 (fe80::) requires a scope ID to connect, making it
-/// unsuitable as a primary address for TCP connections.
+/// Prefer IPv4; fall back to first address. Within a single resolution event,
+/// mdns-sd may return only one address — the upgrade logic in `browse` handles
+/// the cross-event case.
 fn pick_addr<'a>(addrs: impl IntoIterator<Item = &'a IpAddr>) -> Option<IpAddr> {
     let mut fallback: Option<IpAddr> = None;
     for &addr in addrs {

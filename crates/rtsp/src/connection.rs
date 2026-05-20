@@ -3,7 +3,7 @@
 /// Plaintext mode: reads/writes raw bytes.
 /// Encrypted mode: wraps each write in the ChaCha20 frame and unwraps reads.
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 use openair_crypto::ChaChaChannel;
@@ -13,19 +13,24 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct RtspConnection {
     stream: TcpStream,
+    /// Peer address — used to build the RTSP request-URI.
+    peer: SocketAddr,
     cseq: u32,
+    /// MAC-like device identifier for X-Apple-Device-ID header.
     device_id: String,
     session_id: String,
     pub encrypt: Option<(ChaChaChannel, ChaChaChannel)>, // (write, read)
 }
 
 impl RtspConnection {
-    pub fn connect(addr: impl ToSocketAddrs, device_id: &str) -> io::Result<Self> {
+    pub fn connect(addr: impl ToSocketAddrs + Copy, device_id: &str) -> io::Result<Self> {
         let stream = TcpStream::connect(addr)?;
+        let peer = stream.peer_addr()?;
         stream.set_read_timeout(Some(READ_TIMEOUT))?;
         stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
         Ok(RtspConnection {
             stream,
+            peer,
             cseq: 1,
             device_id: device_id.to_string(),
             session_id: new_session_id(),
@@ -54,8 +59,8 @@ impl RtspConnection {
         self.cseq += 1;
 
         let mut req = String::new();
-        req.push_str(&format!("{} rtsp://{}:{}{} RTSP/1.0\r\n",
-            method, self.device_id, 7000, path));
+        req.push_str(&format!("{} rtsp://{}{} RTSP/1.0\r\n",
+            method, self.peer, path));
         req.push_str(&format!("CSeq: {}\r\n", cseq));
         req.push_str("User-Agent: AirPlay/770.8.1\r\n");
         req.push_str("X-Apple-ProtocolVersion: 1\r\n");
