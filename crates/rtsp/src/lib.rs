@@ -1,2 +1,5 @@
-// Encrypted RTSP framing + binary plist negotiation.
-// Stub: implementation in Step 3.
+pub mod connection;
+pub mod session;
+
+pub use connection::RtspConnection;
+pub use session::{pair_and_get_info, SessionError};

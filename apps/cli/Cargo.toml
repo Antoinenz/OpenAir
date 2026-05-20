@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 openair-client = { path = "../../crates/client" }
 openair-discovery = { path = "../../crates/discovery" }
+openair-rtsp = { path = "../../crates/rtsp" }
 openair-core = { path = "../../crates/core" }
 tokio.workspace = true
 tracing.workspace = true

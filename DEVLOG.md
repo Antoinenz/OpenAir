@@ -4,6 +4,26 @@
 
 ---
 
+## 2026-05-20 — Session 3: pairing + rtsp crates (Steps 2–3 code complete)
+
+### What we did
+- Implemented `pairing` crate: TLV8 encoder/decoder, `TransientPairing` M1–M4 state machine, HKDF key derivation into write/read channel keys
+- Implemented `rtsp` crate: `RtspConnection` (sync TCP, plain + encrypted read/write), `pair_and_get_info` end-to-end function
+- Wired `pair_and_get_info` into `apps/cli`: discovers devices, picks first, pairs, fires encrypted GET /info
+- All unit tests pass (7 pairing, 10 crypto, 4 discovery)
+
+### Key design notes
+- **RTSP is synchronous** (blocking `TcpStream`): the pairing handshake is strictly sequential — no benefit from async here until we layer audio streaming. Async promotion in Step 4 when we need concurrent RTP + RTSP keepalives.
+- **Encrypted read**: the frame format is `uint16_le(ciphertext_len) || ciphertext || tag(16)`. We read the 2-byte header first, then read exactly `len + 16` more bytes to get the full frame.
+- **M1 includes Flags=0x00**: required for Transient mode (some receivers check for it).
+- **TLV8 fragmentation**: values >255 bytes must be split into consecutive TLVs with the same type and reassembled on decode — handled in `tlv8::encode`/`decode`.
+
+### What needs hardware verification
+- `pair_and_get_info` against Pool Room (Shairport Sync) and Living Room (Apple TV 4K)
+- Expected: encrypted GET /info returns a binary plist with device capabilities
+
+---
+
 ## 2026-05-20 — Session 2: Hardware verification + Step 2 crypto (SRP-6a, HKDF, ChaCha20)
 
 ### What we did

@@ -8,7 +8,6 @@ license.workspace = true
 [dependencies]
 openair-core = { path = "../core" }
 openair-crypto = { path = "../crypto" }
-tokio.workspace = true
-plist.workspace = true
+openair-pairing = { path = "../pairing" }
 thiserror.workspace = true
 tracing.workspace = true
