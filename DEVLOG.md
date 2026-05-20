@@ -4,6 +4,31 @@
 
 ---
 
+## 2026-05-20 — Session 2: Hardware verification + Step 2 crypto (SRP-6a, HKDF, ChaCha20)
+
+### What we did
+- Verified discovery on real hardware: Pool Room (Shairport Sync @ 192.168.1.106) and Living Room (AppleTV5,3)
+- Fixed IPv4 preference in browser (was returning fe80:: link-local first)
+- Suppressed benign mdns-sd v0.11 shutdown race error
+- Implemented `crypto` crate: SRP-6a 3072-bit, HKDF-SHA-512, ChaCha20-Poly1305 RTSP framing
+
+### Key decisions / bugs caught
+- **N_HEX was malformed**: original hex string was 3552 bits, not 3072. Root cause: copy-pasted RFC lines with inconsistent lengths (some 63, some 65 chars). Fixed by using exact 48-char rows from RFC 5054 / RFC 3526 §7 (16 rows × 48 chars = 768 hex = 3072 bits).
+- **SRP compute_m1**: `H(N) XOR H(g)` uses SHA-512 of the raw big-endian bytes of N and g respectively, not padded.
+- **ChaCha nonce**: 4 zero bytes + 8-byte little-endian counter. Both directions need independent counters; never share state between read and write channels.
+
+### What's working (10 tests)
+- `SrpGroup::rfc5054_3072()` — N is confirmed 3072 bits
+- `SrpClient::new()` — random ephemeral a in range, unique per instance
+- `hkdf::derive()` — deterministic, different info → different keys
+- `ChaChaChannel` — roundtrip, counter advancement, wrong key rejection, replay rejection
+
+### What's next
+- `pairing` crate: pair-setup M1 (POST /pair-setup with TLV8), M2–M4 (SRP challenge/response), derive RTSP keys via HKDF
+- `rtsp` crate: TCP connection, RTSP framing, encrypted GET /info
+
+---
+
 ## 2026-05-20 — Session 1: Workspace scaffold + mDNS discovery (Step 1)
 
 ### What we did
@@ -26,8 +51,15 @@
 - `apps/cli` wired up: `cargo run -p openair-cli` scans for 5s and prints found devices
 - 4 unit tests pass (feature parse, TXT parse)
 
-### What's not working / TODO
-- No hardware test yet — needs a real AirPlay device on the LAN to verify
+### Hardware test results (2026-05-20)
+- **Pool Room** (Shairport Sync @ 192.168.1.106:7000) — discovered correctly; PTP=true, AAC, Transient
+- **Living Room** (AppleTV5,3) — discovered correctly; PTP=true, AAC, Transient
+- IPv4 preference fix applied: devices were initially resolving to fe80:: link-local, now correctly picks IPv4
+- mdns-sd v0.11 shutdown race suppressed (benign, log was `ERROR mdns_sd::service_daemon: exit: failed to send response`)
+
+### Known issues / observations
+- Both devices report `transient=true` — Transient pairing is the right target for Step 2
+- Apple TV 4K also accepts Normal pairing (Step 7), but Transient first
 
 ### Protocol notes
 - Feature bits are transmitted as `0xLOWER,0xUPPER` hex strings in the `features` TXT key.

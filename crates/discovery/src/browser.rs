@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::time::Duration;
 
 use mdns_sd::{ServiceDaemon, ServiceEvent};
@@ -49,14 +50,15 @@ pub fn browse(
         std::thread::sleep(Duration::from_millis(100).min(remaining));
     }
 
-    daemon.shutdown()?;
+    // mdns-sd v0.11 has a benign race on shutdown — ignore the error.
+    let _ = daemon.shutdown();
     Ok(())
 }
 
 fn handle_event(event: ServiceEvent) -> Option<AirPlayDevice> {
     match event {
         ServiceEvent::ServiceResolved(info) => {
-            let addr = *info.get_addresses().iter().next()?;
+            let addr = pick_addr(info.get_addresses())?;
             let port = info.get_port();
             let name = info.get_fullname().to_string();
 
@@ -95,4 +97,20 @@ fn handle_event(event: ServiceEvent) -> Option<AirPlayDevice> {
         }
         _ => None,
     }
+}
+
+/// Prefer an IPv4 address; fall back to the first address available.
+/// Link-local IPv6 (fe80::) requires a scope ID to connect, making it
+/// unsuitable as a primary address for TCP connections.
+fn pick_addr<'a>(addrs: impl IntoIterator<Item = &'a IpAddr>) -> Option<IpAddr> {
+    let mut fallback: Option<IpAddr> = None;
+    for &addr in addrs {
+        if matches!(addr, IpAddr::V4(_)) {
+            return Some(addr);
+        }
+        if fallback.is_none() {
+            fallback = Some(addr);
+        }
+    }
+    fallback
 }
