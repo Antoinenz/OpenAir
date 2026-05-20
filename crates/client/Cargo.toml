@@ -1,0 +1,20 @@
+[package]
+name = "openair-client"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+openair-core = { path = "../core" }
+openair-discovery = { path = "../discovery" }
+openair-pairing = { path = "../pairing" }
+openair-rtsp = { path = "../rtsp" }
+openair-audio-codec = { path = "../audio-codec" }
+openair-audio-rtp = { path = "../audio-rtp" }
+openair-timing = { path = "../timing" }
+openair-capture = { path = "../capture" }
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+async-trait.workspace = true

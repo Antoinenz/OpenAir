@@ -1,0 +1,12 @@
+[package]
+name = "openair-timing"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+openair-core = { path = "../core" }
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

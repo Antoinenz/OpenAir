@@ -1,0 +1,17 @@
+[package]
+name = "openair-ptp-helper"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "openair-ptp-helper"
+path = "src/main.rs"
+
+[dependencies]
+openair-core = { path = "../core" }
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

@@ -1,0 +1,14 @@
+[package]
+name = "openair-audio-rtp"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+openair-core = { path = "../core" }
+openair-crypto = { path = "../crypto" }
+openair-audio-codec = { path = "../audio-codec" }
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

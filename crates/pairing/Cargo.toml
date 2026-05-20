@@ -1,0 +1,13 @@
+[package]
+name = "openair-pairing"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+openair-core = { path = "../core" }
+openair-crypto = { path = "../crypto" }
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

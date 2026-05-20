@@ -1,0 +1,13 @@
+[package]
+name = "openair-audio-codec"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+openair-core = { path = "../core" }
+thiserror.workspace = true
+
+[build-dependencies]
+# cc will be added here when we vendor FDK-AAC / ALAC C sources
