@@ -7,8 +7,8 @@
 | # | Phase | Status | Notes |
 |---|-------|--------|-------|
 | 1 | mDNS discovery + TXT feature-bit parsing | ✅ Done | 4 unit tests pass; verified on LAN (Shairport Sync + Apple TV 4K) |
-| 2 | HomeKit Transient pairing (SRP-6a, PIN "3939") | ✅ Done | TLV8, M1–M4 state machine, key derivation; 7 tests pass |
-| 3 | Encrypted RTSP (`GET /info` over ChaCha20-Poly1305) | ⚠️ Partial | Code complete; needs hardware verification (run `cargo run -p openair-cli`) |
+| 2 | HomeKit Transient pairing (SRP-6a, PIN "3939") | ✅ Done | Hardware-verified vs Shairport Sync 2026-07-07 (after N typo + Flags TLV fixes) |
+| 3 | Encrypted RTSP (`GET /info` over ChaCha20-Poly1305) | ✅ Done | Hardware-verified 2026-07-07: encrypted GET /info → 701 bytes (580 B plist) |
 | 4 | NTP timing + realtime ALAC PT=96 | ⬜ Not Started | Target: AirPort Express first |
 | 5 | Buffered AAC PT=103 | ⬜ Not Started | |
 | 6 | PTP timing (HomePod, BMCA yield) | ⬜ Not Started | Requires ptp-helper binary |
@@ -26,9 +26,9 @@
 |-------|--------|------------------------|-------|
 | `core` | ✅ Scaffolded | — | `Features` bitmask, `AudioMode`, `OpenAirError` |
 | `discovery` | ✅ Done | Yes | `browse()`, `AirPlayDevice`, `AirPlayTxt`, feature-bit decoder; 4 tests pass; verified on LAN |
-| `crypto` | ✅ Done | — | SRP-6a 3072-bit, HKDF-SHA-512, ChaCha20-Poly1305 framing; 10 tests pass |
-| `pairing` | ✅ Done | No | TLV8 encode/decode, `TransientPairing` M1–M4, key derivation; 7 tests |
-| `rtsp` | ⚠️ Partial | No | `RtspConnection`, plain + encrypted framing, `pair_and_get_info`; needs hw test |
+| `crypto` | ✅ Done | Yes | SRP-6a 3072-bit (N fingerprint-guarded), HKDF-SHA-512, ChaCha20-Poly1305 with AAD; 11 tests |
+| `pairing` | ✅ Done | Yes | TLV8 (Flags=0x13), `TransientPairing` M1–M4 incl. M2-proof verify; 7 tests |
+| `rtsp` | ✅ Done | Yes | `pair_and_get_info` verified vs Shairport Sync (AirTunes/366.0) |
 | `audio-codec` | ⬜ Stub | — | Will vendor FDK-AAC + ALAC C sources |
 | `audio-rtp` | ⬜ Stub | — | |
 | `timing` | ⬜ Stub | — | |
@@ -42,14 +42,27 @@
 
 ## Known Issues / Blockers
 
-_None yet._
+- **Apple TV 4K returns 470 at M1** — needs on-device authorization (approve on screen /
+  Home app → "Speakers & TV Access"). Retest Living Room after approving. Not a code bug.
 
 ---
 
 ## Next Steps
 
-1. **Hardware test Steps 2+3** — run `cargo run -p openair-cli` and verify Transient pairing + encrypted `GET /info` against a real device
-2. **Step 4** — NTP timing + realtime ALAC PT=96 (target: Shairport Sync @ Pool Room first)
+1. **Step 4** — NTP timing + realtime ALAC PT=96 (target: Shairport Sync @ Pool Room first):
+   two-phase SETUP plists, RECORD, ALAC encode, RTP + per-packet AEAD
+2. Retest Apple TV once authorized on-device
+
+---
+
+## Reference Tooling (`tools/`)
+
+| Script | Purpose |
+|--------|---------|
+| `hap_probe.py` | Known-good transient pairing + encrypted GET /info client (pyatv math, raw RTSP) |
+| `hap_oracle_server.py` | Local pair-setup M1–M4 server (srptools) for offline differential tests |
+| `mitm_proxy.py` | TCP proxy hex-dumping both directions (wire-level diffing) |
+| `pyatv_probe.py` | Drive pyatv end-to-end with debug logs (needs SelectorEventLoop on Windows) |
 
 ---
 

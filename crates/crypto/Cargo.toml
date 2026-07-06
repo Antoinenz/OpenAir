@@ -16,4 +16,5 @@ x25519-dalek.workspace = true
 num-bigint.workspace = true
 num-traits.workspace = true
 rand.workspace = true
+srp.workspace = true
 thiserror.workspace = true

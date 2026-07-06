@@ -4,4 +4,4 @@ pub mod srp;
 
 pub use chacha::{ChaChaChannel, ChaChaError};
 pub use hkdf::derive as hkdf_derive;
-pub use srp::{SrpClient, SrpError, SrpGroup};
+pub use srp::{SrpClient, SrpError};

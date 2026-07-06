@@ -16,9 +16,13 @@ pub enum Tag {
     EncryptedData = 0x05,
     State = 0x06,
     Error = 0x07,
-    Signature = 0x0B,
-    Flags = 0x10,
+    Signature = 0x0A,
+    /// Apple-internal tag (19) — carries pairing flags, e.g. 0x10 = Transient.
+    Flags = 0x13,
 }
+
+/// Flag value for `Tag::Flags`: kPairingFlag_Transient.
+pub const FLAG_TRANSIENT: u8 = 0x10;
 
 impl Tag {
     pub fn from_byte(b: u8) -> Option<Self> {
@@ -31,8 +35,8 @@ impl Tag {
             0x05 => Some(Tag::EncryptedData),
             0x06 => Some(Tag::State),
             0x07 => Some(Tag::Error),
-            0x0B => Some(Tag::Signature),
-            0x10 => Some(Tag::Flags),
+            0x0A => Some(Tag::Signature),
+            0x13 => Some(Tag::Flags),
             _ => None,
         }
     }

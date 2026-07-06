@@ -40,6 +40,7 @@ x25519-dalek = "2"
 num-bigint = "0.4"
 num-traits = "0.2"
 rand = "0.8"
+srp = "0.6"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

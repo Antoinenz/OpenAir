@@ -3,7 +3,19 @@
     "allow": [
       "Bash(cargo build *)",
       "Bash(cargo test *)",
-      "Bash(git add *)"
+      "Bash(git add *)",
+      "Bash(set RUST_LOG=openair=debug)",
+      "Bash(cargo run *)",
+      "Bash(set RUST_LOG=openair=info)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(curl -s \"https://api.github.com/search/repositories?q=pair_ap+language:c\")",
+      "Bash(curl -I \"https://github.com/owntone/owntone-server\")",
+      "Bash(curl *)",
+      "Bash(cargo add *)",
+      "Bash(cargo metadata *)",
+      "Bash(python3 -c \"import sys,json; m=json.load\\(sys.stdin\\); pkg=[p for p in m['packages'] if p['name']=='srp']; print\\(pkg[0]['version'] if pkg else 'not found'\\)\")",
+      "Bash(cargo doc *)"
     ]
   }
 }

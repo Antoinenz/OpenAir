@@ -1,9 +1,9 @@
 /// HomeKit Transient pairing (X-Apple-HKP: 4).
 ///
-/// Flow:
-///   M1: client sends A (SRP public key) + state=0x01 + flags=0x00
+/// Flow (wire format verified against Shairport Sync on hardware):
+///   M1: client sends Method=0x00 + State=0x01 + Flags(0x13)=0x10 (Transient)
 ///   M2: server sends B (public key) + salt
-///   M3: client sends M1 proof + state=0x03
+///   M3: client sends A + M1 proof + state=0x03
 ///   M4: server sends M2 proof + state=0x04
 ///   Keys derived from session key via HKDF-SHA-512 → encrypted RTSP begins
 ///
@@ -48,13 +48,17 @@ impl TransientPairing {
     }
 
     /// Build the M1 TLV8 body (POST /pair-setup, first round-trip).
-    /// Content-Type: application/pairing+tlv8
+    ///
+    /// Exactly Method=0x00, State=0x01, Flags(0x13)=0x10 — nothing else.
+    /// The Transient flag (0x10) is what makes the receiver use PIN "3939";
+    /// without it, pair_ap treats the session as normal pairing and the SRP
+    /// proof fails with kTLVError_Authentication (0x02).
+    /// A is NOT sent in M1 — it goes in M3 alongside the proof.
     pub fn build_m1(&self) -> Vec<u8> {
-        let a_bytes = self.client.a_pub.to_bytes_be();
         tlv8::encode(&[
-            (Tag::State, &[0x01]),
-            (Tag::Flags, &[0x00]),  // 0x00 = Transient
-            (Tag::PublicKey, &a_bytes),
+            (Tag::Method, &[0x00]),                  // Pair Setup, no MFi
+            (Tag::State,  &[0x01]),                  // M1
+            (Tag::Flags,  &[tlv8::FLAG_TRANSIENT]),  // 0x10 = Transient
         ])
     }
 
@@ -86,11 +90,16 @@ impl TransientPairing {
             .get(&(Tag::Salt as u8))
             .ok_or(PairingError::MissingField("Salt"))?;
 
-        let (m1_proof, session_key) = self.client.process_challenge(salt, b_pub)?;
+        let (m1_proof, session_key) = self.client.process_challenge(
+            b"Pair-Setup", b"3939", salt, b_pub,
+        )?;
 
+        // A is sent here in M3 (not M1), padded to 384 bytes.
+        let a_bytes = self.client.a_pub_padded();
         let m3_body = tlv8::encode(&[
-            (Tag::State, &[0x03]),
-            (Tag::Proof, &m1_proof),
+            (Tag::State,     &[0x03]),
+            (Tag::PublicKey, &a_bytes),
+            (Tag::Proof,     &m1_proof),
         ]);
 
         Ok((m3_body, m1_proof, session_key))
@@ -121,10 +130,12 @@ impl TransientPairing {
             .get(&(Tag::Proof as u8))
             .ok_or(PairingError::MissingField("Proof(M2)"))?;
 
-        self.client
-            .verify_server(m1_proof, m2_proof, session_key)?;
+        // Verify the server's M2 proof = H(A_unpadded || M1 || K).
+        // Hardware-verified: Shairport Sync sends a real 64-byte proof in M4
+        // once M1 carries the correct Transient flag.
+        self.client.verify_server(m1_proof, m2_proof, session_key)?;
 
-        // Derive per-direction RTSP channel keys.
+        // Derive per-direction RTSP channel keys from the session key K.
         let write = hkdf_derive(session_key, b"Control-Salt", b"Control-Write-Encryption-Key");
         let read  = hkdf_derive(session_key, b"Control-Salt", b"Control-Read-Encryption-Key");
 
@@ -142,14 +153,12 @@ mod tests {
     use crate::tlv8;
 
     #[test]
-    fn m1_contains_required_fields() {
+    fn m1_matches_hardware_verified_wire_format() {
         let p = TransientPairing::new();
         let m1 = p.build_m1();
-        let decoded = tlv8::decode(&m1);
-        assert_eq!(decoded[&(Tag::State as u8)], vec![0x01]);
-        assert_eq!(decoded[&(Tag::Flags as u8)], vec![0x00]);
-        // PublicKey should be non-empty (SRP A)
-        assert!(!decoded[&(Tag::PublicKey as u8)].is_empty());
+        // Exact bytes verified against Shairport Sync:
+        // Method(0x00)=0x00, State(0x06)=0x01, Flags(0x13)=0x10
+        assert_eq!(m1, vec![0x00, 1, 0x00, 0x06, 1, 0x01, 0x13, 1, 0x10]);
     }
 
     #[test]

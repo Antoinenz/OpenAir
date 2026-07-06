@@ -4,6 +4,53 @@
 
 ---
 
+## 2026-07-07 — Session 4: Step 3 hardware-verified (three bugs found via differential testing)
+
+### Result
+`cargo run -p openair-cli -- 192.168.1.106:7000` → Transient pairing M1–M4 accepted by
+Shairport Sync (AirTunes/366.0), server M2 proof verified, encrypted channel up,
+**encrypted GET /info returned 701 bytes (580-byte binary plist decrypted)**. Step 3 done.
+
+### The three bugs (all found by differential testing against pyatv/srptools)
+1. **N_HEX had a one-hex-digit typo** — `…95581716 3995…` instead of RFC 3526's
+   `…95581718 3995…` (pos 447). `bits()==3072` passed, all self-consistent tests passed,
+   but every SRP value was computed in the wrong group → receiver always returned
+   kTLVError_Authentication (0x02). Worse: the Python oracle server we first validated
+   against had the same typo copy-pasted in, so it *confirmed* the broken math.
+   Regression guard added: SHA-256 fingerprint test of N (`n_matches_rfc3526_fingerprint`).
+2. **M1 TLV wire format was wrong** — Flags must be tag **0x13** (19) with value **0x10**
+   (kPairingFlag_Transient); we sent tag 0x10 value 0x00. Without the Transient flag,
+   pair_ap treats the session as normal pairing (different PIN policy) and rejects the
+   proof. Correct M1 is exactly `Method=0x00, State=0x01, Flags=0x10` — no Identifier,
+   no PublicKey (A goes in M3). Also fixed Signature tag 0x0B → 0x0A.
+3. **ChaCha20-Poly1305 framing was missing AAD** — the 2-byte little-endian length prefix
+   must be passed as associated data on every encrypt/decrypt. Without it the Poly1305
+   tag never verifies.
+
+### Debugging method (worth repeating)
+- Built a Python "oracle" pair-setup server on srptools → validated Rust math… falsely
+  (shared typo). Lesson: **an oracle must come from an independent source**, never
+  copy-paste constants from the code under test.
+- Wrote `tools/hap_probe.py` — pyatv-exact TLVs over raw RTSP → paired successfully with
+  real hardware, proving receiver + math and isolating the delta to our client.
+- Wrote `tools/mitm_proxy.py` — captured both clients' wire bytes; transcripts were
+  structurally identical → difference had to be in the crypto values.
+- Deterministic cross-check: same fixed `a`, same captured salt/B in Rust and srptools →
+  `A` differed → `g^a mod N` differs → N differs → found the typo in seconds.
+
+### Also learned
+- Apple TV 4K returns **470 Connection Authorization Required** at M1 — on-device
+  approval / Home-app "Speakers & TV Access" setting; retest Living Room after approving.
+- Shairport Sync responds 400 to `/pair-pin-start` (pyatv sends it; not needed for us).
+- `tools/` now has: `hap_probe.py` (known-good reference client), `hap_oracle_server.py`
+  (local pair-setup server, typo fixed), `mitm_proxy.py`, `pyatv_probe.py`.
+
+### Next
+- Step 4: NTP timing + realtime ALAC PT=96 (SETUP two-phase plists, RECORD, RTP+AEAD).
+- Retest Apple TV after on-screen authorization (Normal pairing is Step 7 anyway).
+
+---
+
 ## 2026-05-20 — Session 3: pairing + rtsp crates (Steps 2–3 code complete)
 
 ### What we did

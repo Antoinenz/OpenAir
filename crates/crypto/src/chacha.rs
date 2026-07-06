@@ -3,10 +3,14 @@
 /// Wire format per packet:
 ///   uint16_le length N  ||  ciphertext (N bytes)  ||  Poly1305 tag (16 bytes)
 ///
+/// The 2-byte little-endian length prefix is fed to the AEAD as associated
+/// data (AAD) — verified against Shairport Sync (AirTunes/366.0) on hardware;
+/// omitting it causes Poly1305 tag mismatch on both sides.
+///
 /// Nonce (12 bytes): [0x00 0x00 0x00 0x00] || counter (8 bytes, little-endian)
 /// Each direction uses its own key and an independent monotonic counter.
 use chacha20poly1305::{
-    aead::{Aead, KeyInit},
+    aead::{Aead, KeyInit, Payload},
     ChaCha20Poly1305, Key, Nonce,
 };
 use thiserror::Error;
@@ -38,17 +42,17 @@ impl ChaChaChannel {
     /// Encrypt `plaintext` and return the framed wire bytes:
     /// `uint16_le(len) || ciphertext || tag`.
     pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, ChaChaError> {
+        let len_bytes = (plaintext.len() as u16).to_le_bytes();
         let nonce = self.nonce();
         let ct = self
             .cipher
-            .encrypt(&nonce, plaintext)
+            .encrypt(&nonce, Payload { msg: plaintext, aad: &len_bytes })
             .map_err(|_| ChaChaError::Encrypt)?;
         self.counter += 1;
 
         // ct already includes the 16-byte tag appended by the AEAD crate.
-        let payload_len = ct.len() - 16; // ciphertext without tag
         let mut out = Vec::with_capacity(2 + ct.len());
-        out.extend_from_slice(&(payload_len as u16).to_le_bytes());
+        out.extend_from_slice(&len_bytes);
         out.extend_from_slice(&ct);
         Ok(out)
     }
@@ -67,7 +71,7 @@ impl ChaChaChannel {
         let nonce = self.nonce();
         let pt = self
             .cipher
-            .decrypt(&nonce, ct_and_tag)
+            .decrypt(&nonce, Payload { msg: ct_and_tag, aad: &frame[..2] })
             .map_err(|_| ChaChaError::Decrypt)?;
         self.counter += 1;
         Ok(pt)

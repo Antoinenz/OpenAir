@@ -7,6 +7,7 @@ use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 use openair_crypto::ChaChaChannel;
+use tracing::debug;
 
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -59,8 +60,9 @@ impl RtspConnection {
         self.cseq += 1;
 
         let mut req = String::new();
-        req.push_str(&format!("{} rtsp://{}{} RTSP/1.0\r\n",
-            method, self.peer, path));
+        // Use just the path in the request-line. Shairport Sync (and many receivers)
+        // match handlers on the bare path; a full rtsp:// URI fails the strcmp.
+        req.push_str(&format!("{} {} RTSP/1.0\r\n", method, path));
         req.push_str(&format!("CSeq: {}\r\n", cseq));
         req.push_str("User-Agent: AirPlay/770.8.1\r\n");
         req.push_str("X-Apple-ProtocolVersion: 1\r\n");
@@ -104,35 +106,67 @@ impl RtspConnection {
 
     fn read_plain_response(&mut self) -> io::Result<Vec<u8>> {
         let mut reader = BufReader::new(&self.stream);
-        let mut headers = Vec::new();
-        let mut content_length = 0usize;
+        let mut header_lines: Vec<String> = Vec::new();
+        let mut content_length: Option<usize> = None;
+        let mut chunked = false;
 
         // Read headers until blank line.
         loop {
             let mut line = String::new();
             reader.read_line(&mut line)?;
-            if line == "\r\n" || line == "\n" {
+            let trimmed = line.trim_end_matches(['\r', '\n']);
+            if trimmed.is_empty() {
                 break;
             }
-            let lower = line.to_lowercase();
-            if lower.starts_with("content-length:") {
-                content_length = lower
-                    .trim_start_matches("content-length:")
-                    .trim()
-                    .trim_end()
-                    .parse::<usize>()
-                    .unwrap_or(0);
+            let lower = trimmed.to_lowercase();
+            if let Some(rest) = lower.strip_prefix("content-length:") {
+                content_length = rest.trim().parse::<usize>().ok();
             }
-            headers.extend_from_slice(line.as_bytes());
+            if lower.contains("transfer-encoding") && lower.contains("chunked") {
+                chunked = true;
+            }
+            header_lines.push(line);
         }
-        headers.extend_from_slice(b"\r\n");
 
-        let mut body = vec![0u8; content_length];
-        if content_length > 0 {
-            reader.read_exact(&mut body)?;
+        for h in &header_lines {
+            debug!(header = h.trim_end_matches(['\r', '\n']), "rx header");
         }
-        headers.extend_from_slice(&body);
-        Ok(headers)
+
+        // Reconstruct header block for callers that use extract_body / status_code.
+        let mut out = header_lines.join("").into_bytes();
+        out.extend_from_slice(b"\r\n");
+
+        let body = if chunked {
+            read_chunked_body(&mut reader)?
+        } else if let Some(len) = content_length {
+            let mut body = vec![0u8; len];
+            if len > 0 {
+                reader.read_exact(&mut body)?;
+            }
+            body
+        } else {
+            // No Content-Length and not chunked: receiver sends body then holds
+            // the connection open (Shairport Sync / AirTunes/366.0 style).
+            // Set a short drain timeout — body arrives immediately after headers;
+            // we stop as soon as the server goes quiet.
+            self.stream.set_read_timeout(Some(Duration::from_millis(500)))?;
+            let mut body = Vec::new();
+            let mut chunk = vec![0u8; 4096];
+            loop {
+                match reader.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => body.extend_from_slice(&chunk[..n]),
+                    Err(e) if e.kind() == io::ErrorKind::TimedOut
+                           || e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => return Err(e),
+                }
+            }
+            self.stream.set_read_timeout(Some(READ_TIMEOUT))?;
+            body
+        };
+
+        out.extend_from_slice(&body);
+        Ok(out)
     }
 
     fn read_encrypted_response(&mut self) -> io::Result<Vec<u8>> {
@@ -155,9 +189,32 @@ impl RtspConnection {
     }
 }
 
+/// Decode an HTTP chunked transfer-encoded body.
+fn read_chunked_body(reader: &mut impl BufRead) -> io::Result<Vec<u8>> {
+    let mut body = Vec::new();
+    loop {
+        let mut size_line = String::new();
+        reader.read_line(&mut size_line)?;
+        let chunk_size = usize::from_str_radix(size_line.trim(), 16)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad chunk size"))?;
+        if chunk_size == 0 {
+            // Trailing CRLF after last chunk.
+            let mut _crlf = String::new();
+            let _ = reader.read_line(&mut _crlf);
+            break;
+        }
+        let mut chunk = vec![0u8; chunk_size];
+        reader.read_exact(&mut chunk)?;
+        body.extend_from_slice(&chunk);
+        // Consume trailing CRLF after chunk data.
+        let mut _crlf = String::new();
+        reader.read_line(&mut _crlf)?;
+    }
+    Ok(body)
+}
+
 /// Extract the HTTP body from a raw response (everything after the blank line).
 pub fn extract_body(response: &[u8]) -> &[u8] {
-    // Find \r\n\r\n
     for i in 0..response.len().saturating_sub(3) {
         if &response[i..i + 4] == b"\r\n\r\n" {
             return &response[i + 4..];

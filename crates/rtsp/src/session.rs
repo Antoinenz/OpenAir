@@ -45,6 +45,7 @@ pub fn pair_and_get_info(
     // --- M1: send A ---
     info!("pair-setup M1 (sending A)");
     let m1_body = pairing.build_m1();
+    debug!(m1_len = m1_body.len(), m1_hex = %hex(&m1_body[..m1_body.len().min(32)]), "M1 body (first 32 bytes)");
     let m2_raw = conn.request(
         "POST", "/pair-setup",
         &[("X-Apple-HKP", "4")],
@@ -55,6 +56,7 @@ pub fn pair_and_get_info(
 
     check_status(&m2_raw, 200)?;
     let m2_body = connection::extract_body(&m2_raw);
+    debug!(body_len = m2_body.len(), body_hex = %hex(m2_body), "M2 body");
 
     // --- M3: process M2, send proof ---
     info!("pair-setup M3 (sending proof)");
@@ -67,6 +69,7 @@ pub fn pair_and_get_info(
     )?;
     debug!(bytes = m4_raw.len(), "M4 received");
 
+    debug!(bytes = m4_raw.len(), m4_hex = %hex(connection::extract_body(&m4_raw)), "M4 body");
     check_status(&m4_raw, 200)?;
     let m4_body = connection::extract_body(&m4_raw);
 
@@ -82,6 +85,10 @@ pub fn pair_and_get_info(
     debug!(bytes = info_raw.len(), "GET /info response received");
 
     Ok(info_raw)
+}
+
+fn hex(data: &[u8]) -> String {
+    data.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ")
 }
 
 fn check_status(response: &[u8], expected: u16) -> Result<(), SessionError> {

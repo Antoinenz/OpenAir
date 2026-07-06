@@ -13,6 +13,22 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    // Direct mode: `openair <ip:port>` skips discovery and pairs with the given address.
+    if let Some(arg) = std::env::args().nth(1) {
+        let addr: SocketAddr = arg.parse()?;
+        println!("OpenAir — direct pairing with {}\n", addr);
+        match openair_rtsp::pair_and_get_info(addr, "AA:BB:CC:DD:EE:FF") {
+            Ok(info) => {
+                println!("  ✓ GET /info succeeded ({} bytes)\n", info.len());
+                if let Ok(s) = std::str::from_utf8(&info) {
+                    println!("{}", &s[..s.len().min(512)]);
+                }
+            }
+            Err(e) => println!("  ✗ {}", e),
+        }
+        return Ok(());
+    }
+
     println!("OpenAir — scanning for AirPlay devices (5s)...\n");
 
     let mut devices = Vec::new();
