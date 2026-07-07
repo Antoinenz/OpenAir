@@ -9,9 +9,9 @@
 | 1 | mDNS discovery + TXT feature-bit parsing | ✅ Done | 4 unit tests pass; verified on LAN (Shairport Sync + Apple TV 4K) |
 | 2 | HomeKit Transient pairing (SRP-6a, PIN "3939") | ✅ Done | Hardware-verified vs Shairport Sync 2026-07-07 (after N typo + Flags TLV fixes) |
 | 3 | Encrypted RTSP (`GET /info` over ChaCha20-Poly1305) | ✅ Done | Hardware-verified 2026-07-07: encrypted GET /info → 701 bytes (580 B plist) |
-| 4 | NTP timing + realtime ALAC PT=96 | ⬜ Not Started | Target: AirPort Express first |
+| 4 | Timing + realtime ALAC PT=96 | ✅ Done | Hardware-verified 2026-07-08: 440 Hz tone audible on Pool Room; PTP (pulled fwd from Step 6), collinear type-215 anchors |
 | 5 | Buffered AAC PT=103 | ⬜ Not Started | |
-| 6 | PTP timing (HomePod, BMCA yield) | ⬜ Not Started | Requires ptp-helper binary |
+| 6 | PTP timing (HomePod, BMCA yield) | 🔄 Partial | Minimal PTP master done (Announce+Sync/Follow_Up, nqptp-verified); BMCA yield + Delay_Req + ptp-helper (Linux) remain |
 | 7 | Normal pairing (Apple TV + PIN, persist identity) | ⬜ Not Started | |
 | 8 | Multi-room group streaming | ⬜ Not Started | |
 | 9 | Real-time hardening (SCHED_FIFO, DSCP EF, retransmit <5ms) | ⬜ Not Started | |
@@ -29,13 +29,13 @@
 | `crypto` | ✅ Done | Yes | SRP-6a 3072-bit (N fingerprint-guarded), HKDF-SHA-512, ChaCha20-Poly1305 with AAD; 11 tests |
 | `pairing` | ✅ Done | Yes | TLV8 (Flags=0x13), `TransientPairing` M1–M4 incl. M2-proof verify; 7 tests |
 | `rtsp` | ✅ Done | Yes | `pair_and_get_info` verified vs Shairport Sync (AirTunes/366.0) |
-| `audio-codec` | ⬜ Stub | — | Will vendor FDK-AAC + ALAC C sources |
-| `audio-rtp` | ⬜ Stub | — | |
-| `timing` | ⬜ Stub | — | |
+| `audio-codec` | ✅ Partial | Yes | Verbatim ALAC encoder (uncompressed) plays on hardware; FDK-AAC in Step 5 |
+| `audio-rtp` | ✅ Done | Yes | RTP+AEAD packetizer, PTP anchor packets (0xD7), NTP sync (0xD4), retransmit backlog |
+| `timing` | ✅ Done | Yes | NTP responder + minimal PTP master (nqptp-verified) |
 | `capture` | ⬜ Stub | — | WASAPI / PipeWire / CoreAudio via cpal |
 | `ptp-helper` | ⬜ Stub | — | Privileged binary, IPC to main |
-| `client` | ⬜ Stub | — | |
-| `apps/cli` | ⬜ Stub | — | Boots, logs, exits |
+| `client` | 🔄 Partial | Yes | stream_tone: full realtime pipeline; real audio sources next |
+| `apps/cli` | 🔄 Partial | Yes | discovery scan, direct pair, `tone <ip:port> [secs]` |
 | `apps/tui` | ⬜ Stub | — | |
 
 ---
@@ -49,9 +49,9 @@
 
 ## Next Steps
 
-1. **Step 4** — NTP timing + realtime ALAC PT=96 (target: Shairport Sync @ Pool Room first):
-   two-phase SETUP plists, RECORD, ALAC encode, RTP + per-packet AEAD
-2. Retest Apple TV once authorized on-device
+1. **Step 5** — Buffered AAC PT=103 (FDK-AAC, event channel, FLUSHBUFFERED)
+2. Real audio input (WAV file / capture crate) replacing the tone generator
+3. Retest Apple TV once authorized on-device; fix cosmetic TEARDOWN 451
 
 ---
 

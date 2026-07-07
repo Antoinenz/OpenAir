@@ -39,6 +39,19 @@ impl RtspConnection {
         })
     }
 
+    /// Local IP of this connection (for rtsp:// request URIs).
+    pub fn local_ip(&self) -> std::net::IpAddr {
+        self.stream
+            .local_addr()
+            .map(|a| a.ip())
+            .unwrap_or_else(|_| std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+    }
+
+    /// Remote (receiver) IP.
+    pub fn peer_ip(&self) -> std::net::IpAddr {
+        self.peer.ip()
+    }
+
     /// Enable encrypted mode after successful pairing.
     pub fn enable_encryption(&mut self, write_key: &[u8; 32], read_key: &[u8; 32]) {
         self.encrypt = Some((

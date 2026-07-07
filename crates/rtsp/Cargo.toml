@@ -11,3 +11,5 @@ openair-crypto = { path = "../crypto" }
 openair-pairing = { path = "../pairing" }
 thiserror.workspace = true
 tracing.workspace = true
+plist.workspace = true
+rand.workspace = true

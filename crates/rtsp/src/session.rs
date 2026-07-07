@@ -29,47 +29,42 @@ pub enum SessionError {
     Http(u16),
     #[error("empty response")]
     EmptyResponse,
+    #[error("missing plist field: {0}")]
+    MissingPlistField(&'static str),
+    #[error("failed to encode plist body")]
+    PlistEncode,
+    #[error("failed to decode plist response")]
+    PlistDecode,
 }
 
-/// Pair with a device using Transient pairing and send an encrypted GET /info.
-/// Returns the raw (decrypted) GET /info response body on success.
-pub fn pair_and_get_info(
-    addr: SocketAddr,
-    device_id: &str,
-) -> Result<Vec<u8>, SessionError> {
+/// Connect and Transient-pair, returning the encrypted connection.
+pub fn pair(addr: SocketAddr, device_id: &str) -> Result<RtspConnection, SessionError> {
     info!(addr = %addr, "connecting");
     let mut conn = RtspConnection::connect(addr, device_id)?;
 
     let pairing = TransientPairing::new();
 
-    // --- M1: send A ---
-    info!("pair-setup M1 (sending A)");
+    // --- M1 ---
+    info!("pair-setup M1");
     let m1_body = pairing.build_m1();
-    debug!(m1_len = m1_body.len(), m1_hex = %hex(&m1_body[..m1_body.len().min(32)]), "M1 body (first 32 bytes)");
     let m2_raw = conn.request(
         "POST", "/pair-setup",
         &[("X-Apple-HKP", "4")],
         &m1_body,
-        Some("application/pairing+tlv8"),
+        Some("application/octet-stream"),
     )?;
-    debug!(bytes = m2_raw.len(), "M2 received");
-
     check_status(&m2_raw, 200)?;
     let m2_body = connection::extract_body(&m2_raw);
-    debug!(body_len = m2_body.len(), body_hex = %hex(m2_body), "M2 body");
 
-    // --- M3: process M2, send proof ---
+    // --- M3 ---
     info!("pair-setup M3 (sending proof)");
     let (m3_body, m1_proof, session_key) = pairing.process_m2_build_m3(m2_body)?;
     let m4_raw = conn.request(
         "POST", "/pair-setup",
         &[("X-Apple-HKP", "4")],
         &m3_body,
-        Some("application/pairing+tlv8"),
+        Some("application/octet-stream"),
     )?;
-    debug!(bytes = m4_raw.len(), "M4 received");
-
-    debug!(bytes = m4_raw.len(), m4_hex = %hex(connection::extract_body(&m4_raw)), "M4 body");
     check_status(&m4_raw, 200)?;
     let m4_body = connection::extract_body(&m4_raw);
 
@@ -78,17 +73,20 @@ pub fn pair_and_get_info(
     let keys = pairing.process_m4(m4_body, &m1_proof, &session_key)?;
     conn.enable_encryption(&keys.write, &keys.read);
     info!("encrypted channel established");
+    Ok(conn)
+}
 
-    // --- Encrypted GET /info ---
+/// Pair with a device using Transient pairing and send an encrypted GET /info.
+/// Returns the raw (decrypted) GET /info response on success.
+pub fn pair_and_get_info(
+    addr: SocketAddr,
+    device_id: &str,
+) -> Result<Vec<u8>, SessionError> {
+    let mut conn = pair(addr, device_id)?;
     info!("GET /info (encrypted)");
     let info_raw = conn.request("GET", "/info", &[], &[], None)?;
     debug!(bytes = info_raw.len(), "GET /info response received");
-
     Ok(info_raw)
-}
-
-fn hex(data: &[u8]) -> String {
-    data.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ")
 }
 
 fn check_status(response: &[u8], expected: u16) -> Result<(), SessionError> {

@@ -9,6 +9,7 @@ license.workspace = true
 openair-core = { path = "../core" }
 openair-crypto = { path = "../crypto" }
 openair-audio-codec = { path = "../audio-codec" }
-tokio.workspace = true
+openair-timing = { path = "../timing" }
+chacha20poly1305.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

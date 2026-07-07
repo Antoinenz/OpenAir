@@ -13,6 +13,20 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    let args: Vec<String> = std::env::args().collect();
+
+    // `openair tone <ip:port> [seconds]` — stream a 440 Hz test tone (Step 4).
+    if args.len() >= 3 && args[1] == "tone" {
+        let addr: SocketAddr = args[2].parse()?;
+        let seconds: u32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(10);
+        println!("OpenAir — streaming {}s test tone to {}\n", seconds, addr);
+        match openair_client::stream_tone(addr, "AA:BB:CC:DD:EE:FF", seconds, 440.0, Some(-8.0)) {
+            Ok(()) => println!("  ✓ tone streamed successfully"),
+            Err(e) => println!("  ✗ {}", e),
+        }
+        return Ok(());
+    }
+
     // Direct mode: `openair <ip:port>` skips discovery and pairs with the given address.
     if let Some(arg) = std::env::args().nth(1) {
         let addr: SocketAddr = arg.parse()?;

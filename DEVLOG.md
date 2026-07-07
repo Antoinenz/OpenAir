@@ -4,6 +4,61 @@
 
 ---
 
+## 2026-07-08 — Session 5: FIRST AUDIO 🔊 — Step 4 done (realtime ALAC over AP2, PTP pulled forward)
+
+### Result
+`cargo run -p openair-cli -- tone 192.168.1.106:7000 12` plays a 440 Hz tone on the
+Pool Room speaker. Full chain: pair → SETUP(PTP) → SETUP(stream ALAC PT=96) →
+RECORD → SETRATEANCHORTIME(rate=1) → encrypted RTP + control anchors + PTP master.
+Receiver log: "first frame sync error: 0.612 mS" — sync is essentially perfect.
+
+### Major plan change: PTP pulled forward from Step 6
+Shairport Sync **cannot do AP2-NTP realtime** (`warn("Shairport Sync can not handle
+NTP streams.")` in rtsp.c) and the Apple TV requires PTP too — Step 4's NTP plan
+targeted an AirPort Express we don't have. Implemented a minimal PTP master instead:
+- nqptp (shairport's clock daemon) is **listen-only**: no BMCA, no Delay_Req. Sender
+  just unicasts Announce (1 Hz, port 320) + two-step Sync/Follow_Up (4 Hz, 319/320).
+- Windows has no privileged-port concept → binds 319/320 without elevation
+  (Linux will need the ptp-helper + CAP_NET_BIND_SERVICE later).
+- NTP responder (`TimingResponder`) kept for AirPort-Express-class receivers.
+
+### Protocol discoveries (all verified against shairport-sync source + hardware)
+- **Realtime AP2 anchoring** is NOT SETRATEANCHORTIME (that's the buffered path).
+  It's control-port packets **type 215 (0xD7)**: `[0]=0x80/0x90, [1]=0xD7,
+  [4..8]=frame-77175, [8..16]=PTP-ns u64 BE, [16..20]=frame, [20..28]=clock_id`.
+  SETRATEANCHORTIME is still needed but **rate-only** — it flips ap2_play_enabled.
+- **Anchors must be collinear**: compute T0 (PTP ns of frame 0) once and extrapolate
+  `time(frame)=T0+frame/44100`. Re-measuring the clock per anchor produced ±250 ms
+  "frame adjustments" → receiver resynced/muted continuously (root cause of silence #2).
+- **Audibility trap**: airplay volume −20 dB ⇒ −43 dB software attenuation in
+  shairport; with a −10 dB test tone that's ≈ −53 dB — inaudible (silence #1).
+  Tone now 0.6 amplitude, volume −8 dB.
+- RTP audio packet: `hdr(12) || ct||tag || nonce8`, AAD=hdr[4..12], nonce=LE counter
+  in bytes 4..12; shairport decrypts with `shk` from SETUP 2 ("Hammerton Decoder
+  used on encrypted audio" confirms ALAC ct=2 + AEAD both correct).
+- Uncompressed/verbatim ALAC frames (owntone-style, 23-bit header + BE samples) play fine.
+- SETUP 1 (PTP): timingProtocol=PTP + groupUUID + timingPeerInfo{Addresses,ID};
+  shairport auto-registers the sender IP with nqptp ("/nqptp T <ip>").
+
+### Debug method
+SSH to the receiver, `log_verbosity = 2`, journalctl. Receiver-side logs found in
+minutes what wire-level guesswork couldn't: clock qualified ✓, decrypt ✓, anchor
+drift ✗, volume ✗. (Config restored afterwards.)
+
+### Known quirks / follow-ups
+- TEARDOWN response reads as 451 on our side though shairport's handler always
+  returns 200 + `Connection: close` — probably our encrypted-frame read on a
+  closing socket; cosmetic, investigate with Step 5.
+- Pacing uses `Instant` while anchors use `SystemTime` — fine for minutes-long
+  streams; unify for long sessions (Step 9 hardening).
+
+### Next
+- Step 5: buffered AAC PT=103 (needs FDK-AAC + event channel + FLUSHBUFFERED).
+- Real audio input (WAV/capture) instead of the tone generator; retest Apple TV
+  after on-screen authorization.
+
+---
+
 ## 2026-07-07 — Session 4: Step 3 hardware-verified (three bugs found via differential testing)
 
 ### Result
