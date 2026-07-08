@@ -42,8 +42,9 @@
 
 ## Known Issues / Blockers
 
-- **Apple TV 4K returns 470 at M1** — needs on-device authorization (approve on screen /
-  Home app → "Speakers & TV Access"). Retest Living Room after approving. Not a code bug.
+- **Apple TV 4K returns 470 at M1 even with AirPlay access = "Everyone"** (tested 2026-07-08).
+  tvOS refuses *Transient* pairing from unknown senders — it requires Normal HomeKit pairing
+  (on-screen PIN + persisted Ed25519 identity + pair-verify) = **Step 7**. Not a code bug.
 
 ---
 
