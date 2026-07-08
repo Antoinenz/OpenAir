@@ -34,8 +34,8 @@
 | `timing` | ✅ Done | Yes | NTP responder + minimal PTP master (nqptp-verified) |
 | `capture` | ⬜ Stub | — | WASAPI / PipeWire / CoreAudio via cpal |
 | `ptp-helper` | ⬜ Stub | — | Privileged binary, IPC to main |
-| `client` | 🔄 Partial | Yes | stream_tone: full realtime pipeline; real audio sources next |
-| `apps/cli` | 🔄 Partial | Yes | discovery scan, direct pair, `tone <ip:port> [secs]` |
+| `client` | 🔄 Partial | Yes | stream_audio + AudioSource (sine, WAV w/ resampler); capture next |
+| `apps/cli` | 🔄 Partial | Yes | scan, pair, `tone <ip:port> [secs]`, `play <ip:port> <file.wav>` |
 | `apps/tui` | ⬜ Stub | — | |
 
 ---
@@ -50,7 +50,7 @@
 ## Next Steps
 
 1. **Step 5** — Buffered AAC PT=103 (FDK-AAC, event channel, FLUSHBUFFERED)
-2. Real audio input (WAV file / capture crate) replacing the tone generator
+2. System audio capture (WASAPI loopback via cpal) — WAV playback done 2026-07-08
 3. Retest Apple TV once authorized on-device; fix cosmetic TEARDOWN 451
 
 ---

@@ -4,6 +4,23 @@
 
 ---
 
+## 2026-07-08 — Session 5b: WAV file playback (first real audio content)
+
+### What we did
+- Refactored `stream_tone` into generic `stream_audio(addr, device_id, &mut dyn AudioSource, volume)`;
+  `AudioSource::fill(&mut [i16]) -> usize` (interleaved stereo 44.1 kHz frames, 0 = end).
+- New `WavSource` (hound): 16-bit int / 32-bit float, mono/stereo, any sample rate with a
+  minimal linear-interpolation resampler; streams incrementally (no whole-file buffering).
+- CLI: `openair play <ip:port> <file.wav>`; 6 new unit tests (43 total).
+- Hardware-verified with a 48 kHz stereo melody WAV (exercises the resampler) on Pool Room.
+- Implementation delegated to a Sonnet subagent from a tight spec — clean one-shot delivery.
+
+### Next
+- System audio capture (WASAPI loopback via cpal + 48k→44.1k resample) — the "stream what my
+  PC is playing" milestone; then Step 5 (buffered AAC).
+
+---
+
 ## 2026-07-08 — Session 5: FIRST AUDIO 🔊 — Step 4 done (realtime ALAC over AP2, PTP pulled forward)
 
 ### Result

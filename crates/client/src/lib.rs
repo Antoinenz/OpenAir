@@ -15,14 +15,32 @@ use openair_rtsp::{StreamFormat, StreamSession, TimingConfig};
 use openair_timing::{ptp_now_ns, PtpMaster};
 use tracing::{info, warn};
 
-const SAMPLE_RATE: u32 = 44100;
+mod source;
+pub use source::{SineSource, WavSource};
 
-/// Stream a sine tone to `addr` for `seconds`. Hardware smoke test for Step 4.
-pub fn stream_tone(
+pub(crate) const SAMPLE_RATE: u32 = 44100;
+
+/// A source of interleaved-stereo, 44100 Hz i16 audio frames.
+///
+/// Implementors are pulled from the pacing loop in [`stream_audio`]; `fill`
+/// should be non-blocking (or block for at most a few packet durations) so
+/// the RTP pacing stays accurate.
+pub trait AudioSource {
+    /// Fills `buf` (interleaved stereo i16, 44100 Hz) with up to
+    /// `buf.len()/2` frames. Returns the number of FRAMES written; 0 means
+    /// end of stream.
+    fn fill(&mut self, buf: &mut [i16]) -> usize;
+}
+
+/// Stream audio pulled from `source` to `addr`. This is the shared pipeline
+/// behind [`stream_tone`] and any other `AudioSource` producer (e.g. WAV
+/// file playback): pair → SETUP(timing=PTP) → SETUP(stream) → RECORD →
+/// SETRATEANCHORTIME(rate=1) → paced RTP audio + PTP master + /feedback →
+/// TEARDOWN.
+pub fn stream_audio(
     addr: SocketAddr,
     device_id: &str,
-    seconds: u32,
-    freq: f32,
+    source: &mut dyn AudioSource,
     volume_db: Option<f32>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // --- Control channel (retransmit replies; no AP1-style sync under PTP) ---
@@ -77,27 +95,24 @@ pub fn stream_tone(
     audio_sock.connect(SocketAddr::new(peer_ip, ports.data_port))?;
     let mut cipher = AudioCipher::new(&session.shk);
 
-    let total_packets =
-        (u64::from(seconds) * u64::from(SAMPLE_RATE) / FRAMES_PER_PACKET as u64) as u32;
     let packet_dur = Duration::from_secs_f64(FRAMES_PER_PACKET as f64 / SAMPLE_RATE as f64);
     let start_instant = Instant::now();
     let mut last_feedback = Instant::now();
-    let mut phase: f32 = 0.0;
-    let step = 2.0 * std::f32::consts::PI * freq / SAMPLE_RATE as f32;
 
-    info!(
-        packets = total_packets,
-        data_port = ports.data_port,
-        "streaming {}s of {:.0}Hz tone", seconds, freq
-    );
+    info!(data_port = ports.data_port, "streaming audio");
 
-    for n in 0..total_packets {
+    let mut n: u32 = 0;
+    loop {
         let mut samples = [0i16; FRAMES_PER_PACKET * 2];
-        for frame in samples.chunks_exact_mut(2) {
-            let v = (phase.sin() * 0.6 * f32::from(i16::MAX)) as i16;
-            frame[0] = v;
-            frame[1] = v;
-            phase += step;
+        let frames = source.fill(&mut samples);
+        if frames == 0 {
+            break;
+        }
+        if frames < FRAMES_PER_PACKET {
+            // Zero-pad the final partial packet.
+            for v in &mut samples[frames * 2..] {
+                *v = 0;
+            }
         }
         let payload = alac_encode_verbatim(&samples);
 
@@ -126,12 +141,26 @@ pub fn stream_tone(
         if due > now {
             std::thread::sleep(due - now);
         }
+
+        n += 1;
     }
 
-    info!("tone finished, tearing down");
+    info!("stream finished, tearing down");
     session.set_rate(0).ok();
     session.teardown()?;
     Ok(())
+}
+
+/// Stream a sine tone to `addr` for `seconds`. Hardware smoke test for Step 4.
+pub fn stream_tone(
+    addr: SocketAddr,
+    device_id: &str,
+    seconds: u32,
+    freq: f32,
+    volume_db: Option<f32>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut source = SineSource::new(freq, seconds);
+    stream_audio(addr, device_id, &mut source, volume_db)
 }
 
 fn rand_seq() -> u16 {

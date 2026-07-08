@@ -15,6 +15,37 @@ async fn main() -> Result<()> {
 
     let args: Vec<String> = std::env::args().collect();
 
+    // `openair play <ip:port> <file.wav>` — stream a WAV file.
+    if args.len() >= 4 && args[1] == "play" {
+        let addr: SocketAddr = args[2].parse()?;
+        let path = std::path::Path::new(&args[3]);
+        println!("OpenAir — playing {} to {}\n", path.display(), addr);
+
+        if !path.exists() {
+            println!("  ✗ file not found: {}", path.display());
+            return Ok(());
+        }
+
+        let mut source = match openair_client::WavSource::open(path) {
+            Ok(s) => s,
+            Err(e) => {
+                println!("  ✗ unsupported or invalid WAV file: {}", e);
+                return Ok(());
+            }
+        };
+
+        match openair_client::stream_audio(
+            addr,
+            "AA:BB:CC:DD:EE:FF",
+            &mut source,
+            Some(-8.0),
+        ) {
+            Ok(()) => println!("  ✓ playback finished successfully"),
+            Err(e) => println!("  ✗ {}", e),
+        }
+        return Ok(());
+    }
+
     // `openair tone <ip:port> [seconds]` — stream a 440 Hz test tone (Step 4).
     if args.len() >= 3 && args[1] == "tone" {
         let addr: SocketAddr = args[2].parse()?;
