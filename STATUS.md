@@ -32,10 +32,10 @@
 | `audio-codec` | ✅ Partial | Yes | Verbatim ALAC encoder (uncompressed) plays on hardware; FDK-AAC in Step 5 |
 | `audio-rtp` | ✅ Done | Yes | RTP+AEAD packetizer, PTP anchor packets (0xD7), NTP sync (0xD4), retransmit backlog |
 | `timing` | ✅ Done | Yes | NTP responder + minimal PTP master (nqptp-verified) |
-| `capture` | ⬜ Stub | — | WASAPI / PipeWire / CoreAudio via cpal |
+| `capture` | ✅ Done (Win) | Yes | WASAPI loopback verified with live Spotify; PipeWire/CoreAudio later |
 | `ptp-helper` | ⬜ Stub | — | Privileged binary, IPC to main |
-| `client` | 🔄 Partial | Yes | stream_audio + AudioSource (sine, WAV w/ resampler); capture next |
-| `apps/cli` | 🔄 Partial | Yes | scan, pair, `tone <ip:port> [secs]`, `play <ip:port> <file.wav>` |
+| `client` | 🔄 Partial | Yes | stream_audio + AudioSource (sine, WAV, live capture w/ shared resampler) |
+| `apps/cli` | 🔄 Partial | Yes | scan, pair, `tone`, `play <file.wav>`, `capture [secs]` |
 | `apps/tui` | ⬜ Stub | — | |
 
 ---
@@ -51,8 +51,8 @@
 ## Next Steps
 
 1. **Step 5** — Buffered AAC PT=103 (FDK-AAC, event channel, FLUSHBUFFERED)
-2. System audio capture (WASAPI loopback via cpal) — WAV playback done 2026-07-08
-3. Retest Apple TV once authorized on-device; fix cosmetic TEARDOWN 451
+2. ~~System audio capture~~ done 2026-07-13 (WASAPI loopback, live-verified)
+3. Step 7 Normal pairing for Apple TV; Ctrl+C indefinite capture; volume flag
 
 ---
 

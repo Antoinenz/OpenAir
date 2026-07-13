@@ -15,6 +15,36 @@ async fn main() -> Result<()> {
 
     let args: Vec<String> = std::env::args().collect();
 
+    // `openair capture <ip:port> [seconds]` — stream live system audio
+    // (WASAPI loopback of the default output device) for `seconds` (default
+    // 30).
+    if args.len() >= 3 && args[1] == "capture" {
+        let addr: SocketAddr = args[2].parse()?;
+        let seconds: u32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(30);
+        println!("OpenAir — capturing {}s of system audio to {}\n", seconds, addr);
+
+        let cap = match openair_capture::SystemCapture::start() {
+            Ok(c) => c,
+            Err(e) => {
+                println!("  ✗ failed to start system audio capture: {}", e);
+                println!("    (no default output device, or WASAPI loopback unavailable)");
+                return Ok(());
+            }
+        };
+        println!("  device rate: {} Hz", cap.device_rate);
+
+        let mut source =
+            openair_client::CaptureSource::new(cap.ring.clone(), cap.device_rate, Some(seconds));
+
+        match openair_client::stream_audio(addr, "AA:BB:CC:DD:EE:FF", &mut source, Some(-8.0)) {
+            Ok(()) => println!("  ✓ capture streamed successfully"),
+            Err(e) => println!("  ✗ {}", e),
+        }
+        // `cap` stays alive (and capturing) until here, keeping the loopback
+        // stream running for the whole duration of the call above.
+        return Ok(());
+    }
+
     // `openair play <ip:port> <file.wav>` — stream a WAV file.
     if args.len() >= 4 && args[1] == "play" {
         let addr: SocketAddr = args[2].parse()?;

@@ -4,6 +4,39 @@
 
 ---
 
+## 2026-07-13 — Session 6: SYSTEM AUDIO CAPTURE 🎧→🔊 — the core product feature works
+
+### Result
+`openair capture 192.168.1.106:7000 20` streams live Windows system audio (Spotify →
+laptop speakers, WASAPI loopback) to the Pool Room speaker. Capture health telemetry:
+ring steady ~27k frames, zero silence-padded frames over the whole run.
+
+### What we built
+- `capture` crate: `SystemCapture::start()` — cpal input stream on the default OUTPUT
+  device (WASAPI loopback), F32/I16/U16 + any channel count, 4 s ring
+  (Arc<Mutex<VecDeque<i16>>>, drop-oldest). `cpal::Stream` is !Send — stays in the
+  binary; only the ring crosses threads.
+- `client`: `CaptureSource` (AudioSource) — 200 ms prebuffer, silence-fill on dry ring
+  (live capture must never starve RTP pacing), >1 s drift-guard drain, optional duration;
+  `LinearResampler` extracted from WavSource and shared. 46 tests green.
+- CLI: `openair capture <ip:port> [seconds]`.
+- Fixed TEARDOWN 451: shairport requires a binary-plist body (empty dict = close
+  connection); sessions now end 200.
+- Implementation again delegated to a Sonnet subagent from a tight spec (one-shot).
+
+### Gotchas
+- WASAPI loopback captures the post-mix signal: a muted/idle PC yields silence (and
+  possibly no callbacks at all) — first "silent" test run was exactly that; the
+  `capture health` debug log (ring level + silence-padded count) now makes it obvious.
+- PowerShell background-job SoundPlayer playback is unreliable as a test signal; use
+  real foreground audio (Spotify) for loopback testing.
+
+### Next
+- Step 5: buffered AAC PT=103; Step 7: Normal pairing (Apple TV); Ctrl+C for
+  indefinite capture; volume CLI flag; adaptive resampling for long sessions (Step 9).
+
+---
+
 ## 2026-07-08 — Session 5b: WAV file playback (first real audio content)
 
 ### What we did

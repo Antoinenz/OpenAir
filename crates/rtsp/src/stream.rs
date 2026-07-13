@@ -238,11 +238,23 @@ impl StreamSession {
     }
 
     /// TEARDOWN — end the session.
+    ///
+    /// Must carry a binary-plist body: an empty dict closes the whole
+    /// connection (a dict with a "streams" array would close just that
+    /// stream). Shairport Sync replies 451 "missing plist!" to a bodyless
+    /// TEARDOWN.
     pub fn teardown(&mut self) -> Result<(), SessionError> {
         info!("TEARDOWN");
-        let raw = self
-            .conn
-            .request("TEARDOWN", &self.uri.clone(), &[("Session", "1")], &[], None)?;
+        let mut buf = Vec::new();
+        plist::to_writer_binary(&mut buf, &plist::Value::Dictionary(plist::Dictionary::new()))
+            .map_err(|_| SessionError::PlistEncode)?;
+        let raw = self.conn.request(
+            "TEARDOWN",
+            &self.uri.clone(),
+            &[("Session", "1")],
+            &buf,
+            Some("application/x-apple-binary-plist"),
+        )?;
         check_ok(&raw)
     }
 

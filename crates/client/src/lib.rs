@@ -16,7 +16,7 @@ use openair_timing::{ptp_now_ns, PtpMaster};
 use tracing::{info, warn};
 
 mod source;
-pub use source::{SineSource, WavSource};
+pub use source::{CaptureSource, SineSource, WavSource};
 
 pub(crate) const SAMPLE_RATE: u32 = 44100;
 
