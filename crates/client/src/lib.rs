@@ -4,15 +4,19 @@
 //! Pipeline: pair → SETUP(timing=PTP) → SETUP(stream) → RECORD →
 //! SETRATEANCHORTIME(rate=1) → paced RTP audio + PTP master + /feedback →
 //! TEARDOWN.
-use std::net::{SocketAddr, UdpSocket};
+use std::io::Write;
+use std::net::{SocketAddr, TcpStream, UdpSocket};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use openair_audio_codec::{alac_encode_verbatim, FRAMES_PER_PACKET};
-use openair_audio_rtp::{build_audio_packet, AudioCipher, ControlChannel, SyncState};
+use openair_audio_codec::{alac_encode_verbatim, AacEncoder, AAC_FRAMES_PER_PACKET, FRAMES_PER_PACKET};
+use openair_audio_rtp::{
+    build_audio_packet, build_buffered_audio_block, AudioCipher, ControlChannel, SyncState,
+    AAC_44100_F24_2_SSRC,
+};
 use openair_rtsp::{StreamFormat, StreamSession, TimingConfig};
-use openair_timing::{ptp_now_ns, PtpMaster};
+use openair_timing::{ptp_now_ns, ptp_ns_to_secs_frac, PtpMaster};
 use tracing::{info, warn};
 
 mod source;
@@ -143,6 +147,133 @@ pub fn stream_audio(
         }
 
         n += 1;
+    }
+
+    info!("stream finished, tearing down");
+    session.set_rate(0).ok();
+    session.teardown()?;
+    Ok(())
+}
+
+/// Lead window (in samples) the buffered send loop tries to keep queued
+/// ahead of wall-clock playback: while `frames_sent - elapsed_frames` is at
+/// or above this, we sleep briefly instead of encoding/sending more.
+const BUFFERED_LEAD_SAMPLES: i64 = 88_200; // 2s @ 44100 Hz
+/// PTP lead time before the anchor's rtpTime=0 is scheduled to play.
+const BUFFERED_ANCHOR_LEAD_NS: u64 = 2_000_000_000;
+
+/// Stream audio pulled from `source` to `addr` using AirPlay 2's BUFFERED
+/// pipeline (stream type 103, AAC-LC): pair → SETUP(timing=PTP) →
+/// SETUP(stream type=103) → TCP connect to dataPort → RECORD →
+/// SETRATEANCHORTIME(full anchor) → send-ahead-paced AAC blocks over TCP +
+/// PTP master + /feedback → TEARDOWN.
+///
+/// Unlike [`stream_audio`] (realtime ALAC over UDP, paced to real time),
+/// this pipeline sends over a TCP connection to `dataPort` and paces with a
+/// send-ahead window: it keeps encoding/sending as fast as the source and
+/// encoder allow, only sleeping once it's ~2s ahead of wall-clock playback.
+/// The anchor is set once via RTSP (not the control-channel type-215 packets
+/// realtime uses), so `ControlChannel`'s PTP anchor loop is not spawned here
+/// — the control port is bound but left idle (SETUP still requires one).
+pub fn stream_audio_buffered(
+    addr: SocketAddr,
+    device_id: &str,
+    source: &mut dyn AudioSource,
+    volume_db: Option<f32>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // --- Idle control port (SETUP requires one; buffered streams anchor via RTSP) ---
+    let control = ControlChannel::bind()?;
+    let control_port = control.port;
+
+    // --- RTSP negotiation ---
+    let mut session = StreamSession::connect(addr, device_id)?;
+    let peer_ip = session.peer_ip();
+
+    // PTP master must run for the whole session, started before SETUP.
+    let ptp = PtpMaster::start(peer_ip)?;
+
+    session.setup_timing(TimingConfig::Ptp)?;
+    session.setup_stream(StreamFormat::AacBuffered, control_port)?;
+    let ports = session.ports;
+
+    // --- TCP audio data connection ---
+    let mut data_stream = TcpStream::connect(SocketAddr::new(peer_ip, ports.data_port))?;
+    data_stream.set_nodelay(true).ok();
+
+    // --- RECORD ---
+    let mut seq: u32 = rand_seq() as u32;
+    let first_rtptime: u32 = 0;
+    session.record(seq as u16, first_rtptime)?;
+
+    // --- Anchor: full SETRATEANCHORTIME, rtpTime=0 plays ~2s from now ---
+    let anchor_ns = ptp_now_ns() + BUFFERED_ANCHOR_LEAD_NS;
+    let (anchor_secs, anchor_frac) = ptp_ns_to_secs_frac(anchor_ns);
+    session.set_rate_anchor(ptp.clock_id, first_rtptime, anchor_secs, anchor_frac, 1)?;
+
+    if let Some(db) = volume_db {
+        if let Err(e) = session.set_volume(db) {
+            warn!("set_volume failed (continuing): {e}");
+        }
+    }
+
+    // --- Encode + send loop (send-ahead pacing) ---
+    let mut cipher = AudioCipher::new(&session.shk);
+    let mut encoder = AacEncoder::new()?;
+
+    let start_instant = Instant::now();
+    let mut last_feedback = Instant::now();
+
+    info!(data_port = ports.data_port, "streaming buffered AAC audio");
+
+    let mut rtptime: u32 = first_rtptime;
+    let mut frames_sent: i64 = 0;
+    let mut source_ended = false;
+
+    loop {
+        // Send-ahead pacing: if we're too far ahead of wall-clock playback,
+        // sleep instead of encoding/sending more.
+        let elapsed_frames = (start_instant.elapsed().as_secs_f64() * SAMPLE_RATE as f64) as i64;
+        if frames_sent - elapsed_frames >= BUFFERED_LEAD_SAMPLES {
+            std::thread::sleep(Duration::from_millis(10));
+            continue;
+        }
+
+        if source_ended {
+            break;
+        }
+
+        let mut samples = [0i16; AAC_FRAMES_PER_PACKET * 2];
+        let frames = source.fill(&mut samples);
+        if frames == 0 {
+            source_ended = true;
+            continue;
+        }
+        if frames < AAC_FRAMES_PER_PACKET {
+            // Zero-pad the final partial block.
+            for v in &mut samples[frames * 2..] {
+                *v = 0;
+            }
+        }
+
+        let aac_frame = encoder.encode(&samples)?;
+        if aac_frame.is_empty() {
+            // Encoder still priming: no output yet, don't advance rtptime.
+            continue;
+        }
+
+        let block = build_buffered_audio_block(&mut cipher, seq, rtptime, AAC_44100_F24_2_SSRC, &aac_frame);
+        data_stream.write_all(&block)?;
+
+        seq = seq.wrapping_add(1);
+        rtptime = rtptime.wrapping_add(AAC_FRAMES_PER_PACKET as u32);
+        frames_sent += AAC_FRAMES_PER_PACKET as i64;
+
+        if last_feedback.elapsed() >= Duration::from_secs(2) {
+            if let Err(e) = session.feedback() {
+                warn!("feedback failed: {e}");
+            }
+            last_feedback = Instant::now();
+        }
     }
 
     info!("stream finished, tearing down");

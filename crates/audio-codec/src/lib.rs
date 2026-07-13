@@ -79,6 +79,69 @@ pub fn alac_encode_verbatim(samples: &[i16]) -> Vec<u8> {
     w.into_bytes()
 }
 
+/// Samples per AAC-LC frame at 44100 Hz (buffered AirPlay 2 streams, PT=103).
+pub const AAC_FRAMES_PER_PACKET: usize = 1024;
+
+/// Error wrapper around `fdk_aac::enc::EncoderError` (not `Clone`/`PartialEq`,
+/// so we can't derive much — just carry the message through).
+#[derive(Debug, thiserror::Error)]
+#[error("AAC encoder error: {0}")]
+pub struct AacEncoderError(String);
+
+/// Raw AAC-LC encoder for buffered AirPlay 2 streams (stream type 103).
+///
+/// Wraps `fdk_aac::enc::Encoder` configured for 44100 Hz stereo, CBR 256kbps,
+/// `Transport::Raw` (no ADTS header — the receiver prepends its own). The
+/// encoder primes internally: the first call(s) to `encode` may return an
+/// empty `Vec` while it fills its lookahead buffer; callers should skip empty
+/// outputs and not advance `rtptime` for them. Each non-empty output
+/// corresponds to exactly one 1024-sample (per channel) input block.
+pub struct AacEncoder {
+    inner: fdk_aac::enc::Encoder,
+}
+
+impl AacEncoder {
+    pub fn new() -> Result<Self, AacEncoderError> {
+        let inner = fdk_aac::enc::Encoder::new(fdk_aac::enc::EncoderParams {
+            bit_rate: fdk_aac::enc::BitRate::Cbr(256_000),
+            sample_rate: 44100,
+            transport: fdk_aac::enc::Transport::Raw,
+            channels: fdk_aac::enc::ChannelMode::Stereo,
+            audio_object_type: fdk_aac::enc::AudioObjectType::Mpeg4LowComplexity,
+        })
+        .map_err(|e| AacEncoderError(e.to_string()))?;
+        Ok(AacEncoder { inner })
+    }
+
+    /// Encode one block of `AAC_FRAMES_PER_PACKET` (1024) interleaved stereo
+    /// i16 samples (`samples.len()` must be `AAC_FRAMES_PER_PACKET * 2`).
+    ///
+    /// Returns the raw AAC-LC frame bytes, or an empty `Vec` while the
+    /// encoder is still priming (first call(s) only).
+    pub fn encode(&mut self, samples_1024_stereo: &[i16]) -> Result<Vec<u8>, AacEncoderError> {
+        debug_assert_eq!(samples_1024_stereo.len(), AAC_FRAMES_PER_PACKET * 2);
+        let mut output = Vec::new();
+        let mut out_buf = [0u8; 4096];
+        let mut consumed_samples = 0usize;
+        // Loop until the encoder has consumed the entire input block,
+        // concatenating output (normally this is a single call).
+        while consumed_samples < samples_1024_stereo.len() {
+            let info = self
+                .inner
+                .encode(&samples_1024_stereo[consumed_samples..], &mut out_buf)
+                .map_err(|e| AacEncoderError(e.to_string()))?;
+            output.extend_from_slice(&out_buf[..info.output_size]);
+            if info.input_consumed == 0 {
+                // Encoder is priming and consumed nothing on this call but
+                // also produced no error — avoid spinning forever.
+                break;
+            }
+            consumed_samples += info.input_consumed;
+        }
+        Ok(output)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,5 +195,28 @@ mod tests {
         let samples = vec![1i16; 10];
         let frame = alac_encode_verbatim(&samples);
         assert_eq!(frame.len(), 1411);
+    }
+
+    #[test]
+    fn aac_encoder_smoke_test() {
+        let mut enc = AacEncoder::new().expect("encoder construction");
+        let mut non_empty_count = 0;
+        for i in 0..20 {
+            let mut samples = [0i16; AAC_FRAMES_PER_PACKET * 2];
+            for (n, s) in samples.chunks_mut(2).enumerate() {
+                let idx = i * AAC_FRAMES_PER_PACKET + n;
+                let v = (8000.0 * (2.0 * std::f32::consts::PI * 440.0 * idx as f32 / 44100.0).sin())
+                    as i16;
+                s[0] = v;
+                s[1] = v;
+            }
+            let out = enc.encode(&samples).expect("encode");
+            if !out.is_empty() {
+                non_empty_count += 1;
+                assert!(out.len() < 4096, "frame too large: {}", out.len());
+                assert!(out.len() > 8, "frame too small: {}", out.len());
+            }
+        }
+        assert!(non_empty_count > 0, "expected at least one non-empty AAC frame");
     }
 }

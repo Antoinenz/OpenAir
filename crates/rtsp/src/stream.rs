@@ -18,6 +18,9 @@ pub struct NegotiatedPorts {
     pub timing_port: u16,
     pub data_port: u16,
     pub control_port: u16,
+    /// Informational: receiver-advertised buffer size (buffered streams
+    /// only, from SETUP phase 2 `audioBufferSize`).
+    pub audio_buffer_size: Option<u64>,
 }
 
 /// Timing protocol for SETUP phase 1.
@@ -36,6 +39,9 @@ pub enum StreamFormat {
     AlacRealtime,
     /// Raw PCM realtime (ct=1, audioFormat 0x800) — pyatv-style fallback
     PcmRealtime,
+    /// AAC-LC/44100/2 buffered (type 103, ct=4, audioFormat 0x400000).
+    /// Transport is TCP (dataPort in the SETUP response is a TCP port).
+    AacBuffered,
 }
 
 /// A paired, encrypted RTSP session ready for stream negotiation.
@@ -146,30 +152,94 @@ impl StreamSession {
         check_ok(&raw)
     }
 
+    /// SETRATEANCHORTIME with the full anchor plist (buffered streams).
+    ///
+    /// Unlike realtime PTP streams — where the anchor travels on the control
+    /// channel as type-215 packets and this call only ever carries `rate` —
+    /// buffered streams (type 103) are anchored entirely through this RTSP
+    /// call. `network_secs`/`network_frac` come from `ptp_ns_to_secs_frac`
+    /// applied to the PTP time at which `rtptime` should play.
+    pub fn set_rate_anchor(
+        &mut self,
+        clock_id: u64,
+        rtptime: u32,
+        network_secs: u64,
+        network_frac: u64,
+        rate: u64,
+    ) -> Result<(), SessionError> {
+        let mut dict = plist::Dictionary::new();
+        dict.insert("networkTimeTimelineID".into(), clock_id.into());
+        dict.insert("networkTimeSecs".into(), network_secs.into());
+        dict.insert("networkTimeFrac".into(), network_frac.into());
+        dict.insert("networkTimeFlags".into(), 0u64.into());
+        dict.insert("rtpTime".into(), (rtptime as u64).into());
+        dict.insert("rate".into(), rate.into());
+
+        info!(rtptime, rate, "SETRATEANCHORTIME (full anchor)");
+        let mut buf = Vec::new();
+        plist::to_writer_binary(&mut buf, &plist::Value::Dictionary(dict))
+            .map_err(|_| SessionError::PlistEncode)?;
+        let raw = self.conn.request(
+            "SETRATEANCHORTIME",
+            &self.uri.clone(),
+            &[
+                ("DACP-ID", &self.dacp_id.clone()),
+                ("Active-Remote", &self.active_remote.to_string()),
+            ],
+            &buf,
+            Some("application/x-apple-binary-plist"),
+        )?;
+        check_ok(&raw)
+    }
+
     /// SETUP phase 2: audio stream definition → dataPort/controlPort.
+    ///
+    /// For `StreamFormat::AacBuffered` the returned `dataPort` is a **TCP**
+    /// port (all other formats use UDP); `audioBufferSize` (informational)
+    /// is stashed in `self.ports.audio_buffer_size` when present.
     pub fn setup_stream(
         &mut self,
         format: StreamFormat,
         control_port: u16,
     ) -> Result<(), SessionError> {
-        let (ct, audio_format): (u64, u64) = match format {
-            StreamFormat::AlacRealtime => (2, 0x40000),
-            StreamFormat::PcmRealtime => (1, 0x800),
-        };
         let mut stream = plist::Dictionary::new();
-        stream.insert("type".into(), 96u64.into());
-        stream.insert("ct".into(), ct.into());
-        stream.insert("audioFormat".into(), audio_format.into());
-        stream.insert("audioMode".into(), "default".into());
-        stream.insert("spf".into(), 352u64.into());
-        stream.insert("sr".into(), 44100u64.into());
-        stream.insert("latencyMin".into(), 11025u64.into());
-        stream.insert("latencyMax".into(), 88200u64.into());
-        stream.insert("shk".into(), plist::Value::Data(self.shk.to_vec()));
-        stream.insert("controlPort".into(), (control_port as u64).into());
-        stream.insert("isMedia".into(), true.into());
-        stream.insert("supportsDynamicStreamID".into(), false.into());
-        stream.insert("streamConnectionID".into(), (self.session_id as u64).into());
+        match format {
+            StreamFormat::AlacRealtime | StreamFormat::PcmRealtime => {
+                let (ct, audio_format): (u64, u64) = match format {
+                    StreamFormat::AlacRealtime => (2, 0x40000),
+                    StreamFormat::PcmRealtime => (1, 0x800),
+                    StreamFormat::AacBuffered => unreachable!(),
+                };
+                stream.insert("type".into(), 96u64.into());
+                stream.insert("ct".into(), ct.into());
+                stream.insert("audioFormat".into(), audio_format.into());
+                stream.insert("audioMode".into(), "default".into());
+                stream.insert("spf".into(), 352u64.into());
+                stream.insert("sr".into(), 44100u64.into());
+                stream.insert("latencyMin".into(), 11025u64.into());
+                stream.insert("latencyMax".into(), 88200u64.into());
+                stream.insert("shk".into(), plist::Value::Data(self.shk.to_vec()));
+                stream.insert("controlPort".into(), (control_port as u64).into());
+                stream.insert("isMedia".into(), true.into());
+                stream.insert("supportsDynamicStreamID".into(), false.into());
+                stream.insert("streamConnectionID".into(), (self.session_id as u64).into());
+            }
+            StreamFormat::AacBuffered => {
+                stream.insert("type".into(), 103u64.into());
+                stream.insert("ct".into(), 4u64.into());
+                stream.insert("audioFormat".into(), 0x400000u64.into());
+                stream.insert("spf".into(), 1024u64.into());
+                stream.insert("sr".into(), 44100u64.into());
+                stream.insert("shk".into(), plist::Value::Data(self.shk.to_vec()));
+                stream.insert("controlPort".into(), (control_port as u64).into());
+                stream.insert("latencyMin".into(), 11025u64.into());
+                stream.insert("latencyMax".into(), 88200u64.into());
+                stream.insert("isMedia".into(), true.into());
+                stream.insert("audioMode".into(), "default".into());
+                stream.insert("supportsDynamicStreamID".into(), false.into());
+                stream.insert("streamConnectionID".into(), (self.session_id as u64).into());
+            }
+        }
 
         let mut dict = plist::Dictionary::new();
         dict.insert(
@@ -188,8 +258,9 @@ impl StreamSession {
             .ok_or(SessionError::MissingPlistField("streams[0]"))?;
         self.ports.data_port = dict_port(streams, "dataPort")?;
         self.ports.control_port = dict_port(streams, "controlPort")?;
+        self.ports.audio_buffer_size = streams.get("audioBufferSize").and_then(|v| v.as_unsigned_integer());
         info!(data_port = self.ports.data_port, control_port = self.ports.control_port,
-              "SETUP 2 ok");
+              audio_buffer_size = ?self.ports.audio_buffer_size, "SETUP 2 ok");
         Ok(())
     }
 

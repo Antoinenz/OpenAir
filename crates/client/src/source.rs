@@ -6,6 +6,7 @@ use std::collections::VecDeque;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -285,6 +286,10 @@ pub struct CaptureSource {
     /// Set once the initial prebuffer wait has completed (or been skipped),
     /// so subsequent `fill()` calls don't re-wait.
     prebuffer_done: bool,
+    /// When set and `true`, the next `fill()` call ends the stream (returns
+    /// 0) regardless of `frames_remaining`. Lets callers (e.g. a Ctrl+C
+    /// handler) stop an indefinite capture cleanly.
+    stop: Option<Arc<AtomicBool>>,
     /// Diagnostics: fill() call counter and total silence-padded frames.
     fills: u64,
     silent_frames: u64,
@@ -294,7 +299,16 @@ impl CaptureSource {
     /// `ring`/`device_rate` come from `openair_capture::SystemCapture`.
     /// `max_seconds`, if set, bounds the total output to that many seconds
     /// of 44100 Hz audio; `fill` returns 0 (end of stream) once exhausted.
-    pub fn new(ring: Arc<Mutex<VecDeque<i16>>>, device_rate: u32, max_seconds: Option<u32>) -> Self {
+    /// `stop`, if set, is checked at the start of each `fill()`: once it's
+    /// `true`, `fill()` returns 0 (end of stream) even if `max_seconds`
+    /// hasn't elapsed (or was never set), so an indefinite capture can be
+    /// stopped cleanly (e.g. via Ctrl+C).
+    pub fn new(
+        ring: Arc<Mutex<VecDeque<i16>>>,
+        device_rate: u32,
+        max_seconds: Option<u32>,
+        stop: Option<Arc<AtomicBool>>,
+    ) -> Self {
         let frames_remaining = max_seconds.map(|s| u64::from(s) * u64::from(SAMPLE_RATE));
         // The resampler needs an initial two-frame bracket, but the ring
         // may not have any data yet (capture just started) — prime with
@@ -308,6 +322,7 @@ impl CaptureSource {
             resampler,
             frames_remaining,
             prebuffer_done: false,
+            stop,
             fills: 0,
             silent_frames: 0,
         }
@@ -365,6 +380,12 @@ impl CaptureSource {
 
 impl AudioSource for CaptureSource {
     fn fill(&mut self, buf: &mut [i16]) -> usize {
+        if let Some(stop) = &self.stop {
+            if stop.load(Ordering::Relaxed) {
+                return 0;
+            }
+        }
+
         let mut max_frames = buf.len() / 2;
 
         if let Some(remaining) = self.frames_remaining {
@@ -730,7 +751,7 @@ mod tests {
                 guard.push_back(f[1]);
             }
         }
-        let mut src = CaptureSource::new(ring.clone(), device_rate, max_seconds);
+        let mut src = CaptureSource::new(ring.clone(), device_rate, max_seconds, None);
         // Skip the real prebuffer wait (which polls in 5ms increments up to
         // 500ms) — tests preload the ring directly, so there's nothing to
         // wait for.
@@ -788,6 +809,27 @@ mod tests {
         }
         assert_eq!(total, 44100);
         assert_eq!(src.fill(&mut buf), 0, "must keep returning 0 after limit");
+    }
+
+    #[test]
+    fn capture_source_stop_flag_ends_stream() {
+        // Preloaded ring with plenty of data and no duration limit; setting
+        // the stop flag before fill() must still end the stream (return 0).
+        let frames = ramp_frames(1000);
+        let ring = Arc::new(Mutex::new(VecDeque::new()));
+        {
+            let mut guard = ring.lock().unwrap();
+            for f in &frames {
+                guard.push_back(f[0]);
+                guard.push_back(f[1]);
+            }
+        }
+        let stop = Arc::new(AtomicBool::new(true));
+        let mut src = CaptureSource::new(ring, 44100, None, Some(stop));
+        src.prebuffer_done = true;
+
+        let mut buf = [1i16; 352 * 2];
+        assert_eq!(src.fill(&mut buf), 0, "stop flag set before fill must end the stream");
     }
 
     #[test]

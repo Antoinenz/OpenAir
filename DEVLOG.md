@@ -4,6 +4,39 @@
 
 ---
 
+## 2026-07-14 — Session 7: Step 5 done (buffered AAC) + CLI QoL
+
+### Results (all hardware-verified on Pool Room)
+- **Buffered AAC (type 103)**: `tone <dest> 10 --buffered` and `play <wav> --buffered`
+  play cleanly — FDK-AAC (CBR 256k, raw frames, receiver adds ADTS), TCP transport,
+  full-form SETRATEANCHORTIME anchoring, 2 s send-ahead pacing.
+- **CLI QoL**: receiver by name (`openair tone pool 3`), `--volume <db>`, indefinite
+  `capture` until Ctrl+C.
+
+### Buffered protocol notes (from shairport-sync source, hardware-confirmed)
+- SETUP 2: {type:103, ct:4, audioFormat:0x400000, spf:1024, shk, controlPort, …} →
+  response dataPort is **TCP**, plus audioBufferSize (informational, ~8 MB).
+- Block wire format: `u16 BE length (incl. itself) || u32 BE 0x80800000|(seq&0x7FFFFF)
+  || u32 BE rtptime || u32 BE ssrc || ct+tag || nonce8`; AAD = bytes[4..12]; same shk
+  and AEAD scheme as realtime; SSRC signals the codec per block (0x16000000 = AAC-LC
+  44.1 kHz stereo); rtptime += 1024 per block.
+- Anchoring: full SETRATEANCHORTIME plist (networkTimeTimelineID = our PTP clock id,
+  Secs/Frac = 2^-64 fraction, rtpTime, rate) — NOT the control-port 215 packets
+  (those are the realtime mechanism; sending both would create competing anchors).
+- fdk-aac crate (0.8) builds on Windows MSVC in ~13 s; `encode()` counts individual
+  i16 samples (not frames); first call(s) return empty output while priming — skip
+  them without advancing rtptime.
+
+### Delegation model working well
+Both features implemented one-shot by Sonnet subagents from tight, protocol-complete
+specs; supervisor did research (shairport/nqptp source), hardware tests, and review.
+
+### Next
+- Step 7: Normal HomeKit pairing (M1–M6 + pair-verify + persisted Ed25519 identity)
+  → unlocks Apple TV. Then Step 8 (multi-room) / Step 9 (hardening).
+
+---
+
 ## 2026-07-13 — Session 6: SYSTEM AUDIO CAPTURE 🎧→🔊 — the core product feature works
 
 ### Result

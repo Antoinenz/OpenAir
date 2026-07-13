@@ -72,6 +72,49 @@ pub fn build_audio_packet(
     packet
 }
 
+/// SSRC for buffered AAC/44100/2 streams (type 103) — shairport-sync's
+/// `AAC_44100_F24_2`.
+pub const AAC_44100_F24_2_SSRC: u32 = 0x1600_0000;
+
+/// Build one encrypted buffered-audio TCP block (stream type 103, AAC-LC).
+///
+/// Wire layout, written in full by this function (ready to write to the TCP
+/// socket as-is):
+/// ```text
+/// u16 BE length            (includes these 2 bytes)
+/// u32 BE 0x80800000 | (seq & 0x7FFFFF)   (version/marker byte + 23-bit seq)
+/// u32 BE rtptime
+/// u32 BE ssrc               (0x16000000 for AAC_44100_F24_2)
+/// ciphertext || 16-byte tag
+/// 8-byte nonce
+/// ```
+/// `payload` is one raw AAC-LC frame (no ADTS header — the receiver adds
+/// it). AAD is the 8 bytes `rtptime || ssrc` (block bytes [4..12]).
+pub fn build_buffered_audio_block(
+    cipher: &mut AudioCipher,
+    seq: u32,
+    rtptime: u32,
+    ssrc: u32,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut prefix = [0u8; 12];
+    let word0 = 0x8080_0000u32 | (seq & 0x007F_FFFF);
+    prefix[0..4].copy_from_slice(&word0.to_be_bytes());
+    prefix[4..8].copy_from_slice(&rtptime.to_be_bytes());
+    prefix[8..12].copy_from_slice(&ssrc.to_be_bytes());
+
+    let (ct, nonce8) = cipher.encrypt(payload, &prefix[4..12]);
+
+    let body_len = 12 + ct.len() + 8;
+    let total_len = 2 + body_len;
+    let mut block = Vec::with_capacity(total_len);
+    block.extend_from_slice(&(total_len as u16).to_be_bytes());
+    block.extend_from_slice(&prefix);
+    block.extend_from_slice(&ct);
+    block.extend_from_slice(&nonce8);
+    block
+}
+
 /// Build a control-channel sync packet (PT=0xD4, marker on first).
 ///
 /// `rtptime` is the current stream head (with latency), `latency` in samples,
@@ -343,6 +386,44 @@ mod tests {
         let ct = &pkt[12..pkt.len() - 8];
         let plain = cipher_rx
             .decrypt(Nonce::from_slice(&nonce), Payload { msg: ct, aad: &pkt[4..12] })
+            .unwrap();
+        assert_eq!(plain, payload);
+    }
+
+    #[test]
+    fn buffered_audio_block_layout_and_decrypts() {
+        let shk = [5u8; 32];
+        let mut cipher = AudioCipher::new(&shk);
+        let payload = b"raw aac-lc frame bytes".to_vec();
+        let seq: u32 = 0x00ABCDEF; // within 23-bit range
+        let rtptime: u32 = 1024;
+        let block = build_buffered_audio_block(&mut cipher, seq, rtptime, AAC_44100_F24_2_SSRC, &payload);
+
+        // Length prefix includes the 2 length bytes themselves.
+        let declared_len = u16::from_be_bytes([block[0], block[1]]) as usize;
+        assert_eq!(declared_len, block.len());
+
+        // word0 = 0x80800000 | (seq & 0x7FFFFF)
+        let word0 = u32::from_be_bytes([block[2], block[3], block[4], block[5]]);
+        assert_eq!(word0, 0x8080_0000 | (seq & 0x007F_FFFF));
+
+        let rtptime_be = u32::from_be_bytes([block[6], block[7], block[8], block[9]]);
+        assert_eq!(rtptime_be, rtptime);
+        let ssrc_be = u32::from_be_bytes([block[10], block[11], block[12], block[13]]);
+        assert_eq!(ssrc_be, AAC_44100_F24_2_SSRC);
+
+        // Receiver-style decrypt: nonce from tail, AAD = block[4..12]
+        // (offset by 2 for the length prefix that precedes the RTP-ish header).
+        let header_start = 2;
+        let aad = &block[header_start + 4..header_start + 12];
+        let ct = &block[header_start + 12..block.len() - 8];
+        let nonce_bytes = &block[block.len() - 8..];
+
+        let cipher_rx = ChaCha20Poly1305::new(Key::from_slice(&shk));
+        let mut nonce = [0u8; 12];
+        nonce[4..].copy_from_slice(nonce_bytes);
+        let plain = cipher_rx
+            .decrypt(Nonce::from_slice(&nonce), Payload { msg: ct, aad })
             .unwrap();
         assert_eq!(plain, payload);
     }

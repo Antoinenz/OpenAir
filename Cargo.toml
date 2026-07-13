@@ -49,6 +49,9 @@ plist = "1"
 # Audio capture
 cpal = "0.15"
 
+# AAC encoding (buffered AirPlay 2 streams, PT=103)
+fdk-aac = "0.8"
+
 # WAV file decoding
 hound = "3"
 
@@ -66,6 +69,9 @@ async-trait = "0.1"
 # TUI
 ratatui = "0.28"
 crossterm = "0.28"
+
+# Ctrl+C handling
+ctrlc = "3"
 
 [profile.release]
 opt-level = 3

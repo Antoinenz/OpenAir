@@ -10,7 +10,7 @@
 | 2 | HomeKit Transient pairing (SRP-6a, PIN "3939") | ✅ Done | Hardware-verified vs Shairport Sync 2026-07-07 (after N typo + Flags TLV fixes) |
 | 3 | Encrypted RTSP (`GET /info` over ChaCha20-Poly1305) | ✅ Done | Hardware-verified 2026-07-07: encrypted GET /info → 701 bytes (580 B plist) |
 | 4 | Timing + realtime ALAC PT=96 | ✅ Done | Hardware-verified 2026-07-08: 440 Hz tone audible on Pool Room; PTP (pulled fwd from Step 6), collinear type-215 anchors |
-| 5 | Buffered AAC PT=103 | ⬜ Not Started | |
+| 5 | Buffered AAC PT=103 | ✅ Done | Hardware-verified 2026-07-14: FDK-AAC over TCP, full SETRATEANCHORTIME anchor, --buffered flag |
 | 6 | PTP timing (HomePod, BMCA yield) | 🔄 Partial | Minimal PTP master done (Announce+Sync/Follow_Up, nqptp-verified); BMCA yield + Delay_Req + ptp-helper (Linux) remain |
 | 7 | Normal pairing (Apple TV + PIN, persist identity) | ⬜ Not Started | |
 | 8 | Multi-room group streaming | ⬜ Not Started | |
@@ -29,13 +29,13 @@
 | `crypto` | ✅ Done | Yes | SRP-6a 3072-bit (N fingerprint-guarded), HKDF-SHA-512, ChaCha20-Poly1305 with AAD; 11 tests |
 | `pairing` | ✅ Done | Yes | TLV8 (Flags=0x13), `TransientPairing` M1–M4 incl. M2-proof verify; 7 tests |
 | `rtsp` | ✅ Done | Yes | `pair_and_get_info` verified vs Shairport Sync (AirTunes/366.0) |
-| `audio-codec` | ✅ Partial | Yes | Verbatim ALAC encoder (uncompressed) plays on hardware; FDK-AAC in Step 5 |
+| `audio-codec` | ✅ Done | Yes | Verbatim ALAC + FDK-AAC (CBR 256k) both play on hardware |
 | `audio-rtp` | ✅ Done | Yes | RTP+AEAD packetizer, PTP anchor packets (0xD7), NTP sync (0xD4), retransmit backlog |
 | `timing` | ✅ Done | Yes | NTP responder + minimal PTP master (nqptp-verified) |
 | `capture` | ✅ Done (Win) | Yes | WASAPI loopback verified with live Spotify; PipeWire/CoreAudio later |
 | `ptp-helper` | ⬜ Stub | — | Privileged binary, IPC to main |
 | `client` | 🔄 Partial | Yes | stream_audio + AudioSource (sine, WAV, live capture w/ shared resampler) |
-| `apps/cli` | 🔄 Partial | Yes | scan, pair, `tone`, `play <file.wav>`, `capture [secs]` |
+| `apps/cli` | 🔄 Partial | Yes | scan, pair, tone/play/capture with name resolution, --volume, --buffered, Ctrl+C |
 | `apps/tui` | ⬜ Stub | — | |
 
 ---
@@ -50,9 +50,8 @@
 
 ## Next Steps
 
-1. **Step 5** — Buffered AAC PT=103 (FDK-AAC, event channel, FLUSHBUFFERED)
-2. ~~System audio capture~~ done 2026-07-13 (WASAPI loopback, live-verified)
-3. Step 7 Normal pairing for Apple TV; Ctrl+C indefinite capture; volume flag
+1. **Step 7** — Normal HomeKit pairing (M1–M6, pair-verify, persist Ed25519 identity) → Apple TV
+2. Step 8 multi-room; Step 9 hardening (adaptive resample, retransmit tuning, DSCP)
 
 ---
 

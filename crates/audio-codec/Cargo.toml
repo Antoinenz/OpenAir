@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 openair-core = { path = "../core" }
 thiserror.workspace = true
+fdk-aac.workspace = true
 
 [build-dependencies]
 # cc will be added here when we vendor FDK-AAC / ALAC C sources
