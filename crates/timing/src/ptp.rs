@@ -144,7 +144,13 @@ impl PtpMaster {
                 }
                 debug!(seq = sync_seq, "PTP sync+follow_up sent");
                 sync_seq = sync_seq.wrapping_add(1);
-                std::thread::sleep(Duration::from_millis(250));
+                // Fast cadence for the first ~3s: the receiver's clock
+                // daemon (nqptp) resets its records when a session starts
+                // and its offset smoothing needs several follow_ups to
+                // converge — more early samples = less audible resync/mute
+                // churn at stream start.
+                let interval = if sync_seq < 30 { 100 } else { 250 };
+                std::thread::sleep(Duration::from_millis(interval));
             }
         });
 

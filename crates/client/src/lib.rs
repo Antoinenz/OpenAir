@@ -62,6 +62,12 @@ pub fn stream_audio(
     session.setup_stream(StreamFormat::AlacRealtime, control_port)?;
     let ports = session.ports;
 
+    // Let the receiver's clock daemon converge on our PTP clock before audio
+    // starts: nqptp resets its clock records at SETUP and its offset
+    // smoothing needs ~1-2s of follow_ups; starting audio immediately causes
+    // audible resync churn in the first seconds.
+    std::thread::sleep(Duration::from_millis(1500));
+
     // Shared clock state for the control thread. t0 = PTP time of frame 0;
     // all anchor packets extrapolate from it (collinear anchor line).
     let t0_ns = ptp_now_ns();
@@ -159,8 +165,12 @@ pub fn stream_audio(
 /// ahead of wall-clock playback: while `frames_sent - elapsed_frames` is at
 /// or above this, we sleep briefly instead of encoding/sending more.
 const BUFFERED_LEAD_SAMPLES: i64 = 88_200; // 2s @ 44100 Hz
-/// PTP lead time before the anchor's rtpTime=0 is scheduled to play.
-const BUFFERED_ANCHOR_LEAD_NS: u64 = 2_000_000_000;
+/// Default PTP lead time before the anchor's rtpTime=0 is scheduled to play.
+/// This IS the end-to-end latency of a buffered stream (plus capture-side
+/// buffering) — the realtime pipeline's ~2 s is fixed by protocol constants,
+/// but the buffered anchor is the sender's choice. 500 ms matches Apple's
+/// typical buffered latency and is comfortable on a LAN.
+const BUFFERED_ANCHOR_LEAD_MS_DEFAULT: u64 = 500;
 
 /// Stream audio pulled from `source` to `addr` using AirPlay 2's BUFFERED
 /// pipeline (stream type 103, AAC-LC): pair → SETUP(timing=PTP) →
@@ -181,6 +191,25 @@ pub fn stream_audio_buffered(
     source: &mut dyn AudioSource,
     volume_db: Option<f32>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    stream_audio_buffered_with_latency(
+        addr,
+        device_id,
+        source,
+        volume_db,
+        BUFFERED_ANCHOR_LEAD_MS_DEFAULT,
+    )
+}
+
+/// [`stream_audio_buffered`] with an explicit anchor lead (end-to-end
+/// latency) in milliseconds. Values below ~300 ms risk underruns while the
+/// receiver's clock estimate is still converging.
+pub fn stream_audio_buffered_with_latency(
+    addr: SocketAddr,
+    device_id: &str,
+    source: &mut dyn AudioSource,
+    volume_db: Option<f32>,
+    latency_ms: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
     // --- Idle control port (SETUP requires one; buffered streams anchor via RTSP) ---
     let control = ControlChannel::bind()?;
     let control_port = control.port;
@@ -196,6 +225,10 @@ pub fn stream_audio_buffered(
     session.setup_stream(StreamFormat::AacBuffered, control_port)?;
     let ports = session.ports;
 
+    // Let the receiver's clock daemon converge on our PTP clock before
+    // anchoring (see stream_audio for rationale).
+    std::thread::sleep(Duration::from_millis(1500));
+
     // --- TCP audio data connection ---
     let mut data_stream = TcpStream::connect(SocketAddr::new(peer_ip, ports.data_port))?;
     data_stream.set_nodelay(true).ok();
@@ -205,8 +238,8 @@ pub fn stream_audio_buffered(
     let first_rtptime: u32 = 0;
     session.record(seq as u16, first_rtptime)?;
 
-    // --- Anchor: full SETRATEANCHORTIME, rtpTime=0 plays ~2s from now ---
-    let anchor_ns = ptp_now_ns() + BUFFERED_ANCHOR_LEAD_NS;
+    // --- Anchor: full SETRATEANCHORTIME, rtpTime=0 plays latency_ms from now ---
+    let anchor_ns = ptp_now_ns() + latency_ms * 1_000_000;
     let (anchor_secs, anchor_frac) = ptp_ns_to_secs_frac(anchor_ns);
     session.set_rate_anchor(ptp.clock_id, first_rtptime, anchor_secs, anchor_frac, 1)?;
 

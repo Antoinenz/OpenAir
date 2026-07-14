@@ -4,6 +4,22 @@
 
 ---
 
+## 2026-07-14 — Session 7b: buffered latency tuning (glitch-free, user-controllable)
+
+- **Glitchy buffered-capture start fixed**: the send-ahead loop raced 2 s ahead of a live
+  source, padding the lead window with silence dribbles. `CaptureSource::with_blocking()`
+  now rate-limits buffered pipelines by waiting for real ring data.
+- **PTP warm-up**: 100 ms sync cadence for the first ~3 s + 1.5 s settle between SETUP and
+  RECORD (nqptp resets clock records at SETUP; smoothing needs follow_ups to converge).
+- **Latency is now sender-controlled**: buffered anchor lead default 500 ms, `--latency <ms>`
+  flag (realtime stays ~2 s — protocol constants). Stale setup-time capture audio dropped at
+  stream start (was carrying up to 4 s of ring backlog).
+- A/B verified by stopwatch: 300 vs 1500 ms clearly track the flag.
+- Debugging gotcha: an A/B test ran a stale `target\debug` binary — our hand-rolled arg
+  parser silently ignores unknown flags, masking it. (Consider warning on unknown args.)
+
+---
+
 ## 2026-07-14 — Session 7: Step 5 done (buffered AAC) + CLI QoL
 
 ### Results (all hardware-verified on Pool Room)

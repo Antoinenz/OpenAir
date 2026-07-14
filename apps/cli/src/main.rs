@@ -61,6 +61,29 @@ mod util {
         raw.split("._airplay").next().unwrap_or(raw).to_string()
     }
 
+    /// Extracts an optional `--latency <ms>` flag (buffered pipeline anchor
+    /// lead / end-to-end latency). Same semantics as `extract_volume`.
+    pub fn extract_latency(args: &[String], default: u64) -> (Vec<String>, u64) {
+        let mut remaining = Vec::with_capacity(args.len());
+        let mut latency = default;
+        let mut skip_next = false;
+        for (i, arg) in args.iter().enumerate() {
+            if skip_next {
+                skip_next = false;
+                continue;
+            }
+            if arg == "--latency" {
+                if let Some(v) = args.get(i + 1) {
+                    latency = v.parse().unwrap_or(default);
+                    skip_next = true;
+                }
+                continue;
+            }
+            remaining.push(arg.clone());
+        }
+        (remaining, latency)
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -201,14 +224,23 @@ async fn main() -> Result<()> {
 
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
     let (raw_args, volume_db) = extract_volume(&raw_args, DEFAULT_VOLUME_DB);
+    let (raw_args, latency_ms) = util::extract_latency(&raw_args, 500);
     let (args, buffered) = extract_flag(&raw_args, "--buffered");
 
-    // Dispatches to the realtime ALAC pipeline or the buffered AAC pipeline
-    // depending on the `--buffered` flag.
-    let stream_fn = if buffered {
-        openair_client::stream_audio_buffered
-    } else {
-        openair_client::stream_audio
+    // Dispatches to the realtime ALAC pipeline (fixed ~2s protocol latency)
+    // or the buffered AAC pipeline (sender-chosen latency, `--latency <ms>`,
+    // default 500) depending on the `--buffered` flag.
+    let stream_fn = move |addr: SocketAddr,
+                          device_id: &str,
+                          source: &mut dyn openair_client::AudioSource,
+                          volume: Option<f32>| {
+        if buffered {
+            openair_client::stream_audio_buffered_with_latency(
+                addr, device_id, source, volume, latency_ms,
+            )
+        } else {
+            openair_client::stream_audio(addr, device_id, source, volume)
+        }
     };
 
     // `openair capture <ip:port|name> [seconds] [--volume <db>] [--buffered]` — stream
@@ -253,6 +285,12 @@ async fn main() -> Result<()> {
             seconds,
             Some(stop),
         );
+        // Buffered pipelines send ahead of realtime; a live source must
+        // rate-limit them by blocking for data instead of padding silence
+        // (which sounds like glitchy, chopped audio for the first seconds).
+        if buffered {
+            source = source.with_blocking();
+        }
 
         match stream_fn(addr, &device_id, &mut source, Some(volume_db)) {
             Ok(()) => println!("  ✓ capture streamed successfully"),

@@ -293,6 +293,13 @@ pub struct CaptureSource {
     /// Diagnostics: fill() call counter and total silence-padded frames.
     fills: u64,
     silent_frames: u64,
+    /// Blocking mode (for buffered/send-ahead pipelines): `fill()` waits for
+    /// real ring data instead of padding silence, which rate-limits the
+    /// send-ahead loop to the live capture rate. Without this, a buffered
+    /// pipeline "racing ahead" of a live source pads its whole lead window
+    /// with silence-mixed-with-dribbles — audibly glitchy for the first
+    /// seconds of a session.
+    blocking: bool,
 }
 
 impl CaptureSource {
@@ -325,6 +332,37 @@ impl CaptureSource {
             stop,
             fills: 0,
             silent_frames: 0,
+            blocking: false,
+        }
+    }
+
+    /// Enable blocking mode: `fill()` waits (bounded) for live ring data
+    /// instead of silence-padding. Use with send-ahead (buffered) pipelines;
+    /// realtime pipelines must stay non-blocking so RTP pacing never stalls.
+    pub fn with_blocking(mut self) -> Self {
+        self.blocking = true;
+        self
+    }
+
+    /// In blocking mode: wait (short polls, bounded) until the ring holds
+    /// enough device-rate samples to produce `frames` output frames.
+    fn wait_for_frames(&self, frames: usize) {
+        // Output frames → device-rate samples (stereo interleaved), plus one
+        // spare frame for the resampler bracket.
+        let needed =
+            ((frames as f64 * f64::from(self.device_rate) / f64::from(SAMPLE_RATE)) as usize + 2)
+                * 2;
+        let deadline = Instant::now() + Duration::from_millis(1000);
+        loop {
+            if self.ring.lock().unwrap().len() >= needed || Instant::now() >= deadline {
+                break;
+            }
+            if let Some(stop) = &self.stop {
+                if stop.load(Ordering::SeqCst) {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(PREBUFFER_POLL_MS));
         }
     }
 
@@ -400,7 +438,24 @@ impl AudioSource for CaptureSource {
         }
 
         if !self.prebuffer_done {
+            if self.blocking {
+                // Live low-latency start: everything captured while the
+                // session was being negotiated is stale — drop all but the
+                // newest ~100 ms so playback starts near "now" instead of
+                // seconds in the past.
+                let keep = (self.device_rate as usize / 10) * 2;
+                let mut guard = self.ring.lock().unwrap();
+                let len = guard.len();
+                if len > keep {
+                    guard.drain(..len - keep);
+                }
+                drop(guard);
+            }
             self.wait_for_prebuffer();
+        }
+
+        if self.blocking {
+            self.wait_for_frames(max_frames);
         }
 
         self.apply_drift_guard();
