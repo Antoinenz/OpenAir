@@ -34,8 +34,8 @@
 | `timing` | ✅ Done | Yes | NTP responder + minimal PTP master (nqptp-verified) |
 | `capture` | ✅ Done (Win) | Yes | WASAPI loopback verified with live Spotify; PipeWire/CoreAudio later |
 | `ptp-helper` | ⬜ Stub | — | Privileged binary, IPC to main |
-| `client` | 🔄 Partial | Yes | stream_audio + AudioSource (sine, WAV, live capture w/ shared resampler) |
-| `apps/cli` | 🔄 Partial | Yes | scan, pair, tone/play/capture with name resolution, --volume, --buffered, Ctrl+C |
+| `client` | ✅ Done (v1) | Yes | stream_audio (realtime) + stream_audio_buffered (AAC, tunable latency); AudioSource: sine/WAV/live capture |
+| `apps/cli` | ✅ Done (v1) | Yes | scan, pair, tone/play/capture; name resolution, --volume, --buffered, --latency <ms>, Ctrl+C |
 | `apps/tui` | ⬜ Stub | — | |
 
 ---

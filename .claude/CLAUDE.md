@@ -15,9 +15,11 @@ https://github.com/mikebrady/shairport-sync
 https://github.com/lmcgartland/airplay2-rs/
 https://nto.github.io/AirPlay.html
 
-## Planned Architecture
+## Architecture
 
-No code exists yet. Use a **Rust workspace** with this crate layout when scaffolding:
+Implemented as a **Rust workspace** (Steps 1–5 of §16 are DONE and hardware-verified —
+see STATUS.md for live state and DEVLOG.md for protocol findings before changing
+protocol code):
 
 crates/
   core/          # shared types, errors, traits
@@ -45,16 +47,19 @@ cargo clippy -- -D warnings
 
 Implementation Order
 
-Follow §16 of the research brief:
-1. mDNS discovery + TXT feature-bit parsing
-2. HomeKit Transient pairing (SRP-6a, PIN "3939", skip M5/M6)
-3. Encrypted RTSP (GET /info over ChaCha20-Poly1305 channel)
-4. NTP timing + realtime ALAC PT=96 (target AirPort Express first)
-5. Buffered AAC PT=103
-6. PTP timing (required for HomePod — BMCA yield flow)
-7. Normal pairing (Apple TV + PIN, persist identity to disk)
+Follow §16 of the research brief (✅ = done, hardware-verified):
+1. ✅ mDNS discovery + TXT feature-bit parsing
+2. ✅ HomeKit Transient pairing (SRP-6a, PIN "3939", skip M5/M6)
+3. ✅ Encrypted RTSP (GET /info over ChaCha20-Poly1305 channel)
+4. ✅ Realtime ALAC PT=96 — over PTP, not NTP (Shairport can't do AP2-NTP; see DEVLOG)
+5. ✅ Buffered AAC PT=103 (FDK-AAC over TCP, tunable --latency)
+6. 🔄 PTP timing — minimal master done (nqptp-verified); BMCA yield + Delay_Req for HomePod remain
+7. Normal pairing (Apple TV + PIN, persist identity to disk) ← NEXT
 8. Multi-room streaming
 9. Real-time hardening (SCHED_FIFO, DSCP EF, retransmit <5ms)
+
+Hardware-verified protocol knowledge lives in DEVLOG.md — READ IT before touching
+protocol code (anchoring, PTP, TLV formats, AEAD framing were all hard-won).
 
 Critical Protocol Rules
 - Port negotiation: always use ports from SETUP response — never hardcode 7000. Apple TV quirk: timingPort=0 in response → use sender's configured port.
