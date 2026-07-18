@@ -45,6 +45,37 @@ fn connect_session(
     Ok(StreamSession::connect(addr, device_id)?)
 }
 
+/// Connect the reverse "event" TCP channel (port from SETUP phase 1).
+///
+/// Apple receivers (Apple TV / HomePod) expect the sender to connect here
+/// before RECORD completes — owntone does the same ("reverse connection,
+/// used to receive playback events"). Without it RECORD stalls until our
+/// read timeout. We never send anything; a drain thread discards whatever
+/// the receiver pushes. Shairport doesn't need this — warn-and-continue.
+fn open_event_channel(peer_ip: std::net::IpAddr, event_port: u16) -> Option<TcpStream> {
+    match TcpStream::connect(SocketAddr::new(peer_ip, event_port)) {
+        Ok(s) => {
+            s.set_nodelay(true).ok();
+            if let Ok(mut rdr) = s.try_clone() {
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 2048];
+                    while let Ok(n) = std::io::Read::read(&mut rdr, &mut buf) {
+                        if n == 0 {
+                            break;
+                        }
+                    }
+                });
+            }
+            info!(event_port, "event channel connected");
+            Some(s)
+        }
+        Err(e) => {
+            warn!("event channel connect failed (continuing): {e}");
+            None
+        }
+    }
+}
+
 /// One-time Normal HomeKit pair-setup with PIN (Apple TV / HomePod).
 ///
 /// Shows a PIN on the device; `pin_provider` must return it (e.g. from
@@ -104,11 +135,32 @@ pub fn stream_audio(
     session.setup_stream(StreamFormat::AlacRealtime, control_port)?;
     let ports = session.ports;
 
+    // Reverse event channel — must be connected before RECORD on Apple
+    // receivers (held open for the whole session).
+    let _event = open_event_channel(peer_ip, ports.event_port);
+
+    // Real Apple receivers need SETPEERS to know which clock to monitor;
+    // Shairport ignores it (warn-and-continue keeps older receivers happy).
+    if let Err(e) = session.set_peers() {
+        warn!("SETPEERS failed (continuing): {e}");
+    }
+
     // Let the receiver's clock daemon converge on our PTP clock before audio
     // starts: nqptp resets its clock records at SETUP and its offset
     // smoothing needs ~1-2s of follow_ups; starting audio immediately causes
     // audible resync churn in the first seconds.
     std::thread::sleep(Duration::from_millis(1500));
+
+    // Which timeline do anchors live on? Ours (Shairport slaves to us), or
+    // the receiver's own grandmaster (Apple TV/HomePod — we yielded during
+    // the warm-up above and measured our offset to its clock).
+    let tl = ptp.active_timeline();
+    info!(
+        gm = format!("{:016x}", tl.gm_id),
+        offset_ms = tl.offset_ns as f64 / 1e6,
+        foreign = tl.gm_id != ptp.clock_id,
+        "anchor timeline"
+    );
 
     // Shared clock state for the control thread. t0 = PTP time of frame 0;
     // all anchor packets extrapolate from it (collinear anchor line).
@@ -118,6 +170,8 @@ pub fn stream_audio(
         start_ts: std::sync::atomic::AtomicU64::new(0),
         latency: std::sync::atomic::AtomicU64::new(0),
         t0_ns: std::sync::atomic::AtomicU64::new(t0_ns),
+        timeline_gm: std::sync::atomic::AtomicU64::new(tl.gm_id),
+        timeline_offset_ns: std::sync::atomic::AtomicI64::new(tl.offset_ns),
         sample_rate: SAMPLE_RATE,
     });
     let backlog = control.backlog.clone();
@@ -132,9 +186,14 @@ pub fn stream_audio(
     let first_rtptime: u32 = 0;
     session.record(seq, first_rtptime)?;
 
-    // rate=1 flips ap2_play_enabled on the receiver; the realtime anchor
-    // itself comes from the control-channel type-215 packets.
-    session.set_rate(1)?;
+    // rate=1 flips ap2_play_enabled on the receiver. Real Apple receivers
+    // 400 the rate-only variant (hardware-verified on AppleTV5,3) — they
+    // need the full anchor plist. We send the same anchor line the
+    // control-channel type-215 packets announce (frame 0 at t0, translated
+    // onto the active timeline), so the anchor sources stay collinear.
+    let anchor_ns = t0_ns.wrapping_add_signed(tl.offset_ns);
+    let (t0_secs, t0_frac) = ptp_ns_to_secs_frac(anchor_ns);
+    session.set_rate_anchor(tl.gm_id, first_rtptime, t0_secs, t0_frac, 1)?;
 
     if let Some(db) = volume_db {
         if let Err(e) = session.set_volume(db) {
@@ -267,6 +326,16 @@ pub fn stream_audio_buffered_with_latency(
     session.setup_stream(StreamFormat::AacBuffered, control_port)?;
     let ports = session.ports;
 
+    // Reverse event channel — must be connected before RECORD on Apple
+    // receivers (held open for the whole session).
+    let _event = open_event_channel(peer_ip, ports.event_port);
+
+    // Real Apple receivers need SETPEERS to know which clock to monitor;
+    // Shairport ignores it (warn-and-continue keeps older receivers happy).
+    if let Err(e) = session.set_peers() {
+        warn!("SETPEERS failed (continuing): {e}");
+    }
+
     // Let the receiver's clock daemon converge on our PTP clock before
     // anchoring (see stream_audio for rationale).
     std::thread::sleep(Duration::from_millis(1500));
@@ -280,10 +349,19 @@ pub fn stream_audio_buffered_with_latency(
     let first_rtptime: u32 = 0;
     session.record(seq as u16, first_rtptime)?;
 
-    // --- Anchor: full SETRATEANCHORTIME, rtpTime=0 plays latency_ms from now ---
-    let anchor_ns = ptp_now_ns() + latency_ms * 1_000_000;
+    // --- Anchor: full SETRATEANCHORTIME, rtpTime=0 plays latency_ms from now,
+    // expressed on the active timeline (receiver's own grandmaster if we
+    // yielded to it — Apple TV/HomePod; ours for Shairport). ---
+    let tl = ptp.active_timeline();
+    info!(
+        gm = format!("{:016x}", tl.gm_id),
+        offset_ms = tl.offset_ns as f64 / 1e6,
+        foreign = tl.gm_id != ptp.clock_id,
+        "anchor timeline"
+    );
+    let anchor_ns = ptp_now_ns().wrapping_add_signed(tl.offset_ns) + latency_ms * 1_000_000;
     let (anchor_secs, anchor_frac) = ptp_ns_to_secs_frac(anchor_ns);
-    session.set_rate_anchor(ptp.clock_id, first_rtptime, anchor_secs, anchor_frac, 1)?;
+    session.set_rate_anchor(tl.gm_id, first_rtptime, anchor_secs, anchor_frac, 1)?;
 
     if let Some(db) = volume_db {
         if let Err(e) = session.set_volume(db) {

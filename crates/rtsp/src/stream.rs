@@ -270,6 +270,38 @@ impl StreamSession {
     }
 
     /// RECORD — start the session. `seq`/`rtptime` describe the first packet.
+    /// SETPEERS — tell the receiver which IPs are its PTP timing peers
+    /// (i.e. where our master clock lives).
+    ///
+    /// Required by real Apple receivers (Apple TV / HomePod): without it
+    /// their PTP daemon never locks to our clock and RECORD stalls until
+    /// the read timeout (hardware-verified on AppleTV5,3 / AirTunes 670.5.1).
+    /// Shairport Sync currently ignores it, so it's a harmless no-op there.
+    ///
+    /// Body: binary plist ARRAY of IP strings — receiver address first,
+    /// then our local address (owntone's order). Content-Type is the
+    /// odd-but-genuine `/peer-list-changed` seen in Apple sender captures.
+    pub fn set_peers(&mut self) -> Result<(), SessionError> {
+        info!("SETPEERS");
+        let peers = plist::Value::Array(vec![
+            self.conn.peer_ip().to_string().into(),
+            self.conn.local_ip().to_string().into(),
+        ]);
+        let mut buf = Vec::new();
+        plist::to_writer_binary(&mut buf, &peers).map_err(|_| SessionError::PlistEncode)?;
+        let raw = self.conn.request(
+            "SETPEERS",
+            &self.uri.clone(),
+            &[
+                ("DACP-ID", &self.dacp_id.clone()),
+                ("Active-Remote", &self.active_remote.to_string()),
+            ],
+            &buf,
+            Some("/peer-list-changed"),
+        )?;
+        check_ok(&raw)
+    }
+
     pub fn record(&mut self, seq: u16, rtptime: u32) -> Result<(), SessionError> {
         info!("RECORD");
         let rtp_info = format!("seq={};rtptime={}", seq, rtptime);

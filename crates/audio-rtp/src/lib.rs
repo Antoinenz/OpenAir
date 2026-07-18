@@ -199,6 +199,15 @@ pub struct SyncState {
     /// extrapolate from this so they are perfectly collinear — re-measuring
     /// the clock per anchor makes the receiver resync (and mute) constantly.
     pub t0_ns: AtomicU64,
+    /// Grandmaster clock ID anchors are expressed against. Usually our own
+    /// PTP master; an Apple receiver's own grandmaster when we yielded
+    /// (see openair-timing BMCA yield). 0 = use the clock_id passed to
+    /// spawn_ptp.
+    pub timeline_gm: AtomicU64,
+    /// Offset (ns) to translate local-clock times onto that timeline.
+    /// Captured once at session start — updating it live would bend the
+    /// anchor line and cause receiver resyncs.
+    pub timeline_offset_ns: std::sync::atomic::AtomicI64,
     pub sample_rate: u32,
 }
 
@@ -273,9 +282,17 @@ impl ControlChannel {
                         SyncMode::PtpAnchor { clock_id } => {
                             let head64 = state.head_ts.load(Ordering::Relaxed);
                             let head = head64 as u32;
-                            let frame_time_ns = state.time_of_frame(head64);
+                            // Translate onto the active timeline (foreign
+                            // grandmaster when we yielded, ours otherwise).
+                            let gm = match state.timeline_gm.load(Ordering::Relaxed) {
+                                0 => clock_id,
+                                id => id,
+                            };
+                            let off = state.timeline_offset_ns.load(Ordering::Relaxed);
+                            let frame_time_ns =
+                                state.time_of_frame(head64).wrapping_add_signed(off);
                             let packet =
-                                build_ptp_anchor_packet(first, sync_seq, head, frame_time_ns, clock_id);
+                                build_ptp_anchor_packet(first, sync_seq, head, frame_time_ns, gm);
                             if let Err(e) = socket.send_to(&packet, dest) {
                                 warn!("anchor send failed: {e}");
                             } else {

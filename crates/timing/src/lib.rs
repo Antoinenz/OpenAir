@@ -7,7 +7,7 @@
 //! PTP lives in the `ptp` module (pulled forward from Step 6 since both
 //! Shairport Sync and Apple TV require it; Shairport cannot do AP2-NTP).
 pub mod ptp;
-pub use ptp::{ptp_now_ns, ptp_ns_to_secs_frac, PtpMaster};
+pub use ptp::{ptp_now_ns, ptp_ns_to_secs_frac, PtpMaster, Timeline};
 
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
