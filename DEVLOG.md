@@ -4,6 +4,75 @@
 
 ---
 
+## 2026-07-19 — Session 8: APPLE TV 📺 — Step 7 done (Normal pairing) + Apple-receiver streaming
+
+Both pipelines (realtime ALAC tone, buffered AAC capture) hardware-verified on
+AppleTV6,2 (AirTunes/870.14.1); pairing also verified on AppleTV5,3 (670.5.1).
+Shairport (Pool Room) regression-checked OK. Five stacked discoveries, each only
+visible after fixing the previous one:
+
+### 1. Normal HomeKit pairing (worked first try)
+- Wire format from pyatv (`auth/hap_srp.py`, `protocols/airplay/auth/hap.py`), all `X-Apple-HKP: 3`:
+  - `POST /pair-pin-start` (empty body) → PIN appears on the TV.
+  - M1 `{Method:0, State:1}` (NO transient flag) → M2 salt+B → SRP-6a 3072/SHA-512 with
+    user `"Pair-Setup"`, password = on-screen PIN → M3 A+proof → M4 verify server proof.
+  - M5/M6: sub-TLVs sealed with ChaCha20-Poly1305, key = HKDF(K, "Pair-Setup-Encrypt-Salt",
+    "Pair-Setup-Encrypt-Info"), nonce = 4 zero bytes || "PS-Msg05"/"PS-Msg06", **no AAD**.
+    M5 carries `{Identifier: our-UUID, PublicKey: Ed25519 LTPK, Signature over
+    HKDF(K, Controller-Sign salts) || id || LTPK}`. M6 returns the accessory's identity;
+    we verify its signature (pyatv skips this — spec-conformant receivers pass).
+- Pair-verify (every reconnect): X25519 ephemerals, "PV-Msg02"/"PV-Msg03" sealed sub-TLVs,
+  Ed25519 signatures both ways, **channel keys from the RAW shared secret** (not the
+  Pair-Verify encrypt key) via HKDF("Control-Salt", "Control-Write/Read-Encryption-Key").
+- Credentials persist in `%APPDATA%\OpenAir\pairings.json`; streaming auto-dispatches:
+  stored peer → pair-verify, else transient. `openair pair <name>` is the one-time step.
+- Apple TV "Allow Access: Everyone" does NOT stop the 470 on transient — Normal pairing
+  is simply required for tvOS.
+
+### 2. RECORD stalls without SETPEERS (timeout after 10 s)
+- Method `SETPEERS`, body = binary plist ARRAY of IP strings `[receiver, sender]`,
+  Content-Type `/peer-list-changed` (genuine Apple quirk). Receiver's PTP daemon
+  otherwise has no timing-peer list. Shairport ignores SETPEERS entirely.
+
+### 3. RECORD also stalls without the reverse event channel
+- TCP connect to `eventPort` from SETUP 1 **before RECORD**, hold open all session.
+  We send nothing; a drain thread discards inbound. (owntone: "reverse connection,
+  used to receive playback events".)
+
+### 4. Rate-only SETRATEANCHORTIME → HTTP 400
+- Real Apple receivers require the full anchor plist (networkTimeTimelineID/Secs/Frac,
+  rtpTime, rate) to START. Rate-only `{rate:0}` for stop is accepted. Shairport accepts
+  rate-only for both.
+
+### 5. The big one: Apple receivers never slave to a third-party PTP master
+- The ATV runs its own grandmaster (Announce + two-step Sync/Follow_Up + Signaling
+  type-0xC spam at ~4 Hz) and sent us **zero Delay_Reqs** — it flatly ignores our master.
+  Session accepted, audio buffered, but playback never starts because our anchor
+  referenced a timeline (our clock) that isn't the elected grandmaster. **No error is
+  ever reported — the failure mode is pure silence.** (It does wake the TV from sleep.)
+- Fix = BMCA yield (pulled forward from Step 6): parse their Announce (grandmaster ID),
+  timestamp their Sync locally, match Follow_Up origin timestamps → offset =
+  origin − local_rx (EWMA/8; path delay sub-ms on LAN, absorbed). While a foreign
+  master is active (seen <5 s ago) we stop sending our own Announce/Sync, and ALL
+  anchors — SETRATEANCHORTIME and type-215 control packets — are expressed on THEIR
+  timeline: `networkTimeTimelineID` = their GM ID, times = local + offset.
+- Offset to the ATV was ≈ −20.6 days: its PTP epoch is roughly its uptime, nothing
+  like wall-clock. Never assume the receiver's timeline resembles ours.
+- Timeline is captured ONCE after the 1.5 s warm-up (needs ≥3 offset samples).
+  Deliberately not updated live: bending the anchor line mid-session causes receiver
+  resyncs. Cost: sender/receiver crystal drift (~ppm) accumulates — fine for
+  minutes-long sessions, revisit for hours (slew t0 instead of the offset).
+- We also answer Delay_Req with Delay_Resp now, for receivers that DO slave to us.
+- Shairport unaffected by all of the above: no foreign master → we stay master,
+  offset 0, identical wire behavior to before.
+
+### Debugging pattern that worked
+Each layer was found by logging the receive path we previously ignored. "Receiver
+accepts everything but nothing happens" on Apple gear = look at what THEIR daemons
+are transmitting at you (the Signaling/Announce spam was the tell).
+
+---
+
 ## 2026-07-14 — Session 7b: buffered latency tuning (glitch-free, user-controllable)
 
 - **Glitchy buffered-capture start fixed**: the send-ahead loop raced 2 s ahead of a live

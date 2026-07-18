@@ -9,17 +9,21 @@ with no Apple hardware required on the sending side.
 
 ## What works today
 
-Hardware-verified against Shairport Sync (AirPlay 2 mode):
+Hardware-verified against **Apple TV** (HD + 4K) and **Shairport Sync**:
 
 ```console
+# One-time pairing with an Apple TV (PIN shown on screen); after this it
+# connects automatically — Shairport receivers need no pairing step at all
+openair pair "Living Room"
+
 # Stream live system audio (WASAPI loopback) until Ctrl+C, ~sub-second latency
-openair capture "Pool Room" --buffered --latency 300
+openair capture "Living Room" --buffered --latency 300
 
 # Play a WAV file (any sample rate/bit depth — resampled automatically)
 openair play "Pool Room" song.wav --buffered
 
 # Test tone
-openair tone "Pool Room" 10 --volume -14
+openair tone "Living Room" 10 --volume -14
 
 # Receivers can be named (discovered via mDNS) or given as ip:port
 openair capture 192.168.1.106:7000
@@ -31,17 +35,18 @@ openair
 - **Two pipelines**: realtime ALAC (protocol-fixed ~2 s latency) and buffered
   AAC-LC over TCP (`--buffered`, sender-chosen latency via `--latency <ms>`,
   default 500 ms)
-- **Full AirPlay 2 stack**: mDNS discovery + feature bits, HomeKit Transient
-  pairing (SRP-6a 3072), ChaCha20-Poly1305-encrypted RTSP with binary plists,
-  per-packet AEAD audio, PTP (IEEE 1588) master timing
+- **Full AirPlay 2 stack**: mDNS discovery + feature bits, HomeKit pairing
+  (Transient *and* Normal with on-screen PIN + persisted Ed25519 identity /
+  pair-verify), ChaCha20-Poly1305-encrypted RTSP with binary plists,
+  per-packet AEAD audio, PTP (IEEE 1588) timing with BMCA yield — OpenAir
+  masters the clock for receivers that follow it (Shairport) and slaves to
+  receivers that insist on their own (Apple TV)
 - **Sources**: live system capture (WASAPI loopback), WAV files, test tone —
   all resampled/converted to the pipeline format automatically
 
 ## Not yet
 
-- Apple TV / HomePod "Normal" HomeKit pairing (on-screen PIN + persisted
-  identity) — Transient pairing works with Shairport Sync today; tvOS demands
-  the full pairing flow (next up)
+- HomePod (expected to work like Apple TV — untested, no hardware on hand)
 - Multi-room (grouped) streaming
 - Linux capture (PipeWire) and the privileged PTP helper it needs
 - macOS

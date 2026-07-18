@@ -53,9 +53,9 @@ Follow §16 of the research brief (✅ = done, hardware-verified):
 3. ✅ Encrypted RTSP (GET /info over ChaCha20-Poly1305 channel)
 4. ✅ Realtime ALAC PT=96 — over PTP, not NTP (Shairport can't do AP2-NTP; see DEVLOG)
 5. ✅ Buffered AAC PT=103 (FDK-AAC over TCP, tunable --latency)
-6. 🔄 PTP timing — minimal master done (nqptp-verified); BMCA yield + Delay_Req for HomePod remain
-7. Normal pairing (Apple TV + PIN, persist identity to disk) ← NEXT
-8. Multi-room streaming
+6. 🔄 PTP timing — master + Delay_Resp + BMCA yield/foreign-timeline anchoring done (Apple TV-verified); Linux ptp-helper remains
+7. ✅ Normal pairing (Apple TV + PIN, persist identity to disk) — pair-verify + %APPDATA% store; `openair pair`
+8. Multi-room streaming ← NEXT
 9. Real-time hardening (SCHED_FIFO, DSCP EF, retransmit <5ms)
 
 Hardware-verified protocol knowledge lives in DEVLOG.md — READ IT before touching
