@@ -102,7 +102,7 @@ impl RtspConnection {
     fn write_bytes(&mut self, data: &[u8]) -> io::Result<()> {
         if let Some((write_ch, _)) = &mut self.encrypt {
             let framed = write_ch.encrypt(data)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                .map_err(|e| io::Error::other(e.to_string()))?;
             self.stream.write_all(&framed)
         } else {
             self.stream.write_all(data)

@@ -84,6 +84,41 @@ impl ChaChaChannel {
     }
 }
 
+/// One-shot AEAD seal with an ASCII label nonce (HomeKit pairing messages).
+///
+/// Nonce (12 bytes) = 4 zero bytes || 8-byte label (e.g. b"PS-Msg05").
+/// No AAD. Output = ciphertext || 16-byte Poly1305 tag.
+/// Verified against pyatv's Chacha20Cipher8byteNonce (leading-zero pad, aad=None).
+pub fn seal_labeled(
+    key: &[u8; 32],
+    label8: &[u8; 8],
+    plaintext: &[u8],
+) -> Result<Vec<u8>, ChaChaError> {
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
+    cipher
+        .encrypt(&label_nonce(label8), plaintext)
+        .map_err(|_| ChaChaError::Encrypt)
+}
+
+/// One-shot AEAD open with an ASCII label nonce (HomeKit pairing messages).
+/// `ciphertext` must include the trailing 16-byte tag.
+pub fn open_labeled(
+    key: &[u8; 32],
+    label8: &[u8; 8],
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, ChaChaError> {
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
+    cipher
+        .decrypt(&label_nonce(label8), ciphertext)
+        .map_err(|_| ChaChaError::Decrypt)
+}
+
+fn label_nonce(label8: &[u8; 8]) -> Nonce {
+    let mut n = [0u8; 12];
+    n[4..].copy_from_slice(label8);
+    *Nonce::from_slice(&n)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,6 +155,17 @@ mod tests {
         let mut dec = ChaChaChannel::new(&[0x99u8; 32]);
         let frame = enc.encrypt(b"hello").unwrap();
         assert!(dec.decrypt(&frame).is_err());
+    }
+
+    #[test]
+    fn labeled_seal_open_roundtrip() {
+        let key = test_key();
+        let ct = seal_labeled(&key, b"PS-Msg05", b"hello homekit").unwrap();
+        assert_eq!(ct.len(), 13 + 16); // plaintext + tag
+        let pt = open_labeled(&key, b"PS-Msg05", &ct).unwrap();
+        assert_eq!(pt, b"hello homekit");
+        // Wrong label → tag mismatch
+        assert!(open_labeled(&key, b"PS-Msg06", &ct).is_err());
     }
 
     #[test]

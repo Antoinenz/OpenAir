@@ -22,16 +22,17 @@ pub struct AirPlayTxt {
 impl AirPlayTxt {
     /// Parse a flat key=value map (as returned by mdns-sd) into a typed struct.
     pub fn parse(map: &HashMap<String, String>) -> Self {
-        let mut txt = AirPlayTxt::default();
-
-        txt.device_id = map.get("deviceid").cloned();
-        txt.model = map.get("model").cloned();
-        txt.src_vers = map.get("srcvers").cloned();
-        txt.pk = map.get("pk").cloned();
-        txt.pi = map.get("pi").cloned();
-        txt.psi = map.get("psi").cloned();
-        txt.gid = map.get("gid").cloned();
-        txt.igl = map.get("igl").cloned();
+        let mut txt = AirPlayTxt {
+            device_id: map.get("deviceid").cloned(),
+            model: map.get("model").cloned(),
+            src_vers: map.get("srcvers").cloned(),
+            pk: map.get("pk").cloned(),
+            pi: map.get("pi").cloned(),
+            psi: map.get("psi").cloned(),
+            gid: map.get("gid").cloned(),
+            igl: map.get("igl").cloned(),
+            ..AirPlayTxt::default()
+        };
 
         if let Some(f) = map.get("features") {
             txt.features = parse_features(f);

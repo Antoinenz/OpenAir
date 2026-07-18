@@ -137,7 +137,7 @@ fn sha512(data: &[u8]) -> Vec<u8> {
 
 /// Pad BigUint to N_len bytes (big-endian, leading zeros).
 fn padded(n: &BigUint, modulus: &BigUint) -> Vec<u8> {
-    let len = (modulus.bits() as usize + 7) / 8;
+    let len = (modulus.bits() as usize).div_ceil(8);
     let bytes = n.to_bytes_be();
     let mut out = vec![0u8; len.saturating_sub(bytes.len())];
     out.extend_from_slice(&bytes);
@@ -146,7 +146,7 @@ fn padded(n: &BigUint, modulus: &BigUint) -> Vec<u8> {
 
 /// H_nn_pad for k: SHA512(PAD(N, N_len) || PAD(g, N_len))
 fn h_nn_pad_ng(n: &BigUint, g: &BigUint) -> BigUint {
-    let n_len = (n.bits() as usize + 7) / 8;
+    let n_len = (n.bits() as usize).div_ceil(8);
     let n_bytes = n.to_bytes_be();
     let g_bytes = g.to_bytes_be();
     let mut data = vec![0u8; n_len * 2];
@@ -157,7 +157,7 @@ fn h_nn_pad_ng(n: &BigUint, g: &BigUint) -> BigUint {
 
 /// H_nn_pad for u: SHA512(PAD(a, N_len) || PAD(b, N_len))
 fn h_nn_pad(a: &BigUint, b: &BigUint, n: &BigUint) -> BigUint {
-    let len = (n.bits() as usize + 7) / 8;
+    let len = (n.bits() as usize).div_ceil(8);
     let mut data = vec![0u8; len * 2];
     let ab = a.to_bytes_be();
     let bb = b.to_bytes_be();
@@ -196,7 +196,7 @@ fn compute_m1(
 }
 
 fn random_private_key(n: &BigUint) -> BigUint {
-    let len = (n.bits() as usize + 7) / 8;
+    let len = (n.bits() as usize).div_ceil(8);
     let mut bytes = vec![0u8; len];
     rand::thread_rng().fill_bytes(&mut bytes);
     BigUint::from_bytes_be(&bytes) % (n - BigUint::one()) + BigUint::one()

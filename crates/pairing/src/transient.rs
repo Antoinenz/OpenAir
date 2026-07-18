@@ -25,7 +25,16 @@ pub enum PairingError {
     M2Mismatch,
     #[error("unexpected state byte {got:#04x}, want {want:#04x}")]
     UnexpectedState { got: u8, want: u8 },
+    #[error("crypto failure: {0}")]
+    CryptoFailure(&'static str),
+    #[error("signature verification failed: {0}")]
+    SignatureInvalid(&'static str),
+    #[error("accessory identity does not match stored credentials")]
+    PeerMismatch,
 }
+
+/// Result of the M2→M3 SRP step: `(m3_body, m1_proof, srp_session_key)`.
+pub type SrpStepResult = Result<(Vec<u8>, Vec<u8>, Vec<u8>), PairingError>;
 
 /// Channel keys derived at the end of pairing.
 /// Write = client → server, Read = server → client.
@@ -64,10 +73,7 @@ impl TransientPairing {
 
     /// Parse the M2 response, compute M3, return the TLV8 body for the second POST.
     /// Also returns M1 proof and session key so we can verify M4 and derive keys.
-    pub fn process_m2_build_m3(
-        &self,
-        m2_body: &[u8],
-    ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), PairingError> {
+    pub fn process_m2_build_m3(&self, m2_body: &[u8]) -> SrpStepResult {
         let tlv = tlv8::decode(m2_body);
 
         // Check for server error first.

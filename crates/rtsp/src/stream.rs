@@ -60,7 +60,12 @@ pub struct StreamSession {
 impl StreamSession {
     /// Connect + Transient-pair + encrypt. `device_id` from discovery TXT.
     pub fn connect(addr: SocketAddr, device_id: &str) -> Result<Self, SessionError> {
-        let conn = pair(addr, device_id)?;
+        Self::from_connection(pair(addr, device_id)?)
+    }
+
+    /// Wrap an already-paired, already-encrypted connection (e.g. one produced
+    /// by `session::pair_verify` for Apple TV / HomePod Normal pairing).
+    pub fn from_connection(conn: RtspConnection) -> Result<Self, SessionError> {
         let local_ip = conn.local_ip();
         let mut rng = rand::thread_rng();
         let session_id = rng.next_u32();

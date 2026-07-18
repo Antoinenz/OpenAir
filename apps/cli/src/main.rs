@@ -243,6 +243,31 @@ async fn main() -> Result<()> {
         }
     };
 
+    // `openair pair <ip:port|name>` — one-time Normal HomeKit pairing with the
+    // PIN shown on the device's screen (Apple TV / HomePod). Credentials are
+    // persisted; later `play`/`capture`/`tone` connect via pair-verify
+    // automatically.
+    if args.len() >= 2 && args[0] == "pair" {
+        let Some((addr, device_id)) = resolve_receiver(&args[1]) else {
+            return Ok(());
+        };
+        println!("OpenAir — HomeKit pairing with {} ({})\n", addr, device_id);
+        println!("A PIN should appear on the device's screen...");
+        let mut pin_prompt = || {
+            use std::io::Write as _;
+            print!("Enter PIN: ");
+            std::io::stdout().flush().ok();
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line).ok();
+            line.trim().to_string()
+        };
+        match openair_client::pair_device(addr, &device_id, &mut pin_prompt) {
+            Ok(()) => println!("  ✓ paired — this device will now connect automatically"),
+            Err(e) => println!("  ✗ pairing failed: {}", e),
+        }
+        return Ok(());
+    }
+
     // `openair capture <ip:port|name> [seconds] [--volume <db>] [--buffered]` — stream
     // live system audio (WASAPI loopback of the default output device) for
     // `seconds`, or indefinitely (until Ctrl+C) if omitted.

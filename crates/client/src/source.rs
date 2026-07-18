@@ -492,7 +492,7 @@ impl AudioSource for CaptureSource {
         // how much of this fill was real vs. silence padding.
         self.fills += 1;
         self.silent_frames += (total - written) as u64;
-        if self.fills % 250 == 0 {
+        if self.fills.is_multiple_of(250) {
             let ring_len = self.ring.lock().map(|g| g.len()).unwrap_or(0);
             tracing::debug!(
                 ring_frames = ring_len / 2,

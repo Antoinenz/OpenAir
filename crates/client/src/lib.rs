@@ -19,10 +19,52 @@ use openair_rtsp::{StreamFormat, StreamSession, TimingConfig};
 use openair_timing::{ptp_now_ns, ptp_ns_to_secs_frac, PtpMaster};
 use tracing::{info, warn};
 
+mod pairings;
 mod source;
+pub use pairings::PairingStore;
 pub use source::{CaptureSource, SineSource, WavSource};
 
 pub(crate) const SAMPLE_RATE: u32 = 44100;
+
+/// Open a paired, encrypted RTSP session with the right pairing flavor:
+/// stored HomeKit credentials (Apple TV / HomePod → pair-verify) if we have
+/// them for this device-id, Transient pairing (Shairport, AirPort Express)
+/// otherwise.
+fn connect_session(
+    addr: SocketAddr,
+    device_id: &str,
+) -> Result<StreamSession, Box<dyn std::error::Error>> {
+    if let Ok(store) = PairingStore::load() {
+        if let Some(peer) = store.peer(device_id) {
+            let identity = store.identity()?;
+            info!(device_id, "using stored HomeKit pairing (pair-verify)");
+            let conn = openair_rtsp::pair_verify(addr, device_id, identity, peer)?;
+            return Ok(StreamSession::from_connection(conn)?);
+        }
+    }
+    Ok(StreamSession::connect(addr, device_id)?)
+}
+
+/// One-time Normal HomeKit pair-setup with PIN (Apple TV / HomePod).
+///
+/// Shows a PIN on the device; `pin_provider` must return it (e.g. from
+/// stdin). On success the credentials are persisted, and every later
+/// connection to this device-id automatically uses pair-verify.
+pub fn pair_device(
+    addr: SocketAddr,
+    device_id: &str,
+    pin_provider: &mut dyn FnMut() -> String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut store = PairingStore::load()?;
+    // Persist the identity before pairing so a crash after M6 can't strand
+    // an accessory that stored our LTPK we no longer have.
+    store.ensure_saved()?;
+    let identity = store.identity()?;
+    let peer = openair_rtsp::pair_setup_normal(addr, device_id, &identity, pin_provider)?;
+    store.set_peer(device_id, &peer)?;
+    info!(device_id, "pairing stored — future connections will use pair-verify");
+    Ok(())
+}
 
 /// A source of interleaved-stereo, 44100 Hz i16 audio frames.
 ///
@@ -52,7 +94,7 @@ pub fn stream_audio(
     let control_port = control.port;
 
     // --- RTSP negotiation ---
-    let mut session = StreamSession::connect(addr, device_id)?;
+    let mut session = connect_session(addr, device_id)?;
     let peer_ip = session.peer_ip();
 
     // PTP master must be running before the receiver starts monitoring us.
@@ -215,7 +257,7 @@ pub fn stream_audio_buffered_with_latency(
     let control_port = control.port;
 
     // --- RTSP negotiation ---
-    let mut session = StreamSession::connect(addr, device_id)?;
+    let mut session = connect_session(addr, device_id)?;
     let peer_ip = session.peer_ip();
 
     // PTP master must run for the whole session, started before SETUP.
