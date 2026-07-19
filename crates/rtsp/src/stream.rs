@@ -278,9 +278,16 @@ impl StreamSession {
     /// the read timeout (hardware-verified on AppleTV5,3 / AirTunes 670.5.1).
     /// Shairport Sync currently ignores it, so it's a harmless no-op there.
     ///
-    /// Body: binary plist ARRAY of IP strings — receiver address first,
-    /// then our local address (owntone's order). Content-Type is the
-    /// odd-but-genuine `/peer-list-changed` seen in Apple sender captures.
+    /// Body: binary plist ARRAY of IP strings — this receiver's address
+    /// first, then our local address (owntone's order). Deliberately NOT
+    /// the whole multi-room group: each receiver's timing world is just
+    /// {itself, us}. Cross-listing receivers invites their BMCA to elect a
+    /// clock we can't control or that never serves time (hardware-verified:
+    /// a Shairport receiver anchored on an Apple TV's clock stays silent —
+    /// the ATV's clock never reaches it). Multi-room sync instead comes
+    /// from per-receiver anchors describing the same physical instant.
+    /// Content-Type is the odd-but-genuine `/peer-list-changed` seen in
+    /// Apple sender captures.
     pub fn set_peers(&mut self) -> Result<(), SessionError> {
         info!("SETPEERS");
         let peers = plist::Value::Array(vec![

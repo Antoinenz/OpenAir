@@ -212,6 +212,71 @@ fn resolve_receiver(arg: &str) -> Option<(SocketAddr, String)> {
     }
 }
 
+/// Resolve several receiver arguments (`ip:port` or names) with at most ONE
+/// mDNS browse shared by all names. Returns `None` (after printing why) if
+/// any argument doesn't resolve to exactly one receiver.
+fn resolve_receivers(args: &[String]) -> Option<Vec<(SocketAddr, String)>> {
+    let mut out: Vec<(SocketAddr, String)> = Vec::new();
+    let names: Vec<&String> = args
+        .iter()
+        .filter(|a| a.parse::<SocketAddr>().is_err())
+        .collect();
+
+    let mut devices = Vec::new();
+    if !names.is_empty() {
+        println!(
+            "Searching for receiver(s) {} (5s)...",
+            names
+                .iter()
+                .map(|n| format!("'{n}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        if let Err(e) = openair_discovery::browse(Duration::from_secs(5), |d| devices.push(d)) {
+            println!("  ✗ discovery failed: {}", e);
+            return None;
+        }
+    }
+
+    for arg in args {
+        if let Ok(addr) = arg.parse::<SocketAddr>() {
+            out.push((addr, DEFAULT_DEVICE_ID.to_string()));
+            continue;
+        }
+        let needle = arg.to_lowercase();
+        let matches: Vec<_> = devices
+            .iter()
+            .filter(|d| clean_device_name(&d.name).to_lowercase().contains(&needle))
+            .collect();
+        match matches.len() {
+            1 => {
+                let dev = matches[0];
+                let device_id = dev
+                    .txt
+                    .device_id
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_DEVICE_ID.to_string());
+                out.push((SocketAddr::new(dev.addr, dev.port), device_id));
+            }
+            0 => {
+                println!("No receiver matched '{}'. Discovered device(s):", arg);
+                for d in &devices {
+                    println!("  - {}", clean_device_name(&d.name));
+                }
+                return None;
+            }
+            _ => {
+                println!("Multiple receivers matched '{}':", arg);
+                for d in &matches {
+                    println!("  - {}", clean_device_name(&d.name));
+                }
+                return None;
+            }
+        }
+    }
+    Some(out)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -229,17 +294,19 @@ async fn main() -> Result<()> {
 
     // Dispatches to the realtime ALAC pipeline (fixed ~2s protocol latency)
     // or the buffered AAC pipeline (sender-chosen latency, `--latency <ms>`,
-    // default 500) depending on the `--buffered` flag.
-    let stream_fn = move |addr: SocketAddr,
-                          device_id: &str,
+    // default 500) depending on the `--buffered` flag. Multiple receivers
+    // always use the buffered pipeline — that's the multi-room mode.
+    let stream_fn = move |receivers: &[(SocketAddr, String)],
                           source: &mut dyn openair_client::AudioSource,
                           volume: Option<f32>| {
-        if buffered {
-            openair_client::stream_audio_buffered_with_latency(
-                addr, device_id, source, volume, latency_ms,
-            )
+        if receivers.len() > 1 && !buffered {
+            println!("  (multi-room uses the buffered pipeline — enabling --buffered)");
+        }
+        if buffered || receivers.len() > 1 {
+            openair_client::stream_audio_buffered_multi(receivers, source, volume, latency_ms)
         } else {
-            openair_client::stream_audio(addr, device_id, source, volume)
+            let (addr, device_id) = &receivers[0];
+            openair_client::stream_audio(*addr, device_id, source, volume)
         }
     };
 
@@ -268,14 +335,23 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // `openair capture <ip:port|name> [seconds] [--volume <db>] [--buffered]` — stream
+    // `openair capture <ip:port|name>... [seconds] [--volume <db>] [--buffered]` — stream
     // live system audio (WASAPI loopback of the default output device) for
-    // `seconds`, or indefinitely (until Ctrl+C) if omitted.
+    // `seconds`, or indefinitely (until Ctrl+C) if omitted. Multiple
+    // receivers = synchronized multi-room (buffered pipeline).
     if args.len() >= 2 && args[0] == "capture" {
-        let Some((addr, device_id)) = resolve_receiver(&args[1]) else {
+        let mut recv_args: Vec<String> = args[1..].to_vec();
+        let seconds: Option<u32> = recv_args.last().and_then(|s| s.parse().ok());
+        if seconds.is_some() {
+            recv_args.pop();
+        }
+        if recv_args.is_empty() {
+            println!("usage: openair capture <receiver>... [seconds]");
+            return Ok(());
+        }
+        let Some(receivers) = resolve_receivers(&recv_args) else {
             return Ok(());
         };
-        let seconds: Option<u32> = args.get(2).and_then(|s| s.parse().ok());
 
         let stop = Arc::new(AtomicBool::new(false));
         {
@@ -286,11 +362,16 @@ async fn main() -> Result<()> {
             .ok();
         }
 
+        let dest = receivers
+            .iter()
+            .map(|(a, _)| a.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
         match seconds {
-            Some(s) => println!("OpenAir — capturing {}s of system audio to {}\n", s, addr),
+            Some(s) => println!("OpenAir — capturing {}s of system audio to {}\n", s, dest),
             None => println!(
                 "OpenAir — capturing until Ctrl+C… (streaming system audio to {})\n",
-                addr
+                dest
             ),
         }
 
@@ -313,11 +394,11 @@ async fn main() -> Result<()> {
         // Buffered pipelines send ahead of realtime; a live source must
         // rate-limit them by blocking for data instead of padding silence
         // (which sounds like glitchy, chopped audio for the first seconds).
-        if buffered {
+        if buffered || receivers.len() > 1 {
             source = source.with_blocking();
         }
 
-        match stream_fn(addr, &device_id, &mut source, Some(volume_db)) {
+        match stream_fn(&receivers, &mut source, Some(volume_db)) {
             Ok(()) => println!("  ✓ capture streamed successfully"),
             Err(e) => println!("  ✗ {}", e),
         }
@@ -326,13 +407,20 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // `openair play <ip:port|name> <file.wav> [--volume <db>] [--buffered]` — stream a WAV file.
+    // `openair play <ip:port|name>... <file.wav> [--volume <db>] [--buffered]` — stream a
+    // WAV file; the file is the LAST argument. Multiple receivers = multi-room.
     if args.len() >= 3 && args[0] == "play" {
-        let Some((addr, device_id)) = resolve_receiver(&args[1]) else {
+        let path = std::path::Path::new(&args[args.len() - 1]);
+        let recv_args: Vec<String> = args[1..args.len() - 1].to_vec();
+        let Some(receivers) = resolve_receivers(&recv_args) else {
             return Ok(());
         };
-        let path = std::path::Path::new(&args[2]);
-        println!("OpenAir — playing {} to {}\n", path.display(), addr);
+        let dest = receivers
+            .iter()
+            .map(|(a, _)| a.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("OpenAir — playing {} to {}\n", path.display(), dest);
 
         if !path.exists() {
             println!("  ✗ file not found: {}", path.display());
@@ -347,22 +435,39 @@ async fn main() -> Result<()> {
             }
         };
 
-        match stream_fn(addr, &device_id, &mut source, Some(volume_db)) {
+        match stream_fn(&receivers, &mut source, Some(volume_db)) {
             Ok(()) => println!("  ✓ playback finished successfully"),
             Err(e) => println!("  ✗ {}", e),
         }
         return Ok(());
     }
 
-    // `openair tone <ip:port|name> [seconds] [--volume <db>] [--buffered]` — stream a 440 Hz test tone (Step 4).
+    // `openair tone <ip:port|name>... [seconds] [--volume <db>] [--buffered]` — stream a
+    // 440 Hz test tone. Multiple receivers = multi-room.
     if args.len() >= 2 && args[0] == "tone" {
-        let Some((addr, device_id)) = resolve_receiver(&args[1]) else {
+        let mut recv_args: Vec<String> = args[1..].to_vec();
+        let seconds: u32 = match recv_args.last().and_then(|s| s.parse().ok()) {
+            Some(s) => {
+                recv_args.pop();
+                s
+            }
+            None => 10,
+        };
+        if recv_args.is_empty() {
+            println!("usage: openair tone <receiver>... [seconds]");
+            return Ok(());
+        }
+        let Some(receivers) = resolve_receivers(&recv_args) else {
             return Ok(());
         };
-        let seconds: u32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(10);
-        println!("OpenAir — streaming {}s test tone to {}\n", seconds, addr);
+        let dest = receivers
+            .iter()
+            .map(|(a, _)| a.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("OpenAir — streaming {}s test tone to {}\n", seconds, dest);
         let mut source = openair_client::SineSource::new(440.0, seconds);
-        match stream_fn(addr, &device_id, &mut source, Some(volume_db)) {
+        match stream_fn(&receivers, &mut source, Some(volume_db)) {
             Ok(()) => println!("  ✓ tone streamed successfully"),
             Err(e) => println!("  ✗ {}", e),
         }

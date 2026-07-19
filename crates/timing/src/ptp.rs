@@ -136,15 +136,48 @@ fn build_delay_resp(clock_id: &[u8; 8], req: &[u8], t4_ns: u64) -> Option<[u8; 5
 struct ForeignMaster {
     /// Grandmaster identity from its Announce messages.
     gm_id: u64,
+    /// Which peer this master lives on — timelines are chosen per receiver:
+    /// a receiver that runs (and follows) its own clock gets anchors on that
+    /// clock; everyone else gets anchors on ours. Clock distribution BETWEEN
+    /// receivers is deliberately not relied on (hardware-verified failure:
+    /// an Apple TV's clock never reached the Shairport receiver, so a
+    /// group-wide foreign anchor left it silent).
+    src_ip: IpAddr,
     /// master_time ≈ local_time + offset_ns (from two-step Sync/Follow_Up;
     /// ignores path delay — sub-ms on a LAN, fine for anchor granularity).
     offset_ns: i64,
     last_seen: std::time::Instant,
     samples: u32,
+    /// BMCA dataset fields from its Announce (lower tuple wins election).
+    priority1: u8,
+    clock_class: u8,
+    clock_accuracy: u8,
+    variance: u16,
+    priority2: u8,
 }
 
+impl ForeignMaster {
+    /// IEEE 1588 dataset-comparison key (simplified: no steps-removed) —
+    /// lexicographically lower wins the grandmaster election. With several
+    /// foreign masters in a group (two Apple TVs), receivers follow the
+    /// BMCA winner, so our anchors must too.
+    fn bmca_key(&self) -> (u8, u8, u8, u16, u8, u64) {
+        (
+            self.priority1,
+            self.clock_class,
+            self.clock_accuracy,
+            self.variance,
+            self.priority2,
+            self.gm_id,
+        )
+    }
+}
+
+/// All foreign masters currently heard, keyed by grandmaster identity.
 #[derive(Default)]
-struct SharedForeign(std::sync::Mutex<Option<ForeignMaster>>);
+struct SharedForeign(std::sync::Mutex<std::collections::HashMap<u64, ForeignMaster>>);
+
+const FOREIGN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The timeline anchors should be expressed on right now.
 #[derive(Debug, Clone, Copy)]
@@ -164,15 +197,25 @@ pub struct PtpMaster {
 }
 
 impl PtpMaster {
-    /// Start announcing + syncing to `peer` (receiver IP).
+    /// Start announcing + syncing to a single `peer` (receiver IP).
+    pub fn start(peer: IpAddr) -> std::io::Result<Self> {
+        Self::start_multi(&[peer])
+    }
+
+    /// Start the PTP node for a timing group of `peers` (all receiver IPs).
     ///
     /// Binds UDP 319/320 (fails without privileges on Linux/macOS — fine on
-    /// Windows). Announce 1 Hz, Sync/Follow_Up 4 Hz.
-    pub fn start(peer: IpAddr) -> std::io::Result<Self> {
+    /// Windows), so there can be only ONE node per process — a multi-room
+    /// session must create it once with the full peer list. Announce 1 Hz,
+    /// Sync/Follow_Up 4 Hz to every peer while we are master; yields to the
+    /// BMCA-best foreign master when any receiver runs its own clock.
+    pub fn start_multi(peers: &[IpAddr]) -> std::io::Result<Self> {
         let event = UdpSocket::bind(("0.0.0.0", 319))?;
         let general = UdpSocket::bind(("0.0.0.0", 320))?;
-        let event_dest = SocketAddr::new(peer, 319);
-        let general_dest = SocketAddr::new(peer, 320);
+        let event_dests: Vec<SocketAddr> =
+            peers.iter().map(|p| SocketAddr::new(*p, 319)).collect();
+        let general_dests: Vec<SocketAddr> =
+            peers.iter().map(|p| SocketAddr::new(*p, 320)).collect();
 
         let mut clock_bytes = [0u8; 8];
         // Derive a stable-ish clock identity from process randomness.
@@ -182,14 +225,20 @@ impl PtpMaster {
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
-        info!(clock_id = format!("{clock_id:016x}"), peer = %peer, "PTP master starting");
+        info!(
+            clock_id = format!("{clock_id:016x}"),
+            peers = ?peers,
+            "PTP node starting"
+        );
 
         let foreign = Arc::new(SharedForeign::default());
 
-        // Local receive-times of the foreign master's Sync messages, keyed by
-        // sequence number, matched against the origin timestamps that arrive
-        // in its Follow_Up messages (two-step clock).
-        let sync_rx_times: Arc<std::sync::Mutex<std::collections::HashMap<u16, u64>>> =
+        // Local receive-times of foreign masters' Sync messages, keyed by
+        // (source clock, sequence) — two masters in a group can collide on
+        // sequence numbers — matched against the origin timestamps that
+        // arrive in their Follow_Up messages (two-step clocks).
+        #[allow(clippy::type_complexity)]
+        let sync_rx_times: Arc<std::sync::Mutex<std::collections::HashMap<(u64, u16), u64>>> =
             Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
         // --- Receive path (Apple receivers need this; nqptp doesn't) ---
@@ -214,13 +263,14 @@ impl PtpMaster {
                     }
                     match buf[0] & 0x0F {
                         MSG_SYNC => {
+                            let src_clock = u64::from_be_bytes(buf[20..28].try_into().unwrap());
                             let seq = u16::from_be_bytes([buf[30], buf[31]]);
                             let mut g = sync_times.lock().unwrap();
-                            g.insert(seq, t_rx);
-                            if g.len() > 64 {
+                            g.insert((src_clock, seq), t_rx);
+                            if g.len() > 128 {
                                 // Drop stale entries so the map stays bounded.
                                 let newest = seq;
-                                g.retain(|k, _| newest.wrapping_sub(*k) < 32);
+                                g.retain(|(_, s), _| newest.wrapping_sub(*s) < 32);
                             }
                         }
                         MSG_DELAY_REQ => {
@@ -259,32 +309,58 @@ impl PtpMaster {
                         MSG_ANNOUNCE if n >= 64 => {
                             let gm_id = u64::from_be_bytes(buf[53..61].try_into().unwrap());
                             let mut g = foreign_rx.0.lock().unwrap();
-                            match g.as_mut() {
-                                Some(f) if f.gm_id == gm_id => {
-                                    f.last_seen = std::time::Instant::now();
+                            let entry = g.entry(gm_id).or_insert_with(|| {
+                                info!(
+                                    gm = format!("{gm_id:016x}"), src = %src,
+                                    "foreign PTP master announcing (will follow for this peer if it also syncs)"
+                                );
+                                ForeignMaster {
+                                    gm_id,
+                                    src_ip: src.ip(),
+                                    offset_ns: 0,
+                                    last_seen: std::time::Instant::now(),
+                                    samples: 0,
+                                    priority1: 255,
+                                    clock_class: 255,
+                                    clock_accuracy: 255,
+                                    variance: u16::MAX,
+                                    priority2: 255,
                                 }
-                                _ => {
-                                    info!(
-                                        gm = format!("{gm_id:016x}"), src = %src,
-                                        "foreign PTP master detected — yielding (anchors will use its timeline)"
-                                    );
-                                    *g = Some(ForeignMaster {
-                                        gm_id,
-                                        offset_ns: 0,
-                                        last_seen: std::time::Instant::now(),
-                                        samples: 0,
-                                    });
-                                }
+                            });
+                            let first = entry.samples == 0 && entry.priority1 == 255;
+                            entry.last_seen = std::time::Instant::now();
+                            entry.priority1 = buf[47];
+                            entry.clock_class = buf[48];
+                            entry.clock_accuracy = buf[49];
+                            entry.variance = u16::from_be_bytes([buf[50], buf[51]]);
+                            entry.priority2 = buf[52];
+                            if first {
+                                // BMCA dataset — this decides which clock the
+                                // RECEIVERS elect; log it so mismatches with
+                                // our own pick are visible.
+                                info!(
+                                    gm = format!("{gm_id:016x}"),
+                                    p1 = entry.priority1,
+                                    class = entry.clock_class,
+                                    accuracy = entry.clock_accuracy,
+                                    variance = entry.variance,
+                                    p2 = entry.priority2,
+                                    "foreign master announce quality"
+                                );
                             }
                         }
                         MSG_FOLLOW_UP if n >= 44 => {
+                            let src_clock = u64::from_be_bytes(buf[20..28].try_into().unwrap());
                             let seq = u16::from_be_bytes([buf[30], buf[31]]);
                             let t_origin = read_ptp_timestamp(&buf[34..44]);
-                            let rx_time = sync_times.lock().unwrap().remove(&seq);
+                            let rx_time = sync_times.lock().unwrap().remove(&(src_clock, seq));
                             if let Some(t_rx) = rx_time {
                                 let sample = t_origin as i64 - t_rx as i64;
                                 let mut g = foreign_rx.0.lock().unwrap();
-                                if let Some(f) = g.as_mut() {
+                                // A master's Sync source clock is its own
+                                // grandmaster identity (it IS the GM of its
+                                // own timeline).
+                                if let Some(f) = g.get_mut(&src_clock) {
                                     // EWMA after the first sample; ~sub-ms
                                     // path delay is absorbed into the offset.
                                     f.offset_ns = if f.samples == 0 {
@@ -296,6 +372,7 @@ impl PtpMaster {
                                     f.last_seen = std::time::Instant::now();
                                     if f.samples <= 3 || f.samples % 32 == 0 {
                                         debug!(
+                                            gm = format!("{src_clock:016x}"),
                                             offset_ms = f.offset_ns as f64 / 1e6,
                                             samples = f.samples,
                                             "foreign master offset updated"
@@ -314,48 +391,70 @@ impl PtpMaster {
         let thread = std::thread::spawn(move || {
             let mut announce_seq: u16 = 0;
             let mut sync_seq: u16 = 0;
-            let mut yielding = false;
+            let mut quiet: Vec<bool> = vec![false; event_dests.len()];
             let mut last_announce = std::time::Instant::now() - Duration::from_secs(2);
             loop {
                 if stop2.load(Ordering::Relaxed) {
                     break;
                 }
-                // BMCA-style yield: while a foreign master is actively
-                // announcing (Apple TV / HomePod run their own grandmaster
-                // and won't slave to us), stop transmitting our own
-                // Announce/Sync so we don't fight its clock. If it goes
-                // quiet for >5s, resume mastering.
-                let foreign_active = foreign_tx
-                    .0
-                    .lock()
-                    .unwrap()
-                    .map(|f| f.last_seen.elapsed() < Duration::from_secs(5))
-                    .unwrap_or(false);
-                if foreign_active != yielding {
-                    yielding = foreign_active;
-                    info!(yielding, "PTP master role changed");
-                }
-                if !yielding {
-                    if last_announce.elapsed() >= Duration::from_secs(1) {
-                        let a = build_announce(&clock_bytes, announce_seq);
-                        if let Err(e) = general.send_to(&a, general_dest) {
-                            warn!("announce send failed: {e}");
+                // Per-peer BMCA-style yield: stay quiet toward peers that
+                // run their own actively-SYNCING grandmaster (Apple TV /
+                // HomePod never slave to us — their anchors use their own
+                // clock), but keep mastering toward everyone else
+                // (Shairport needs our clock; its nqptp announces a clock
+                // identity but never serves Sync for it, so announce-only
+                // masters don't count). A global yield is wrong in mixed
+                // groups: going quiet toward the Shairport peer because an
+                // Apple TV elsewhere has a clock starves the Shairport
+                // (hardware-verified).
+                {
+                    let g = foreign_tx.0.lock().unwrap();
+                    for (i, dest) in event_dests.iter().enumerate() {
+                        let has_own_master = g.values().any(|f| {
+                            f.src_ip == dest.ip()
+                                && f.last_seen.elapsed() < FOREIGN_TIMEOUT
+                                && f.samples >= 3
+                        });
+                        if has_own_master != quiet[i] {
+                            quiet[i] = has_own_master;
+                            info!(peer = %dest.ip(), yielding = has_own_master,
+                                  "PTP role toward peer changed");
                         }
-                        announce_seq = announce_seq.wrapping_add(1);
-                        last_announce = std::time::Instant::now();
                     }
-                    let s = build_sync(&clock_bytes, sync_seq);
-                    let t = ptp_now_ns();
-                    if let Err(e) = event.send_to(&s, event_dest) {
-                        warn!("sync send failed: {e}");
-                    }
-                    let f = build_follow_up(&clock_bytes, sync_seq, t);
-                    if let Err(e) = general.send_to(&f, general_dest) {
-                        warn!("follow_up send failed: {e}");
-                    }
-                    debug!(seq = sync_seq, "PTP sync+follow_up sent");
-                    sync_seq = sync_seq.wrapping_add(1);
                 }
+                let announce_due = last_announce.elapsed() >= Duration::from_secs(1);
+                let a = build_announce(&clock_bytes, announce_seq);
+                let s = build_sync(&clock_bytes, sync_seq);
+                let t = ptp_now_ns();
+                let f = build_follow_up(&clock_bytes, sync_seq, t);
+                let mut sent_any = false;
+                for (i, (ev_dest, gen_dest)) in
+                    event_dests.iter().zip(general_dests.iter()).enumerate()
+                {
+                    if quiet[i] {
+                        continue;
+                    }
+                    if announce_due {
+                        if let Err(e) = general.send_to(&a, gen_dest) {
+                            warn!(dest = %gen_dest, "announce send failed: {e}");
+                        }
+                    }
+                    if let Err(e) = event.send_to(&s, ev_dest) {
+                        warn!(dest = %ev_dest, "sync send failed: {e}");
+                    }
+                    if let Err(e) = general.send_to(&f, gen_dest) {
+                        warn!(dest = %gen_dest, "follow_up send failed: {e}");
+                    }
+                    sent_any = true;
+                }
+                if announce_due {
+                    announce_seq = announce_seq.wrapping_add(1);
+                    last_announce = std::time::Instant::now();
+                }
+                if sent_any {
+                    debug!(seq = sync_seq, "PTP sync+follow_up sent");
+                }
+                sync_seq = sync_seq.wrapping_add(1);
                 // Fast cadence for the first ~3s: the receiver's clock
                 // daemon (nqptp) resets its records when a session starts
                 // and its offset smoothing needs several follow_ups to
@@ -369,17 +468,24 @@ impl PtpMaster {
         Ok(PtpMaster { clock_id, foreign, stop, thread: Some(thread) })
     }
 
-    /// The timeline anchors must be expressed on right now.
+    /// The timeline anchors for `peer` must be expressed on right now.
     ///
-    /// If a foreign master (receiver-side grandmaster) is active with a
-    /// converged offset, use its clock ID and offset; otherwise our own
-    /// clock (offset 0).
-    pub fn active_timeline(&self) -> Timeline {
+    /// If the peer runs its own actively-syncing grandmaster (Apple TV /
+    /// HomePod — they never follow ours), anchors for it must use that
+    /// clock; everyone else follows our clock (offset 0). Multi-room sync
+    /// comes from all anchors describing the same physical instant, not
+    /// from receivers sharing one clock. If a peer somehow serves several
+    /// masters, the BMCA dataset winner is picked.
+    pub fn timeline_for(&self, peer: IpAddr) -> Timeline {
         let g = self.foreign.0.lock().unwrap();
-        if let Some(f) = g.as_ref() {
-            if f.last_seen.elapsed() < Duration::from_secs(5) && f.samples >= 3 {
-                return Timeline { gm_id: f.gm_id, offset_ns: f.offset_ns };
-            }
+        let best = g
+            .values()
+            .filter(|f| {
+                f.src_ip == peer && f.last_seen.elapsed() < FOREIGN_TIMEOUT && f.samples >= 3
+            })
+            .min_by_key(|f| f.bmca_key());
+        if let Some(f) = best {
+            return Timeline { gm_id: f.gm_id, offset_ns: f.offset_ns };
         }
         Timeline { gm_id: self.clock_id, offset_ns: 0 }
     }
