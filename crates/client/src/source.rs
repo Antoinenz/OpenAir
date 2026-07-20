@@ -261,6 +261,11 @@ const PREBUFFER_MS: u32 = 200;
 /// active playback), give up and stream silence rather than hang forever.
 const PREBUFFER_MAX_WAIT_MS: u32 = 500;
 const PREBUFFER_POLL_MS: u64 = 5;
+/// Ceiling on how long a single blocking-mode `fill()` waits for live ring
+/// data before giving up and padding silence. Long enough to cover normal
+/// capture-callback jitter (WASAPI delivers in ~10 ms chunks), short enough
+/// that a paused source is noticed within a couple of packets.
+const BLOCKING_WAIT_MS: u64 = 60;
 
 /// Ring exceeding this many ms of buffered audio indicates the sender is
 /// falling behind the device's capture rate (clock drift or a stalled RTP
@@ -346,13 +351,20 @@ impl CaptureSource {
 
     /// In blocking mode: wait (short polls, bounded) until the ring holds
     /// enough device-rate samples to produce `frames` output frames.
+    ///
+    /// The bound is short (`BLOCKING_WAIT_MS`): when live audio is flowing the
+    /// data is there within one packet time so this returns promptly and
+    /// rate-limits the send loop to real time; when the source has gone dry
+    /// (playback paused — WASAPI loopback stops delivering) it must give up
+    /// quickly and let the caller pad silence, so the pipeline's pause/resume
+    /// state machine stays responsive instead of stalling ~1 s per fill.
     fn wait_for_frames(&self, frames: usize) {
         // Output frames → device-rate samples (stereo interleaved), plus one
         // spare frame for the resampler bracket.
         let needed =
             ((frames as f64 * f64::from(self.device_rate) / f64::from(SAMPLE_RATE)) as usize + 2)
                 * 2;
-        let deadline = Instant::now() + Duration::from_millis(1000);
+        let deadline = Instant::now() + Duration::from_millis(BLOCKING_WAIT_MS);
         loop {
             if self.ring.lock().unwrap().len() >= needed || Instant::now() >= deadline {
                 break;
@@ -417,6 +429,10 @@ impl CaptureSource {
 }
 
 impl AudioSource for CaptureSource {
+    fn is_live(&self) -> bool {
+        true
+    }
+
     fn fill(&mut self, buf: &mut [i16]) -> usize {
         if let Some(stop) = &self.stop {
             if stop.load(Ordering::Relaxed) {

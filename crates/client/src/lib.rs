@@ -107,6 +107,14 @@ pub trait AudioSource {
     /// `buf.len()/2` frames. Returns the number of FRAMES written; 0 means
     /// end of stream.
     fn fill(&mut self, buf: &mut [i16]) -> usize;
+
+    /// True for continuous live sources (system capture) where a sustained
+    /// stretch of silence means "playback paused" and the buffered pipeline
+    /// should pause/auto-resume the AirPlay stream. False for finite sources
+    /// (WAV, tone) where a quiet passage is just quiet music, not a pause.
+    fn is_live(&self) -> bool {
+        false
+    }
 }
 
 /// Stream audio pulled from `source` to `addr`. This is the shared pipeline
@@ -273,6 +281,15 @@ const BUFFERED_LEAD_SAMPLES: i64 = 88_200; // 2s @ 44100 Hz
 /// typical buffered latency and is comfortable on a LAN.
 const BUFFERED_ANCHOR_LEAD_MS_DEFAULT: u64 = 500;
 
+/// Peak |sample| below which a packet counts as silence, for live-capture
+/// pause detection (~ -54 dBFS). Real system playback sits far above this;
+/// a paused source is exact zeros (WASAPI loopback stops delivering, so the
+/// capture source pads zeros).
+const SILENCE_PEAK: u16 = 64;
+/// How long a live source must stay silent before the AirPlay stream is
+/// paused (`rate=0`). Auto-resumes (re-anchor) the instant audio returns.
+const PAUSE_AFTER_SILENCE: Duration = Duration::from_millis(1500);
+
 /// Stream audio pulled from `source` to `addr` using AirPlay 2's BUFFERED
 /// pipeline (stream type 103, AAC-LC): pair → SETUP(timing=PTP) →
 /// SETUP(stream type=103) → TCP connect to dataPort → RECORD →
@@ -312,11 +329,25 @@ pub fn stream_audio_buffered_with_latency(
     latency_ms: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     stream_audio_buffered_multi(
-        &[(addr, device_id.to_string())],
+        &[GroupTarget {
+            addr,
+            device_id: device_id.to_string(),
+            offset_ms: 0,
+        }],
         source,
         volume_db,
         latency_ms,
     )
+}
+
+/// One receiver in a buffered (possibly multi-room) stream.
+pub struct GroupTarget {
+    pub addr: SocketAddr,
+    pub device_id: String,
+    /// Extra play delay for this receiver in milliseconds (+ = later,
+    /// − = earlier), added to its anchor. Compensates downstream amp/DSP
+    /// latency so rooms line up audibly.
+    pub offset_ms: i64,
 }
 
 /// One receiver's live state inside a (possibly multi-room) buffered stream.
@@ -324,6 +355,8 @@ struct BufferedReceiver {
     name: String,
     session: StreamSession,
     cipher: AudioCipher,
+    /// Per-receiver anchor offset in ns (from `GroupTarget::offset_ms`).
+    offset_ns: i64,
     /// Bounded queue to this receiver's TCP writer thread. `None` once closed.
     tx: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
     writer: Option<std::thread::JoinHandle<()>>,
@@ -383,28 +416,72 @@ impl BufferedReceiver {
     }
 }
 
+/// Compute and push one receiver's SETRATEANCHORTIME so that stream position
+/// `rtptime` is heard at the shared instant `t_local_ns` (on OUR PTP clock),
+/// translated onto the clock that receiver actually follows and shifted by
+/// its user offset. Used for the initial anchor and for every resume.
+fn anchor_receiver(
+    ptp: &PtpMaster,
+    r: &mut BufferedReceiver,
+    t_local_ns: u64,
+    rtptime: u32,
+) -> Result<(), openair_rtsp::SessionError> {
+    let tl = ptp.timeline_for(r.session.peer_ip());
+    let play_ns = t_local_ns
+        .wrapping_add_signed(r.offset_ns)
+        .wrapping_add_signed(tl.offset_ns);
+    let (secs, frac) = ptp_ns_to_secs_frac(play_ns);
+    info!(
+        receiver = %r.name,
+        gm = format!("{:016x}", tl.gm_id),
+        clock_offset_ms = tl.offset_ns as f64 / 1e6,
+        user_offset_ms = r.offset_ns as f64 / 1e6,
+        foreign = tl.gm_id != ptp.clock_id,
+        "anchor"
+    );
+    r.session.set_rate_anchor(tl.gm_id, rtptime, secs, frac, 1)
+}
+
+/// Send the periodic `/feedback` keepalive to every live receiver every ~2 s
+/// (also keeps a paused stream's session from timing out).
+fn service_feedback(group: &mut [BufferedReceiver], last: &mut Instant) {
+    if last.elapsed() >= Duration::from_secs(2) {
+        for r in group.iter_mut() {
+            if r.alive {
+                if let Err(e) = r.session.feedback() {
+                    warn!(receiver = %r.name, "feedback failed: {e}");
+                }
+            }
+        }
+        *last = Instant::now();
+    }
+}
+
 /// Multi-room buffered streaming: the same AAC audio, time-synchronized, to
-/// every receiver in `receivers` (`(addr, device_id)` pairs).
+/// every receiver in `targets`.
 ///
-/// How the group stays in sync: one PTP node serves the whole timing group
-/// (SETPEERS tells every receiver about all the others, so group-wide BMCA
-/// elects a single grandmaster — ours for Shairport-only groups, an Apple
-/// receiver's own clock when one is present), and every session gets an
-/// IDENTICAL SETRATEANCHORTIME (same timeline, same network time, same
-/// rtpTime). Each receiver then plays frame N at the same group-clock
-/// instant. Audio is encoded once and encrypted per-receiver (each SETUP
-/// negotiates its own AEAD key); per-receiver writer threads with bounded
-/// queues isolate a stalling receiver from the rest of the group.
+/// How the group stays in sync: one PTP node serves the whole timing group,
+/// and every session gets a SETRATEANCHORTIME for the SAME physical instant —
+/// each expressed on the clock that receiver actually follows (ours for
+/// Shairport, its own grandmaster for Apple) plus that receiver's user
+/// offset. Each receiver plays frame N at the same wall-clock moment. Audio
+/// is encoded once and encrypted per-receiver (each SETUP negotiates its own
+/// AEAD key); per-receiver writer threads with bounded queues isolate a
+/// stalling receiver from the rest of the group.
+///
+/// For live sources ([`AudioSource::is_live`]) a sustained silence pauses the
+/// AirPlay stream (`rate=0`) and audio's return re-anchors and resumes it, so
+/// pausing the music on the PC cleanly pauses/resumes every room.
 pub fn stream_audio_buffered_multi(
-    receivers: &[(SocketAddr, String)],
+    targets: &[GroupTarget],
     source: &mut dyn AudioSource,
     volume_db: Option<f32>,
     latency_ms: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if receivers.is_empty() {
+    if targets.is_empty() {
         return Err("no receivers given".into());
     }
-    let group_ips: Vec<std::net::IpAddr> = receivers.iter().map(|(a, _)| a.ip()).collect();
+    let group_ips: Vec<std::net::IpAddr> = targets.iter().map(|t| t.addr.ip()).collect();
 
     // One PTP node for the whole group, running before any receiver starts
     // monitoring us (and observing their masters before we anchor).
@@ -412,11 +489,11 @@ pub fn stream_audio_buffered_multi(
 
     // --- Per-receiver RTSP negotiation ---
     let mut group: Vec<BufferedReceiver> = Vec::new();
-    for (addr, device_id) in receivers {
-        let name = format!("{addr}");
+    for target in targets {
+        let name = format!("{}", target.addr);
         let setup = (|| -> Result<BufferedReceiver, Box<dyn std::error::Error>> {
             let control = ControlChannel::bind()?;
-            let mut session = connect_session(*addr, device_id)?;
+            let mut session = connect_session(target.addr, &target.device_id)?;
             let peer_ip = session.peer_ip();
             session.setup_timing(TimingConfig::Ptp)?;
             session.setup_stream(StreamFormat::AacBuffered, control.port)?;
@@ -429,6 +506,7 @@ pub fn stream_audio_buffered_multi(
                 name: name.clone(),
                 session,
                 cipher,
+                offset_ns: target.offset_ms * 1_000_000,
                 tx: None,
                 writer: None,
                 _event: event,
@@ -490,26 +568,12 @@ pub fn stream_audio_buffered_multi(
 
     // --- Anchors: ONE shared physical instant (rtpTime=0 plays latency_ms
     // from now), expressed per receiver on the timeline that receiver
-    // actually follows — ours for Shairport-style receivers, its own
-    // grandmaster for Apple receivers (translated by the measured offset).
-    // Same instant on every clock = synchronized rooms, without relying on
-    // receivers being able to see each other's clocks.
+    // actually follows plus its user offset. Same instant on every clock =
+    // synchronized rooms, without relying on receivers seeing each other's
+    // clocks.
     let t_local = ptp_now_ns() + latency_ms * 1_000_000;
     for r in &mut group {
-        let tl = ptp.timeline_for(r.session.peer_ip());
-        info!(
-            receiver = %r.name,
-            gm = format!("{:016x}", tl.gm_id),
-            offset_ms = tl.offset_ns as f64 / 1e6,
-            foreign = tl.gm_id != ptp.clock_id,
-            "anchor timeline"
-        );
-        let anchor_ns = t_local.wrapping_add_signed(tl.offset_ns);
-        let (anchor_secs, anchor_frac) = ptp_ns_to_secs_frac(anchor_ns);
-        if let Err(e) =
-            r.session
-                .set_rate_anchor(tl.gm_id, first_rtptime, anchor_secs, anchor_frac, 1)
-        {
+        if let Err(e) = anchor_receiver(&ptp, r, t_local, first_rtptime) {
             warn!(receiver = %r.name, "anchor failed — dropping: {e}");
             r.alive = false;
         }
@@ -524,41 +588,93 @@ pub fn stream_audio_buffered_multi(
         return Err("no receiver accepted the anchor".into());
     }
 
-    // --- Encode once + fan out (send-ahead pacing) ---
+    // --- Encode once + fan out (send-ahead pacing, with pause/resume) ---
+    let live = source.is_live();
     let mut encoder = AacEncoder::new()?;
-    let start_instant = Instant::now();
+    // `pace_origin`/`frames_sent` are the wall-clock pacing baseline; both
+    // reset on every resume so post-pause playback re-paces cleanly.
+    let mut pace_origin = Instant::now();
+    let mut frames_sent: i64 = 0;
     let mut last_feedback = Instant::now();
 
-    info!(receivers = group.len(), "streaming buffered AAC audio");
+    info!(receivers = group.len(), live, "streaming buffered AAC audio");
 
     let mut rtptime: u32 = first_rtptime;
-    let mut frames_sent: i64 = 0;
-    let mut source_ended = false;
+    let mut paused = false;
+    let mut silent_since: Option<Instant> = None;
 
     loop {
-        // Send-ahead pacing: if we're too far ahead of wall-clock playback,
-        // sleep instead of encoding/sending more.
-        let elapsed_frames = (start_instant.elapsed().as_secs_f64() * SAMPLE_RATE as f64) as i64;
-        if frames_sent - elapsed_frames >= BUFFERED_LEAD_SAMPLES {
-            std::thread::sleep(Duration::from_millis(10));
-            continue;
-        }
-
-        if source_ended {
-            break;
+        // Send-ahead pacing (only while actively playing; a paused loop is
+        // throttled by the blocking fill() below).
+        if !paused {
+            let elapsed_frames =
+                (pace_origin.elapsed().as_secs_f64() * SAMPLE_RATE as f64) as i64;
+            if frames_sent - elapsed_frames >= BUFFERED_LEAD_SAMPLES {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
         }
 
         let mut samples = [0i16; AAC_FRAMES_PER_PACKET * 2];
         let frames = source.fill(&mut samples);
         if frames == 0 {
-            source_ended = true;
-            continue;
+            break; // source exhausted (EOF) or stopped (Ctrl+C)
         }
         if frames < AAC_FRAMES_PER_PACKET {
             // Zero-pad the final partial block.
             for v in &mut samples[frames * 2..] {
                 *v = 0;
             }
+        }
+
+        // Pause/resume on sustained silence (live capture only: a quiet
+        // passage in a file is music, not a pause).
+        if live {
+            let peak = samples.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
+            if peak >= SILENCE_PEAK {
+                silent_since = None;
+                if paused {
+                    // Audio's back: re-anchor at a fresh instant and resume.
+                    info!("audio resumed — re-anchoring");
+                    let t_local = ptp_now_ns() + latency_ms * 1_000_000;
+                    for r in &mut group {
+                        if r.alive {
+                            if let Err(e) = anchor_receiver(&ptp, r, t_local, rtptime) {
+                                warn!(receiver = %r.name, "resume anchor failed — dropping: {e}");
+                                r.alive = false;
+                            }
+                        }
+                    }
+                    group.retain(|r| r.alive);
+                    if group.is_empty() {
+                        warn!("all receivers dropped on resume — stopping");
+                        break;
+                    }
+                    paused = false;
+                    pace_origin = Instant::now();
+                    frames_sent = 0;
+                }
+            } else {
+                let since = *silent_since.get_or_insert_with(Instant::now);
+                if !paused && since.elapsed() >= PAUSE_AFTER_SILENCE {
+                    info!("source silent — pausing AirPlay (rate=0)");
+                    for r in &mut group {
+                        if r.alive {
+                            if let Err(e) = r.session.set_rate(0) {
+                                warn!(receiver = %r.name, "pause set_rate(0) failed: {e}");
+                            }
+                        }
+                    }
+                    paused = true;
+                }
+            }
+        }
+
+        if paused {
+            // Don't send audio while paused; fill() already drained the ring
+            // and throttled the loop. Keep sessions alive with /feedback.
+            service_feedback(&mut group, &mut last_feedback);
+            continue;
         }
 
         let aac_frame = encoder.encode(&samples)?;
@@ -589,26 +705,17 @@ pub fn stream_audio_buffered_multi(
         rtptime = rtptime.wrapping_add(AAC_FRAMES_PER_PACKET as u32);
         frames_sent += AAC_FRAMES_PER_PACKET as i64;
 
-        if last_feedback.elapsed() >= Duration::from_secs(2) {
-            for r in &mut group {
-                if r.alive {
-                    if let Err(e) = r.session.feedback() {
-                        warn!(receiver = %r.name, "feedback failed: {e}");
-                    }
-                }
-            }
-            last_feedback = Instant::now();
-        }
+        service_feedback(&mut group, &mut last_feedback);
     }
 
     // Wait for the queued audio to actually PLAY OUT before tearing down.
-    // rtpTime=0 starts at anchor time (latency_ms after the anchor was
-    // computed), and the send-ahead pacing keeps us up to the whole lead
-    // window ahead of wall clock — tearing down immediately makes receivers
-    // dump the unplayed tail (for a short source: ALL of it, silently).
+    // rtpTime advances with the send-ahead window, up to the whole lead ahead
+    // of wall clock — tearing down immediately makes receivers dump the
+    // unplayed tail (for a short source: ALL of it, silently). If we ended
+    // while paused there is nothing buffered, so this naturally waits ~0.
     let played = Duration::from_secs_f64(frames_sent as f64 / SAMPLE_RATE as f64)
         + Duration::from_millis(latency_ms + 250);
-    let elapsed = start_instant.elapsed();
+    let elapsed = pace_origin.elapsed();
     if played > elapsed {
         let wait = played - elapsed;
         info!(wait_ms = wait.as_millis() as u64, "draining playout before teardown");

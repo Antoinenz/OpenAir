@@ -84,9 +84,64 @@ mod util {
         (remaining, latency)
     }
 
+    use std::collections::HashMap;
+
+    /// Extracts any number of `--offset <name=ms>` flags (per-receiver anchor
+    /// delay for multi-room), returning the remaining positional args and a
+    /// map of lowercased receiver-name → offset in ms. The value may carry an
+    /// optional `+`/`-` sign and an optional `ms` suffix, e.g.
+    /// `--offset "Pool Room=+80ms"`.
+    pub fn extract_offsets(args: &[String]) -> (Vec<String>, HashMap<String, i64>) {
+        let mut remaining = Vec::with_capacity(args.len());
+        let mut offsets = HashMap::new();
+        let mut skip_next = false;
+        for (i, arg) in args.iter().enumerate() {
+            if skip_next {
+                skip_next = false;
+                continue;
+            }
+            if arg == "--offset" {
+                if let Some(spec) = args.get(i + 1) {
+                    if let Some((name, ms)) = parse_offset_spec(spec) {
+                        offsets.insert(name, ms);
+                    }
+                    skip_next = true;
+                }
+                continue;
+            }
+            remaining.push(arg.clone());
+        }
+        (remaining, offsets)
+    }
+
+    /// Parses one `name=ms` offset spec into (lowercased name, ms). Accepts a
+    /// trailing `ms` and a leading sign on the value.
+    fn parse_offset_spec(spec: &str) -> Option<(String, i64)> {
+        let (name, val) = spec.rsplit_once('=')?;
+        let val = val.trim().trim_end_matches("ms").trim();
+        let ms: i64 = val.parse().ok()?;
+        Some((name.trim().to_lowercase(), ms))
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn extract_offsets_parses_signed_and_ms_suffix() {
+            let args = vec![
+                "capture".to_string(),
+                "pool".to_string(),
+                "--offset".to_string(),
+                "Pool Room=+80ms".to_string(),
+                "--offset".to_string(),
+                "test=-15".to_string(),
+            ];
+            let (rest, offs) = extract_offsets(&args);
+            assert_eq!(rest, vec!["capture".to_string(), "pool".to_string()]);
+            assert_eq!(offs.get("pool room"), Some(&80));
+            assert_eq!(offs.get("test"), Some(&-15));
+        }
 
         #[test]
         fn extract_volume_present() {
@@ -213,10 +268,15 @@ fn resolve_receiver(arg: &str) -> Option<(SocketAddr, String)> {
 }
 
 /// Resolve several receiver arguments (`ip:port` or names) with at most ONE
-/// mDNS browse shared by all names. Returns `None` (after printing why) if
-/// any argument doesn't resolve to exactly one receiver.
-fn resolve_receivers(args: &[String]) -> Option<Vec<(SocketAddr, String)>> {
-    let mut out: Vec<(SocketAddr, String)> = Vec::new();
+/// mDNS browse shared by all names, applying any per-receiver `--offset`
+/// (keyed case-insensitively by the argument the user typed). Returns `None`
+/// (after printing why) if any argument doesn't resolve to exactly one
+/// receiver.
+fn resolve_receivers(
+    args: &[String],
+    offsets: &std::collections::HashMap<String, i64>,
+) -> Option<Vec<openair_client::GroupTarget>> {
+    let mut out: Vec<openair_client::GroupTarget> = Vec::new();
     let names: Vec<&String> = args
         .iter()
         .filter(|a| a.parse::<SocketAddr>().is_err())
@@ -239,8 +299,13 @@ fn resolve_receivers(args: &[String]) -> Option<Vec<(SocketAddr, String)>> {
     }
 
     for arg in args {
+        let offset_ms = offsets.get(&arg.to_lowercase()).copied().unwrap_or(0);
         if let Ok(addr) = arg.parse::<SocketAddr>() {
-            out.push((addr, DEFAULT_DEVICE_ID.to_string()));
+            out.push(openair_client::GroupTarget {
+                addr,
+                device_id: DEFAULT_DEVICE_ID.to_string(),
+                offset_ms,
+            });
             continue;
         }
         let needle = arg.to_lowercase();
@@ -256,7 +321,11 @@ fn resolve_receivers(args: &[String]) -> Option<Vec<(SocketAddr, String)>> {
                     .device_id
                     .clone()
                     .unwrap_or_else(|| DEFAULT_DEVICE_ID.to_string());
-                out.push((SocketAddr::new(dev.addr, dev.port), device_id));
+                out.push(openair_client::GroupTarget {
+                    addr: SocketAddr::new(dev.addr, dev.port),
+                    device_id,
+                    offset_ms,
+                });
             }
             0 => {
                 println!("No receiver matched '{}'. Discovered device(s):", arg);
@@ -290,23 +359,23 @@ async fn main() -> Result<()> {
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
     let (raw_args, volume_db) = extract_volume(&raw_args, DEFAULT_VOLUME_DB);
     let (raw_args, latency_ms) = util::extract_latency(&raw_args, 500);
+    let (raw_args, offsets) = util::extract_offsets(&raw_args);
     let (args, buffered) = extract_flag(&raw_args, "--buffered");
 
     // Dispatches to the realtime ALAC pipeline (fixed ~2s protocol latency)
     // or the buffered AAC pipeline (sender-chosen latency, `--latency <ms>`,
     // default 500) depending on the `--buffered` flag. Multiple receivers
     // always use the buffered pipeline — that's the multi-room mode.
-    let stream_fn = move |receivers: &[(SocketAddr, String)],
+    let stream_fn = move |targets: &[openair_client::GroupTarget],
                           source: &mut dyn openair_client::AudioSource,
                           volume: Option<f32>| {
-        if receivers.len() > 1 && !buffered {
+        if targets.len() > 1 && !buffered {
             println!("  (multi-room uses the buffered pipeline — enabling --buffered)");
         }
-        if buffered || receivers.len() > 1 {
-            openair_client::stream_audio_buffered_multi(receivers, source, volume, latency_ms)
+        if buffered || targets.len() > 1 {
+            openair_client::stream_audio_buffered_multi(targets, source, volume, latency_ms)
         } else {
-            let (addr, device_id) = &receivers[0];
-            openair_client::stream_audio(*addr, device_id, source, volume)
+            openair_client::stream_audio(targets[0].addr, &targets[0].device_id, source, volume)
         }
     };
 
@@ -349,7 +418,7 @@ async fn main() -> Result<()> {
             println!("usage: openair capture <receiver>... [seconds]");
             return Ok(());
         }
-        let Some(receivers) = resolve_receivers(&recv_args) else {
+        let Some(receivers) = resolve_receivers(&recv_args, &offsets) else {
             return Ok(());
         };
 
@@ -364,7 +433,7 @@ async fn main() -> Result<()> {
 
         let dest = receivers
             .iter()
-            .map(|(a, _)| a.to_string())
+            .map(|t| t.addr.to_string())
             .collect::<Vec<_>>()
             .join(", ");
         match seconds {
@@ -412,12 +481,12 @@ async fn main() -> Result<()> {
     if args.len() >= 3 && args[0] == "play" {
         let path = std::path::Path::new(&args[args.len() - 1]);
         let recv_args: Vec<String> = args[1..args.len() - 1].to_vec();
-        let Some(receivers) = resolve_receivers(&recv_args) else {
+        let Some(receivers) = resolve_receivers(&recv_args, &offsets) else {
             return Ok(());
         };
         let dest = receivers
             .iter()
-            .map(|(a, _)| a.to_string())
+            .map(|t| t.addr.to_string())
             .collect::<Vec<_>>()
             .join(", ");
         println!("OpenAir — playing {} to {}\n", path.display(), dest);
@@ -457,12 +526,12 @@ async fn main() -> Result<()> {
             println!("usage: openair tone <receiver>... [seconds]");
             return Ok(());
         }
-        let Some(receivers) = resolve_receivers(&recv_args) else {
+        let Some(receivers) = resolve_receivers(&recv_args, &offsets) else {
             return Ok(());
         };
         let dest = receivers
             .iter()
-            .map(|(a, _)| a.to_string())
+            .map(|t| t.addr.to_string())
             .collect::<Vec<_>>()
             .join(", ");
         println!("OpenAir — streaming {}s test tone to {}\n", seconds, dest);
