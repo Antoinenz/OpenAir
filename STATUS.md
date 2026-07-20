@@ -13,7 +13,7 @@
 | 5 | Buffered AAC PT=103 | ✅ Done | Hardware-verified 2026-07-14 (Shairport) + 2026-07-19 (Apple TV); FDK-AAC over TCP, --buffered/--latency |
 | 6 | PTP timing (HomePod, BMCA yield) | 🔄 Mostly done | Master (Announce+Sync/Follow_Up) ✅, Delay_Resp ✅, **BMCA yield + foreign-timeline anchoring ✅ (ATV-verified)**; ptp-helper (Linux privileged ports) remains |
 | 7 | Normal pairing (Apple TV + PIN, persist identity) | ✅ Done | Hardware-verified 2026-07-19 on AppleTV5,3 + AppleTV6,2: pair-setup M1–M6 w/ PIN, pair-verify, %APPDATA% persistence, `openair pair` |
-| 8 | Multi-room group streaming | ⬜ Not Started | |
+| 8 | Multi-room group streaming | ✅ Done | Hardware-verified 2026-07-20: Shairport + Apple TV synchronized group (buffered); per-receiver timelines anchored at one shared instant; receiver-drop resilience tested live |
 | 9 | Real-time hardening (SCHED_FIFO, DSCP EF, retransmit <5ms) | ⬜ Not Started | |
 
 **Legend:** ✅ Done · 🔄 In Progress · ⚠️ Partial / Known Issues · ⬜ Not Started
@@ -61,9 +61,10 @@
 
 ## Next Steps
 
-1. **Step 8** — multi-room group streaming
-2. Step 9 hardening (adaptive resample, retransmit tuning, DSCP); Linux capture + ptp-helper
-3. HomePod hardware test when available
+1. **Step 9** — hardening (adaptive resample, retransmit tuning, DSCP EF)
+2. Linux capture (PipeWire) + ptp-helper for privileged ports
+3. Per-receiver latency offset (`--offset pool=+80ms`) for downstream amp/DSP delay
+4. HomePod hardware test when available; realtime-ALAC multi-room (buffered-only today)
 
 ---
 

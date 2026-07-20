@@ -4,6 +4,57 @@
 
 ---
 
+## 2026-07-20 — Session 9: MULTI-ROOM 🔊🔊 — Step 8 done (grouped streaming)
+
+Hardware-verified: `openair capture pool test --buffered` plays synchronized system
+audio on a Shairport receiver and an Apple TV simultaneously. Residual inter-room
+offset matches the iPhone's own AirPlay on the same pair (it's the pool amp's DSP
+latency, downstream of the receiver) — i.e. parity with Apple's sender.
+
+### The design that works: per-receiver timelines, one shared instant
+Rooms are synchronized because every session's SETRATEANCHORTIME describes the
+SAME physical moment — each expressed on the clock that receiver actually
+follows (ours for Shairport, its own grandmaster for Apple), NOT because the
+receivers share a clock. One `PtpMaster::start_multi(all_peer_ips)` node
+(319/320 can only bind once per process); audio encoded once, encrypted
+per-receiver (each SETUP has its own AEAD key); bounded per-receiver TCP writer
+threads so a stalled/dead receiver is dropped while the rest keep playing
+(hardware-tested live: the ATV aborted its TCP mid-stream and pool kept going).
+
+### Two shared-clock designs that hardware killed first
+1. **Global yield**: Shairport's nqptp ANNOUNCES a clock identity
+   (002324fffeb60750, p1=247 class=248 accuracy=254 — real values now logged)
+   but never serves Sync/Follow_Up for it. Yielding to any announcing master
+   left the whole group clockless. Yield (and timeline choice) must require an
+   actively-SYNCING master: ≥3 offset samples.
+2. **Group-wide foreign anchor**: anchoring the Shairport receiver on the
+   Apple TV's grandmaster left it silent — the ATV's clock never reaches other
+   receivers, and receiver-side BMCA isn't ours to control. Hence: SETPEERS
+   stays `[receiver, us]` per session (deliberately NOT the whole group — keep
+   each receiver's timing world down to {itself, us}), PTP yield is per-peer
+   (quiet toward the ATV, mastering toward pool simultaneously), and
+   `timeline_for(peer_ip)` picks per-receiver.
+
+### Other hardware finds
+- **Playout drain before teardown**: the send-ahead loop runs up to the whole
+  lead window ahead of wall clock; tearing down at source-end made receivers
+  dump the unplayed tail. A 1s tone sent in 4 ms and torn down before its
+  500 ms anchor even arrived = perfect silence with "✓ success" logs. Now we
+  sleep until sent-frames + latency (+250 ms margin) have actually played.
+- The "test" ATV auto-updated tvOS overnight (AirTunes 870.14.1 → 950.7.1),
+  new clock identity, uptime reset — protocol still works on 950.
+- tvOS announce quality: p1=248 class=248 accuracy=33 variance=17258 p2=243.
+- CLI: `capture/play/tone` take multiple receivers (one shared browse);
+  >1 receiver auto-selects buffered; trailing integer = seconds (beware:
+  `tone pool test 1` is a ONE-second tone, which is how the drain bug surfaced).
+
+### Future niceties (not planned yet)
+- Per-receiver latency offset (`--offset pool=+80ms`) to compensate downstream
+  amp/DSP delay — the residual sync gap the user hears is exactly this.
+- Timeline offset captured once per session; ppm drift over hours → slew t0.
+
+---
+
 ## 2026-07-19 — Session 8: APPLE TV 📺 — Step 7 done (Normal pairing) + Apple-receiver streaming
 
 Both pipelines (realtime ALAC tone, buffered AAC capture) hardware-verified on

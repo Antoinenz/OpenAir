@@ -55,8 +55,8 @@ Follow §16 of the research brief (✅ = done, hardware-verified):
 5. ✅ Buffered AAC PT=103 (FDK-AAC over TCP, tunable --latency)
 6. 🔄 PTP timing — master + Delay_Resp + BMCA yield/foreign-timeline anchoring done (Apple TV-verified); Linux ptp-helper remains
 7. ✅ Normal pairing (Apple TV + PIN, persist identity to disk) — pair-verify + %APPDATA% store; `openair pair`
-8. Multi-room streaming ← NEXT
-9. Real-time hardening (SCHED_FIFO, DSCP EF, retransmit <5ms)
+8. ✅ Multi-room streaming — per-receiver timelines anchored at one shared instant (mixed Shairport+ATV group hardware-verified; buffered-only)
+9. Real-time hardening (SCHED_FIFO, DSCP EF, retransmit <5ms) ← NEXT
 
 Hardware-verified protocol knowledge lives in DEVLOG.md — READ IT before touching
 protocol code (anchoring, PTP, TLV formats, AEAD framing were all hard-won).

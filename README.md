@@ -25,6 +25,10 @@ openair play "Pool Room" song.wav --buffered
 # Test tone
 openair tone "Living Room" 10 --volume -14
 
+# Multi-room: list several receivers to play the same audio, synchronized,
+# to all of them at once (mixes receiver types freely — e.g. Apple TV + Shairport)
+openair capture "Living Room" "Pool Room" --buffered
+
 # Receivers can be named (discovered via mDNS) or given as ip:port
 openair capture 192.168.1.106:7000
 
@@ -35,6 +39,9 @@ openair
 - **Two pipelines**: realtime ALAC (protocol-fixed ~2 s latency) and buffered
   AAC-LC over TCP (`--buffered`, sender-chosen latency via `--latency <ms>`,
   default 500 ms)
+- **Multi-room**: name several receivers and the same audio plays
+  time-synchronized on all of them, even a mix of Apple TV and Shairport —
+  each anchored on the clock it actually follows, at one shared instant
 - **Full AirPlay 2 stack**: mDNS discovery + feature bits, HomeKit pairing
   (Transient *and* Normal with on-screen PIN + persisted Ed25519 identity /
   pair-verify), ChaCha20-Poly1305-encrypted RTSP with binary plists,
@@ -47,7 +54,6 @@ openair
 ## Not yet
 
 - HomePod (expected to work like Apple TV — untested, no hardware on hand)
-- Multi-room (grouped) streaming
 - Linux capture (PipeWire) and the privileged PTP helper it needs
 - macOS
 
