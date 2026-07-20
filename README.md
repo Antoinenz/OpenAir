@@ -51,6 +51,36 @@ openair
 - **Sources**: live system capture (WASAPI loopback), WAV files, test tone —
   all resampled/converted to the pipeline format automatically
 
+## Commands & flags
+
+A `<receiver>` is either a discovered device **name** (case-insensitive
+substring match over mDNS, e.g. `pool`) or an explicit **`ip:port`** (e.g.
+`192.168.1.106:7000`). Streaming commands accept **several** receivers — two or
+more plays the same audio synchronized to all of them (multi-room), which
+automatically uses the buffered pipeline.
+
+| Command | What it does |
+|---------|--------------|
+| `openair` | Scan the LAN for 5 s, list AirPlay receivers, and try Transient pairing + `GET /info` on each (discovery/diagnostic). |
+| `openair <ip:port>` | Connect straight to one address, pair, and `GET /info` — no discovery (diagnostic). |
+| `openair pair <receiver>` | One-time **Normal HomeKit pairing**: shows a PIN on the device, prompts for it, and persists credentials so future connections are automatic. Needed for Apple TV / HomePod; Shairport needs no pairing. |
+| `openair capture <receiver>… [seconds]` | Stream **live system audio** (WASAPI loopback of the default output device). Runs until `Ctrl+C`, or for `seconds` if given. Pausing PC audio auto-pauses/resumes the stream. |
+| `openair play <receiver>… <file.wav>` | Stream a **WAV file** (the last argument). Any sample rate / 16-bit int or 32-bit float, mono or stereo — resampled/converted automatically. |
+| `openair tone <receiver>… [seconds]` | Stream a 440 Hz **test tone** (default 10 s). Hardware smoke test. |
+
+| Flag | Applies to | Default | What it does |
+|------|-----------|---------|--------------|
+| `--buffered` | capture / play / tone | off | Use the buffered AAC-LC pipeline (lower, sender-chosen latency) instead of realtime ALAC (~2 s fixed). Auto-enabled when you name more than one receiver. |
+| `--latency <ms>` | buffered only | `500` | End-to-end buffered latency (the anchor lead). Lower = tighter sync but more prone to underruns; below ~300 ms is risky. Ignored without `--buffered`. |
+| `--volume <dBFS>` | capture / play / tone | `-8` | Playback volume in dBFS: `0` = full scale, negative = quieter (e.g. `-14`), very low mutes. |
+| `--offset <name=ms>` | buffered / multi-room | `0` | Per-receiver play delay in milliseconds (`+` later, `-` earlier), e.g. `--offset "pool=+80ms"`. Repeatable; the `name` matches the receiver argument case-insensitively. Compensates downstream amp/DSP delay so rooms line up audibly. |
+
+Notes:
+- Flags can appear anywhere in the command line.
+- `--latency` and `--offset` only affect the buffered pipeline; the realtime
+  (default single-receiver) pipeline has a protocol-fixed ~2 s latency.
+- HomeKit credentials are stored at `%APPDATA%\OpenAir\pairings.json`.
+
 ## Not yet
 
 - HomePod (expected to work like Apple TV — untested, no hardware on hand)
