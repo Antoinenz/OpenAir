@@ -4,6 +4,52 @@
 
 ---
 
+## 2026-07-21 — Session 10: robustness — pause/resume, per-receiver offset, auto-reconnect
+
+Three features (tasks #10–#12). **Code complete, clippy-clean, 71 tests pass —
+NOT yet hardware-verified.** Test plan handed to user.
+
+### Pause/resume on silence (fixes: pausing PC audio → AirPlay silent forever)
+Root cause: the buffered timeline maps `rtptime` to frames-sent; during a pause
+frames-sent stalls while wall-clock advances, so every post-resume packet is
+"in the past" of the anchor and the receiver drops it. Fix (live capture only —
+gated by new `AudioSource::is_live`; a quiet passage in a WAV is music, not a
+pause): detect silence by packet peak (< ~−54 dBFS / `SILENCE_PEAK`), after
+`PAUSE_AFTER_SILENCE` (1.5 s) pause via `SETRATEANCHORTIME rate=0`, and on
+audio's return re-anchor at a fresh instant (rate=1) + reset the pacing
+baseline. `/feedback` keepalive continues through the pause. Also shortened the
+blocking-capture `fill()` wait 1000 ms → 60 ms so a pause is noticed within a
+couple packets instead of stalling the loop.
+*Protocol-uncertain:* whether the Apple TV cleanly resumes from rate=0 →
+re-anchor rate=1, or needs a FLUSH first. Watch the hardware test.
+
+### Per-receiver latency offset (`--offset "Pool Room=+80ms"`)
+`GroupTarget.offset_ms` added into the anchor (+ = play later) on top of the
+per-peer clock-timeline translation. Compensates downstream amp/DSP delay so
+rooms line up audibly — the residual gap heard in Session 9. Repeatable, signed,
+optional `ms` suffix; matches the receiver argument case-insensitively.
+
+### Auto-reconnect dropped receivers (live streams)
+A dropped receiver (TV off, Wi-Fi blip) is re-established on a BACKGROUND thread
+(pair → SETUP → event → SETPEERS → TCP), up to 3× with increasing backoff, so
+healthy receivers keep playing uninterrupted during the seconds-long re-pair.
+On success the main loop RECORDs + anchors the rejoiner onto the group's current
+anchor LINE (tracked as `anchor_rtptime` heard at `anchor_t_local`, refreshed on
+each resume) so it lands in sync. Crucial detail: `rtptime` keeps advancing with
+wall-clock even while the group is momentarily empty (encode is skipped, position
+still advances), so the line stays valid and a rejoin never needs a full-group
+re-anchor. Stop condition is now "group empty AND no reconnects pending".
+
+New helpers in client: `prepare_receiver` / `spawn_reconnect` /
+`finish_reconnect` / `reap_dead` / `spawn_writer`; `stream_audio_buffered_multi`
+now takes `&[GroupTarget]`.
+
+### Still queued
+#13 auto-latency on underrun, #14 Step 9 hardening (DSCP EF / thread priority),
+#15 metadata to receiver (deferred).
+
+---
+
 ## 2026-07-20 — Session 9: MULTI-ROOM 🔊🔊 — Step 8 done (grouped streaming)
 
 Hardware-verified: `openair capture pool test --buffered` plays synchronized system

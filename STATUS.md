@@ -35,7 +35,7 @@
 | `capture` | ✅ Done (Win) | Yes | WASAPI loopback verified with live Spotify; PipeWire/CoreAudio later |
 | `ptp-helper` | ⬜ Stub | — | Privileged binary, IPC to main (Linux ports 319/320; not needed on Windows) |
 | `client` | ✅ Done (v1) | Yes | realtime + buffered pipelines, pairing store + auto-dispatch (pair-verify vs transient), event channel |
-| `apps/cli` | ✅ Done (v1) | Yes | scan, `pair` (PIN), tone/play/capture; name resolution, --volume, --buffered, --latency <ms>, Ctrl+C |
+| `apps/cli` | ✅ Done (v1) | Yes | scan, `pair` (PIN), tone/play/capture; name resolution, --volume, --buffered, --latency <ms>, --offset <name=ms>, Ctrl+C |
 | `apps/tui` | ⬜ Stub | — | |
 
 ---
@@ -59,12 +59,22 @@
 
 ---
 
+## Awaiting hardware verification (code complete, Session 10)
+
+- **Pause/resume on silence** — pausing PC audio pauses AirPlay (`rate=0`) and
+  auto-resumes on sound. Verify the Apple TV resumes cleanly from rate=0 →
+  re-anchor (may need a FLUSH — see DEVLOG).
+- **Per-receiver `--offset "name=ms"`** — verify a room shifts by the given ms.
+- **Auto-reconnect** — kill a receiver mid-`capture` (switch the TV off/on); it
+  should rejoin in sync within a few seconds while the other room keeps playing.
+
 ## Next Steps
 
-1. **Step 9** — hardening (adaptive resample, retransmit tuning, DSCP EF)
-2. Linux capture (PipeWire) + ptp-helper for privileged ports
-3. Per-receiver latency offset (`--offset pool=+80ms`) for downstream amp/DSP delay
-4. HomePod hardware test when available; realtime-ALAC multi-room (buffered-only today)
+1. #13 auto-latency on underrun (raise buffered latency when audio cuts out)
+2. **Step 9** — hardening (DSCP EF, thread priority, retransmit tuning)
+3. Linux capture (PipeWire) + ptp-helper for privileged ports
+4. #15 metadata to receiver (artist/track/cover) — deferred
+5. HomePod hardware test when available; realtime-ALAC multi-room (buffered-only today)
 
 ---
 
