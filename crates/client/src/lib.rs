@@ -299,6 +299,23 @@ const MAX_RECONNECT_ATTEMPTS: u32 = 3;
 /// a truly gone one isn't hammered.
 const RECONNECT_BACKOFF: Duration = Duration::from_secs(2);
 
+/// Auto-latency: if the newest queued frame's play-deadline stays within this
+/// of "now" across a whole evaluation window, the buffer is dangerously
+/// shallow (the network/receiver can't keep up) and the latency is stepped up.
+/// For a live capture the receiver's jitter buffer is ≈ the anchor latency, so
+/// a deeper anchor = more headroom.
+const UNDERRUN_LEAD_FLOOR: Duration = Duration::from_millis(120);
+/// How much to raise the anchor latency each time underrun risk is detected.
+const AUTO_LATENCY_STEP_MS: u64 = 250;
+/// Ceiling for auto-raised latency (a bump-only heuristic never lowers it).
+const AUTO_LATENCY_MAX_MS: u64 = 2000;
+/// Evaluation window: the minimum lead seen over this span is what's compared
+/// against the floor, so a single transient dip can't ratchet latency up.
+const AUTO_LATENCY_WINDOW: Duration = Duration::from_millis(1000);
+/// Wait this long after a bump before considering another, so the deeper
+/// buffer has time to fill and stabilise before we judge it again.
+const AUTO_LATENCY_COOLDOWN: Duration = Duration::from_secs(5);
+
 /// Stream audio pulled from `source` to `addr` using AirPlay 2's BUFFERED
 /// pipeline (stream type 103, AAC-LC): pair → SETUP(timing=PTP) →
 /// SETUP(stream type=103) → TCP connect to dataPort → RECORD →
@@ -627,6 +644,14 @@ fn anchor_receiver(
     r.session.set_rate_anchor(tl.gm_id, rtptime, secs, frac, 1)
 }
 
+/// Our-clock instant (ns) at which stream position `rtptime` is scheduled to
+/// play, per the current group anchor line `(anchor_rtptime → anchor_t_local)`.
+/// Used by auto-latency to measure how much buffer headroom is left.
+fn play_deadline_ns(anchor_t_local: u64, anchor_rtptime: u32, rtptime: u32) -> u64 {
+    let dframes = u64::from(rtptime.wrapping_sub(anchor_rtptime));
+    anchor_t_local + dframes * 1_000_000_000 / SAMPLE_RATE as u64
+}
+
 /// Send the periodic `/feedback` keepalive to every live receiver every ~2 s
 /// (also keeps a paused stream's session from timing out).
 fn service_feedback(group: &mut [BufferedReceiver], last: &mut Instant) {
@@ -741,12 +766,14 @@ pub fn stream_audio_buffered_multi(
         return Err("no receiver reached RECORD".into());
     }
 
-    // --- Anchors: ONE shared physical instant (rtpTime=0 plays latency_ms
+    // --- Anchors: ONE shared physical instant (rtpTime=0 plays latency
     // from now), expressed per receiver on the timeline that receiver
     // actually follows plus its user offset. Same instant on every clock =
     // synchronized rooms, without relying on receivers seeing each other's
-    // clocks.
-    let t_local = ptp_now_ns() + latency_ms * 1_000_000;
+    // clocks. `current_latency` starts at the requested value and may be
+    // auto-raised later if underruns are detected.
+    let mut current_latency = latency_ms;
+    let t_local = ptp_now_ns() + current_latency * 1_000_000;
     for r in &mut group {
         if let Err(e) = anchor_receiver(&ptp, r, t_local, first_rtptime) {
             warn!(receiver = %r.name, "anchor failed — dropping: {e}");
@@ -783,6 +810,12 @@ pub fn stream_audio_buffered_multi(
     let mut anchor_t_local = t_local;
     let mut anchor_rtptime = first_rtptime;
     let mut handles: Vec<ReconnectHandle> = Vec::new();
+
+    // Auto-latency: track the minimum play-deadline lead over each window; if
+    // it stays under the floor, step the latency up (bump-only, capped).
+    let mut min_lead_ns: i64 = i64::MAX;
+    let mut window_start = Instant::now();
+    let mut last_bump = Instant::now();
 
     info!(receivers = group.len(), live, "streaming buffered AAC audio");
 
@@ -853,7 +886,7 @@ pub fn stream_audio_buffered_multi(
                 if paused {
                     // Audio's back: re-anchor at a fresh instant and resume.
                     info!("audio resumed — re-anchoring");
-                    let t_local = ptp_now_ns() + latency_ms * 1_000_000;
+                    let t_local = ptp_now_ns() + current_latency * 1_000_000;
                     for r in &mut group {
                         if r.alive {
                             if let Err(e) = anchor_receiver(&ptp, r, t_local, rtptime) {
@@ -918,6 +951,47 @@ pub fn stream_audio_buffered_multi(
             }
             // Receivers that just dropped go to background reconnect.
             reap_dead(&mut group, &mut handles, reconnect);
+
+            // Auto-latency: how much headroom does the just-queued frame have
+            // before its play deadline? Track the window minimum.
+            let lead = play_deadline_ns(anchor_t_local, anchor_rtptime, rtptime) as i64
+                - ptp_now_ns() as i64;
+            min_lead_ns = min_lead_ns.min(lead);
+
+            if window_start.elapsed() >= AUTO_LATENCY_WINDOW {
+                if min_lead_ns < UNDERRUN_LEAD_FLOOR.as_nanos() as i64
+                    && current_latency < AUTO_LATENCY_MAX_MS
+                    && last_bump.elapsed() >= AUTO_LATENCY_COOLDOWN
+                {
+                    let old = current_latency;
+                    current_latency =
+                        (current_latency + AUTO_LATENCY_STEP_MS).min(AUTO_LATENCY_MAX_MS);
+                    warn!(
+                        from_ms = old,
+                        to_ms = current_latency,
+                        min_lead_ms = min_lead_ns / 1_000_000,
+                        "underrun risk — raising latency"
+                    );
+                    // Re-anchor the group deeper: current head plays
+                    // `current_latency` from now, giving the receiver buffer
+                    // room to refill.
+                    let t_local = ptp_now_ns() + current_latency * 1_000_000;
+                    for r in &mut group {
+                        if r.alive {
+                            if let Err(e) = anchor_receiver(&ptp, r, t_local, rtptime) {
+                                warn!(receiver = %r.name, "auto-latency anchor failed — dropping: {e}");
+                                r.alive = false;
+                            }
+                        }
+                    }
+                    reap_dead(&mut group, &mut handles, reconnect);
+                    anchor_t_local = t_local;
+                    anchor_rtptime = rtptime;
+                    last_bump = Instant::now();
+                }
+                min_lead_ns = i64::MAX;
+                window_start = Instant::now();
+            }
         }
 
         seq = seq.wrapping_add(1);
@@ -933,7 +1007,7 @@ pub fn stream_audio_buffered_multi(
     // unplayed tail (for a short source: ALL of it, silently). If we ended
     // while paused there is nothing buffered, so this naturally waits ~0.
     let played = Duration::from_secs_f64(frames_sent as f64 / SAMPLE_RATE as f64)
-        + Duration::from_millis(latency_ms + 250);
+        + Duration::from_millis(current_latency + 250);
     let elapsed = pace_origin.elapsed();
     if played > elapsed {
         let wait = played - elapsed;

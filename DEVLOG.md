@@ -44,9 +44,26 @@ New helpers in client: `prepare_receiver` / `spawn_reconnect` /
 `finish_reconnect` / `reap_dead` / `spawn_writer`; `stream_audio_buffered_multi`
 now takes `&[GroupTarget]`.
 
+### Auto-latency on underrun (#13)
+Buffered latency now auto-raises when the stream starts cutting out. Key
+insight: for a LIVE capture the receiver's jitter buffer is ≈ the anchor
+latency (we can't send audio before we've captured it), so a deeper anchor =
+more headroom. Sender-side signal = the *lead*: `play_deadline(rtptime) − now`
+for the newest queued frame (`play_deadline_ns` walks the current anchor line).
+Healthy live stream ⇒ lead ≈ latency (well above floor); TCP backpressure /
+network can't keep up ⇒ rtptime stalls while now advances ⇒ lead collapses.
+When the *window-minimum* lead stays under `UNDERRUN_LEAD_FLOOR` (120 ms) for a
+1 s window, step latency +250 ms (cap 2 s, bump-only) and re-anchor the whole
+group deeper — same anchor-line machinery as resume/reconnect, so multi-room
+sync is preserved. 5 s cooldown + window-min gate stop a transient blip from
+ratcheting latency up. `--latency` is now the *starting* value.
+*Note:* re-anchoring deeper causes a one-time ~step gap as the buffer refills —
+expected cost of stabilising. Lowering-when-stable is deliberately not done
+(oscillation risk); revisit if wanted.
+
 ### Still queued
-#13 auto-latency on underrun, #14 Step 9 hardening (DSCP EF / thread priority),
-#15 metadata to receiver (deferred).
+#14 Step 9 hardening (DSCP EF / thread priority), #15 metadata to receiver
+(deferred).
 
 ---
 

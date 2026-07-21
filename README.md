@@ -71,7 +71,7 @@ automatically uses the buffered pipeline.
 | Flag | Applies to | Default | What it does |
 |------|-----------|---------|--------------|
 | `--buffered` | capture / play / tone | off | Use the buffered AAC-LC pipeline (lower, sender-chosen latency) instead of realtime ALAC (~2 s fixed). Auto-enabled when you name more than one receiver. |
-| `--latency <ms>` | buffered only | `500` | End-to-end buffered latency (the anchor lead). Lower = tighter sync but more prone to underruns; below ~300 ms is risky. Ignored without `--buffered`. |
+| `--latency <ms>` | buffered only | `500` | **Starting** end-to-end buffered latency (the anchor lead). Lower = tighter sync but more prone to underruns; below ~300 ms is risky. If the stream starts cutting out, OpenAir automatically raises the latency in 250 ms steps (up to 2 s) until it's stable. Ignored without `--buffered`. |
 | `--volume <dBFS>` | capture / play / tone | `-8` | Playback volume in dBFS: `0` = full scale, negative = quieter (e.g. `-14`), very low mutes. |
 | `--offset <name=ms>` | buffered / multi-room | `0` | Per-receiver play delay in milliseconds (`+` later, `-` earlier), e.g. `--offset "pool=+80ms"`. Repeatable; the `name` matches the receiver argument case-insensitively. Compensates downstream amp/DSP delay so rooms line up audibly. |
 

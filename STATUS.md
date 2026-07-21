@@ -67,11 +67,12 @@
 - **Per-receiver `--offset "name=ms"`** — verify a room shifts by the given ms.
 - **Auto-reconnect** — kill a receiver mid-`capture` (switch the TV off/on); it
   should rejoin in sync within a few seconds while the other room keeps playing.
+- **Auto-latency** — force underruns (start with `--latency 200` on Wi-Fi);
+  expect "underrun risk — raising latency" logs stepping 200→…, then stability.
 
 ## Next Steps
 
-1. #13 auto-latency on underrun (raise buffered latency when audio cuts out)
-2. **Step 9** — hardening (DSCP EF, thread priority, retransmit tuning)
+1. **Step 9** — hardening (DSCP EF, thread priority, retransmit tuning)
 3. Linux capture (PipeWire) + ptp-helper for privileged ports
 4. #15 metadata to receiver (artist/track/cover) — deferred
 5. HomePod hardware test when available; realtime-ALAC multi-room (buffered-only today)
