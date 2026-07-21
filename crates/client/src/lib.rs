@@ -290,6 +290,15 @@ const SILENCE_PEAK: u16 = 64;
 /// paused (`rate=0`). Auto-resumes (re-anchor) the instant audio returns.
 const PAUSE_AFTER_SILENCE: Duration = Duration::from_millis(1500);
 
+/// How many times a dropped receiver is re-established (re-pair → SETUP →
+/// RECORD → re-anchor) before it is given up on. Only live (capture)
+/// streams reconnect — a finite tone/file just loses the receiver.
+const MAX_RECONNECT_ATTEMPTS: u32 = 3;
+/// Base backoff between reconnect attempts; attempt N waits N × this so a
+/// receiver that's briefly off (TV asleep, Wi-Fi blip) is retried soon while
+/// a truly gone one isn't hammered.
+const RECONNECT_BACKOFF: Duration = Duration::from_secs(2);
+
 /// Stream audio pulled from `source` to `addr` using AirPlay 2's BUFFERED
 /// pipeline (stream type 103, AAC-LC): pair → SETUP(timing=PTP) →
 /// SETUP(stream type=103) → TCP connect to dataPort → RECORD →
@@ -353,6 +362,9 @@ pub struct GroupTarget {
 /// One receiver's live state inside a (possibly multi-room) buffered stream.
 struct BufferedReceiver {
     name: String,
+    /// Where to reconnect if this receiver drops (live streams only).
+    addr: SocketAddr,
+    device_id: String,
     session: StreamSession,
     cipher: AudioCipher,
     /// Per-receiver anchor offset in ns (from `GroupTarget::offset_ms`).
@@ -365,6 +377,179 @@ struct BufferedReceiver {
     /// Keeps the (idle) control socket bound for the session lifetime.
     _control: ControlChannel,
     alive: bool,
+}
+
+/// A receiver re-established on a background thread after it dropped: paired,
+/// SETUP, event channel + SETPEERS done, and the TCP data connection open —
+/// but NOT yet RECORD'd or anchored (the main loop does those with the live
+/// anchor baseline so the rejoining receiver lands in sync with the group).
+struct PreparedReceiver {
+    name: String,
+    addr: SocketAddr,
+    device_id: String,
+    offset_ns: i64,
+    session: StreamSession,
+    cipher: AudioCipher,
+    control: ControlChannel,
+    event: Option<TcpStream>,
+    data_stream: TcpStream,
+}
+
+/// An in-flight reconnect: the background thread sends `Ok(prepared)` on the
+/// first successful attempt or `Err(())` once it gives up.
+struct ReconnectHandle {
+    name: String,
+    rx: std::sync::mpsc::Receiver<Result<PreparedReceiver, ()>>,
+}
+
+/// Do the slow part of establishing a receiver (pair → SETUP → event →
+/// SETPEERS → TCP connect to dataPort). Shared by fresh setup and reconnect.
+/// Returns everything the caller needs to RECORD + anchor + start the writer.
+fn prepare_receiver(
+    target_addr: SocketAddr,
+    device_id: &str,
+    offset_ns: i64,
+) -> Result<PreparedReceiver, Box<dyn std::error::Error>> {
+    let name = format!("{target_addr}");
+    let control = ControlChannel::bind()?;
+    let mut session = connect_session(target_addr, device_id)?;
+    let peer_ip = session.peer_ip();
+    session.setup_timing(TimingConfig::Ptp)?;
+    session.setup_stream(StreamFormat::AacBuffered, control.port)?;
+    let event = open_event_channel(peer_ip, session.ports.event_port);
+    if let Err(e) = session.set_peers() {
+        warn!("SETPEERS failed (continuing): {e}");
+    }
+    let data_stream = TcpStream::connect(SocketAddr::new(peer_ip, session.ports.data_port))?;
+    data_stream.set_nodelay(true).ok();
+    let cipher = AudioCipher::new(&session.shk);
+    Ok(PreparedReceiver {
+        name,
+        addr: target_addr,
+        device_id: device_id.to_string(),
+        offset_ns,
+        session,
+        cipher,
+        control,
+        event,
+        data_stream,
+    })
+}
+
+/// Spawn a background thread that retries [`prepare_receiver`] up to
+/// [`MAX_RECONNECT_ATTEMPTS`] times with increasing backoff, reporting the
+/// first success (or final failure) back to the main loop. Runs off the audio
+/// thread so healthy receivers keep playing uninterrupted during the
+/// seconds-long re-pair/SETUP.
+fn spawn_reconnect(addr: SocketAddr, device_id: String, offset_ns: i64) -> ReconnectHandle {
+    let name = format!("{addr}");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let thread_name = name.clone();
+    std::thread::spawn(move || {
+        for attempt in 1..=MAX_RECONNECT_ATTEMPTS {
+            std::thread::sleep(RECONNECT_BACKOFF * attempt);
+            info!(receiver = %thread_name, attempt, "reconnect attempt");
+            match prepare_receiver(addr, &device_id, offset_ns) {
+                Ok(prep) => {
+                    let _ = tx.send(Ok(prep));
+                    return;
+                }
+                Err(e) => warn!(receiver = %thread_name, attempt, "reconnect failed: {e}"),
+            }
+        }
+        warn!(receiver = %thread_name, "giving up reconnecting");
+        let _ = tx.send(Err(()));
+    });
+    ReconnectHandle { name, rx }
+}
+
+/// Spawn the per-receiver TCP writer thread: it drains its bounded queue and
+/// writes each encrypted block to `stream`, exiting (which the main loop sees
+/// as a drop) on the first write error.
+fn spawn_writer(
+    mut stream: TcpStream,
+    name: String,
+) -> (std::sync::mpsc::SyncSender<Vec<u8>>, std::thread::JoinHandle<()>) {
+    // ~256 blocks ≈ 6 s of audio: enough to absorb TCP hiccups, small enough
+    // to bound memory and detect a truly dead peer.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(256);
+    let handle = std::thread::spawn(move || {
+        for block in rx {
+            if let Err(e) = stream.write_all(&block) {
+                warn!(receiver = %name, "data write failed: {e}");
+                break; // dropping rx signals the main loop
+            }
+        }
+    });
+    (tx, handle)
+}
+
+/// Turn a background-prepared receiver into a live group member: RECORD at the
+/// current stream head, anchor it onto the group's current anchor line (so it
+/// lands in sync with whoever's still playing), match volume/pause state, and
+/// start its writer. Returns `None` if RECORD or the anchor fails.
+#[allow(clippy::too_many_arguments)]
+fn finish_reconnect(
+    ptp: &PtpMaster,
+    prep: PreparedReceiver,
+    seq: u32,
+    rtptime: u32,
+    anchor_t_local: u64,
+    anchor_rtptime: u32,
+    volume_db: Option<f32>,
+    paused: bool,
+) -> Option<BufferedReceiver> {
+    let mut br = BufferedReceiver {
+        name: prep.name,
+        addr: prep.addr,
+        device_id: prep.device_id,
+        session: prep.session,
+        cipher: prep.cipher,
+        offset_ns: prep.offset_ns,
+        tx: None,
+        writer: None,
+        _event: prep.event,
+        _control: prep.control,
+        alive: true,
+    };
+    if let Err(e) = br.session.record(seq as u16, rtptime) {
+        warn!(receiver = %br.name, "rejoin RECORD failed: {e}");
+        return None;
+    }
+    if let Err(e) = anchor_receiver(ptp, &mut br, anchor_t_local, anchor_rtptime) {
+        warn!(receiver = %br.name, "rejoin anchor failed: {e}");
+        return None;
+    }
+    if let Some(db) = volume_db {
+        br.session.set_volume(db).ok();
+    }
+    if paused {
+        // Group is mid-pause; keep the newcomer quiet until the group resumes.
+        br.session.set_rate(0).ok();
+    }
+    let (tx, handle) = spawn_writer(prep.data_stream, br.name.clone());
+    br.tx = Some(tx);
+    br.writer = Some(handle);
+    info!(receiver = %br.name, "rejoined group");
+    Some(br)
+}
+
+/// Remove dropped receivers from `group`; for live streams schedule a
+/// background reconnect for each so a receiver that briefly disappears (TV
+/// asleep, Wi-Fi blip) rejoins automatically.
+fn reap_dead(group: &mut Vec<BufferedReceiver>, handles: &mut Vec<ReconnectHandle>, reconnect: bool) {
+    let mut i = 0;
+    while i < group.len() {
+        if group[i].alive {
+            i += 1;
+            continue;
+        }
+        let dead = group.remove(i);
+        if reconnect {
+            info!(receiver = %dead.name, "receiver dropped — scheduling reconnect");
+            handles.push(spawn_reconnect(dead.addr, dead.device_id.clone(), dead.offset_ns));
+        }
+    }
 }
 
 impl BufferedReceiver {
@@ -504,6 +689,8 @@ pub fn stream_audio_buffered_multi(
             let cipher = AudioCipher::new(&session.shk);
             Ok(BufferedReceiver {
                 name: name.clone(),
+                addr: target.addr,
+                device_id: target.device_id.clone(),
                 session,
                 cipher,
                 offset_ns: target.offset_ms * 1_000_000,
@@ -539,20 +726,8 @@ pub fn stream_audio_buffered_multi(
                 TcpStream::connect(SocketAddr::new(peer_ip, r.session.ports.data_port))?;
             data_stream.set_nodelay(true).ok();
             r.session.record(seq as u16, first_rtptime)?;
-
-            // ~256 blocks ≈ 6 s of audio: enough to absorb TCP hiccups,
-            // small enough to bound memory and detect a truly dead peer.
-            let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(256);
-            let mut stream = data_stream;
-            let name = r.name.clone();
-            r.writer = Some(std::thread::spawn(move || {
-                for block in rx {
-                    if let Err(e) = stream.write_all(&block) {
-                        warn!(receiver = %name, "data write failed: {e}");
-                        break; // dropping rx signals the main loop
-                    }
-                }
-            }));
+            let (tx, handle) = spawn_writer(data_stream, r.name.clone());
+            r.writer = Some(handle);
             r.tx = Some(tx);
             Ok(())
         })();
@@ -590,12 +765,24 @@ pub fn stream_audio_buffered_multi(
 
     // --- Encode once + fan out (send-ahead pacing, with pause/resume) ---
     let live = source.is_live();
+    // Only live (capture) streams reconnect: a dropped receiver mid-song is
+    // worth chasing; a finite tone/file just loses it.
+    let reconnect = live;
     let mut encoder = AacEncoder::new()?;
     // `pace_origin`/`frames_sent` are the wall-clock pacing baseline; both
     // reset on every resume so post-pause playback re-paces cleanly.
     let mut pace_origin = Instant::now();
     let mut frames_sent: i64 = 0;
     let mut last_feedback = Instant::now();
+
+    // Current group anchor LINE: stream position `anchor_rtptime` is heard at
+    // our-clock instant `anchor_t_local`. A receiver rejoining after a drop
+    // anchors onto this same line so it lands in sync; the line is refreshed
+    // on every resume. Because rtptime keeps advancing with wall clock (below),
+    // this line stays valid even while the whole group is briefly empty.
+    let mut anchor_t_local = t_local;
+    let mut anchor_rtptime = first_rtptime;
+    let mut handles: Vec<ReconnectHandle> = Vec::new();
 
     info!(receivers = group.len(), live, "streaming buffered AAC audio");
 
@@ -604,6 +791,36 @@ pub fn stream_audio_buffered_multi(
     let mut silent_since: Option<Instant> = None;
 
     loop {
+        // Rejoin any receivers whose background reconnect just succeeded, and
+        // drop the handles of those that gave up.
+        if !handles.is_empty() {
+            let mut still = Vec::with_capacity(handles.len());
+            for h in handles.drain(..) {
+                match h.rx.try_recv() {
+                    Ok(Ok(prep)) => {
+                        if let Some(br) = finish_reconnect(
+                            &ptp, prep, seq, rtptime, anchor_t_local, anchor_rtptime,
+                            volume_db, paused,
+                        ) {
+                            group.push(br);
+                        }
+                    }
+                    Ok(Err(())) => {} // gave up (already logged)
+                    Err(std::sync::mpsc::TryRecvError::Empty) => still.push(h),
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        warn!(receiver = %h.name, "reconnect thread vanished");
+                    }
+                }
+            }
+            handles = still;
+        }
+
+        // Nothing left to play to and nothing coming back → done.
+        if group.is_empty() && handles.is_empty() {
+            warn!("all receivers gone and no reconnects pending — stopping");
+            break;
+        }
+
         // Send-ahead pacing (only while actively playing; a paused loop is
         // throttled by the blocking fill() below).
         if !paused {
@@ -645,11 +862,10 @@ pub fn stream_audio_buffered_multi(
                             }
                         }
                     }
-                    group.retain(|r| r.alive);
-                    if group.is_empty() {
-                        warn!("all receivers dropped on resume — stopping");
-                        break;
-                    }
+                    reap_dead(&mut group, &mut handles, reconnect);
+                    // Refresh the group anchor line so reconnects land on it.
+                    anchor_t_local = t_local;
+                    anchor_rtptime = rtptime;
                     paused = false;
                     pace_origin = Instant::now();
                     frames_sent = 0;
@@ -677,28 +893,31 @@ pub fn stream_audio_buffered_multi(
             continue;
         }
 
-        let aac_frame = encoder.encode(&samples)?;
-        if aac_frame.is_empty() {
-            // Encoder still priming: no output yet, don't advance rtptime.
-            continue;
-        }
-
-        for r in &mut group {
-            if !r.alive {
+        // Encode + fan out only when we have receivers. While the group is
+        // momentarily empty (all dropped, reconnects in flight) we skip the
+        // encode but still advance the stream position below, so the anchor
+        // line stays valid and a rejoining receiver lands in sync.
+        if !group.is_empty() {
+            let aac_frame = encoder.encode(&samples)?;
+            if aac_frame.is_empty() {
+                // Encoder still priming: no output yet, don't advance rtptime.
                 continue;
             }
-            let block = build_buffered_audio_block(
-                &mut r.cipher,
-                seq,
-                rtptime,
-                AAC_44100_F24_2_SSRC,
-                &aac_frame,
-            );
-            r.queue(block);
-        }
-        if !group.iter().any(|r| r.alive) {
-            warn!("all receivers dropped — stopping stream");
-            break;
+            for r in &mut group {
+                if !r.alive {
+                    continue;
+                }
+                let block = build_buffered_audio_block(
+                    &mut r.cipher,
+                    seq,
+                    rtptime,
+                    AAC_44100_F24_2_SSRC,
+                    &aac_frame,
+                );
+                r.queue(block);
+            }
+            // Receivers that just dropped go to background reconnect.
+            reap_dead(&mut group, &mut handles, reconnect);
         }
 
         seq = seq.wrapping_add(1);
