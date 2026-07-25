@@ -363,6 +363,7 @@ pub fn stream_audio_buffered_with_latency(
         source,
         volume_db,
         latency_ms,
+        None,
     )
 }
 
@@ -652,6 +653,18 @@ fn play_deadline_ns(anchor_t_local: u64, anchor_rtptime: u32, rtptime: u32) -> u
     anchor_t_local + dframes * 1_000_000_000 / SAMPLE_RATE as u64
 }
 
+/// Drain all pending mirrored-volume updates (`--handoff`), returning the most
+/// recent dBFS value (last-wins) or `None` if the channel was empty. Coalescing
+/// to the newest avoids a backlog of stale `set_volume` calls if the user
+/// sweeps the slider faster than the loop iterates.
+fn drain_latest_volume(rx: &std::sync::mpsc::Receiver<f32>) -> Option<f32> {
+    let mut latest = None;
+    while let Ok(db) = rx.try_recv() {
+        latest = Some(db);
+    }
+    latest
+}
+
 /// Send the periodic `/feedback` keepalive to every live receiver every ~2 s
 /// (also keeps a paused stream's session from timing out).
 fn service_feedback(group: &mut [BufferedReceiver], last: &mut Instant) {
@@ -682,11 +695,16 @@ fn service_feedback(group: &mut [BufferedReceiver], last: &mut Instant) {
 /// For live sources ([`AudioSource::is_live`]) a sustained silence pauses the
 /// AirPlay stream (`rate=0`) and audio's return re-anchors and resumes it, so
 /// pausing the music on the PC cleanly pauses/resumes every room.
+///
+/// If `volume_rx` is `Some` (the `--handoff` feature), mirrored-volume updates
+/// (dBFS) drained from it each loop iteration are applied to every receiver,
+/// overriding the initial `volume_db` seed from the first update onward.
 pub fn stream_audio_buffered_multi(
     targets: &[GroupTarget],
     source: &mut dyn AudioSource,
     volume_db: Option<f32>,
     latency_ms: u64,
+    volume_rx: Option<std::sync::mpsc::Receiver<f32>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if targets.is_empty() {
         return Err("no receivers given".into());
@@ -811,6 +829,10 @@ pub fn stream_audio_buffered_multi(
     let mut anchor_rtptime = first_rtptime;
     let mut handles: Vec<ReconnectHandle> = Vec::new();
 
+    // Live volume, seeded by `volume_db` and overridden by `--handoff` mirror
+    // updates. Tracked so rejoining receivers match the group's current level.
+    let mut current_volume_db = volume_db;
+
     // Auto-latency: track the minimum play-deadline lead over each window; if
     // it stays under the floor, step the latency up (bump-only, capped).
     let mut min_lead_ns: i64 = i64::MAX;
@@ -833,7 +855,7 @@ pub fn stream_audio_buffered_multi(
                     Ok(Ok(prep)) => {
                         if let Some(br) = finish_reconnect(
                             &ptp, prep, seq, rtptime, anchor_t_local, anchor_rtptime,
-                            volume_db, paused,
+                            current_volume_db, paused,
                         ) {
                             group.push(br);
                         }
@@ -852,6 +874,23 @@ pub fn stream_audio_buffered_multi(
         if group.is_empty() && handles.is_empty() {
             warn!("all receivers gone and no reconnects pending — stopping");
             break;
+        }
+
+        // Mirror Windows volume (--handoff): apply the latest update, if any, to
+        // every live receiver. Done at the loop top so it still runs on the
+        // paused/priming `continue` paths (a volume change while paused takes
+        // effect on resume).
+        if let Some(rx) = &volume_rx {
+            if let Some(db) = drain_latest_volume(rx) {
+                current_volume_db = Some(db);
+                for r in group.iter_mut() {
+                    if r.alive {
+                        if let Err(e) = r.session.set_volume(db) {
+                            warn!(receiver = %r.name, "handoff set_volume failed: {e}");
+                        }
+                    }
+                }
+            }
         }
 
         // Send-ahead pacing (only while actively playing; a paused loop is
@@ -1041,4 +1080,34 @@ fn rand_seq() -> u16 {
         .unwrap_or_default()
         .subsec_nanos()
         & 0xFFFF) as u16
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drain_latest_volume_coalesces_to_newest() {
+        let (tx, rx) = std::sync::mpsc::channel::<f32>();
+        tx.send(-20.0).unwrap();
+        tx.send(-12.0).unwrap();
+        tx.send(-6.0).unwrap();
+        assert_eq!(drain_latest_volume(&rx), Some(-6.0));
+    }
+
+    #[test]
+    fn drain_latest_volume_empty_is_none() {
+        let (_tx, rx) = std::sync::mpsc::channel::<f32>();
+        assert_eq!(drain_latest_volume(&rx), None);
+    }
+
+    #[test]
+    fn drain_latest_volume_disconnected_returns_buffered_then_none() {
+        let (tx, rx) = std::sync::mpsc::channel::<f32>();
+        tx.send(-8.0).unwrap();
+        drop(tx);
+        // Buffered value is still delivered before the channel reads empty.
+        assert_eq!(drain_latest_volume(&rx), Some(-8.0));
+        assert_eq!(drain_latest_volume(&rx), None);
+    }
 }
