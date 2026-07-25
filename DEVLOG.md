@@ -4,6 +4,52 @@
 
 ---
 
+## 2026-07-26 — Session 11: `--handoff` — mute local speakers + mirror Windows volume
+
+Task #16. **Phase 0 hardware-verified** (loopback keeps delivering full-scale
+audio while the render endpoint is muted — the load-bearing assumption). Phases
+1–3 code complete, clippy-clean, tests pass (capture +6, client +3). End-to-end
+capture run still pending a final hardware pass.
+
+### What it does
+`openair capture <recv>… --handoff` (Windows only): mutes the default render
+endpoint so audio comes out of AirPlay only (no double audio), and mirrors the
+Windows master volume onto AirPlay — the slider, volume keys, and the mute key
+all drive the AirPlay volume. `--volume` seeds the initial level; the first
+Windows change hands control over. Restores the original volume/mute on Ctrl+C.
+
+### Approach A (polling) — design doc under `docs/superpowers/specs/`
+New `#[cfg(windows)] crates/capture/src/handoff.rs`: a `VolumeBridge` that, on a
+dedicated COM thread, mutes the endpoint (`IAudioEndpointVolume::SetMute`) and
+polls master volume/mute every 50 ms. All the testable logic is pure:
+`scalar_to_dbfs` (Windows 0–1 scalar → dBFS, clamped `[-30,0]`, 0 → −144) and a
+`classify` state machine. Key insight: because we *hold* the endpoint muted, the
+only mute-flag transition a user can produce is `true→false` (they tapped
+mute/unmute), so a mute keypress with unchanged scalar reads as an AirPlay-mute
+toggle; a volume-key press changes the scalar and auto-clears our mute, so we
+re-assert it. Events flow out as `VolumeEvent::Level(dBFS)`.
+*Future path B* (documented, not built): event-driven
+`IAudioEndpointVolumeCallback` to kill the ~50 ms re-mute blip — the
+`start → Receiver → Drop` surface is designed so that swap stays internal.
+
+### Client + CLI plumbing
+`stream_audio_buffered_multi` gained `volume_rx: Option<Receiver<f32>>`; the loop
+drains the latest dBFS each iteration (coalesced, last-wins via
+`drain_latest_volume`) and applies `set_volume` to every live receiver, tracking
+`current_volume_db` so reconnecting receivers rejoin at the right level. The
+channel is plain `f32` (not the `#[cfg(windows)]` `VolumeEvent`) so the client
+signature stays platform-independent; the CLI adapts `VolumeEvent → f32`.
+`--handoff` implies `--buffered` (only the buffered pipeline applies live volume);
+it's rejected early on non-Windows or with non-`capture` subcommands, and
+degrades off (warns, streams normally) if Core Audio can't be reached.
+
+### Incidental
+A clippy version bump started flagging a tautological `i16` range check in a
+`source.rs` test helper (`absurd_extreme_comparisons`); suppressed with a local
+`#[allow]` + comment (separate commit, not part of the feature).
+
+---
+
 ## 2026-07-21 — Session 10: robustness — pause/resume, per-receiver offset, auto-reconnect
 
 Three features (tasks #10–#12). **Code complete, clippy-clean, 71 tests pass —

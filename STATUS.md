@@ -35,7 +35,7 @@
 | `capture` | ✅ Done (Win) | Yes | WASAPI loopback verified with live Spotify; PipeWire/CoreAudio later |
 | `ptp-helper` | ⬜ Stub | — | Privileged binary, IPC to main (Linux ports 319/320; not needed on Windows) |
 | `client` | ✅ Done (v1) | Yes | realtime + buffered pipelines, pairing store + auto-dispatch (pair-verify vs transient), event channel |
-| `apps/cli` | ✅ Done (v1) | Yes | scan, `pair` (PIN), tone/play/capture; name resolution, --volume, --buffered, --latency <ms>, --offset <name=ms>, Ctrl+C |
+| `apps/cli` | ✅ Done (v1) | Yes | scan, `pair` (PIN), tone/play/capture; name resolution, --volume, --buffered, --latency <ms>, --offset <name=ms>, --handoff (Windows), Ctrl+C |
 | `apps/tui` | ⬜ Stub | — | |
 
 ---
@@ -59,7 +59,7 @@
 
 ---
 
-## Awaiting hardware verification (code complete, Session 10)
+## Awaiting hardware verification (code complete, Sessions 10–11)
 
 - **Pause/resume on silence** — pausing PC audio pauses AirPlay (`rate=0`) and
   auto-resumes on sound. Verify the Apple TV resumes cleanly from rate=0 →
@@ -69,6 +69,18 @@
   should rejoin in sync within a few seconds while the other room keeps playing.
 - **Auto-latency** — force underruns (start with `--latency 200` on Wi-Fi);
   expect "underrun risk — raising latency" logs stepping 200→…, then stability.
+
+### `--handoff` (Windows, Session 11 — Phase 0 already verified)
+
+- **Mute + play** — `openair capture "<room>" --handoff` → PC speakers silent,
+  AirPlay plays.
+- **Volume mirror** — drag the Windows slider / press volume keys → AirPlay
+  volume follows (~50 ms lag ok); speakers stay silent.
+- **Mute key** — press Windows mute → AirPlay goes silent; press again →
+  returns; speakers stay silent throughout.
+- **Restore** — Ctrl+C restores the original Windows volume + mute.
+- **Multi-room** — `--handoff` with two rooms: both track the volume; a
+  reconnecting room comes back at the current level.
 
 ## Next Steps
 

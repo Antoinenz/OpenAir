@@ -19,6 +19,9 @@ openair pair "Living Room"
 # Stream live system audio (WASAPI loopback) until Ctrl+C, ~sub-second latency
 openair capture "Living Room" --buffered --latency 300
 
+# Windows only: mute the PC speakers and let the Windows volume control AirPlay
+openair capture "Living Room" --handoff
+
 # Play a WAV file (any sample rate/bit depth — resampled automatically)
 openair play "Pool Room" song.wav --buffered
 
@@ -74,11 +77,15 @@ automatically uses the buffered pipeline.
 | `--latency <ms>` | buffered only | `500` | **Starting** end-to-end buffered latency (the anchor lead). Lower = tighter sync but more prone to underruns; below ~300 ms is risky. If the stream starts cutting out, OpenAir automatically raises the latency in 250 ms steps (up to 2 s) until it's stable. Ignored without `--buffered`. |
 | `--volume <dBFS>` | capture / play / tone | `-8` | Playback volume in dBFS: `0` = full scale, negative = quieter (e.g. `-14`), very low mutes. |
 | `--offset <name=ms>` | buffered / multi-room | `0` | Per-receiver play delay in milliseconds (`+` later, `-` earlier), e.g. `--offset "pool=+80ms"`. Repeatable; the `name` matches the receiver argument case-insensitively. Compensates downstream amp/DSP delay so rooms line up audibly. |
+| `--handoff` | capture only (**Windows**) | off | Silences the local speakers while streaming (so audio only comes out of AirPlay) and **mirrors the Windows master volume** — slider, volume keys and the mute key all control the AirPlay volume instead. `--volume` sets the initial level until you first touch the Windows volume, after which Windows controls it. Implies `--buffered`. |
 
 Notes:
 - Flags can appear anywhere in the command line.
 - `--latency` and `--offset` only affect the buffered pipeline; the realtime
   (default single-receiver) pipeline has a protocol-fixed ~2 s latency.
+- `--handoff` restores your original Windows volume/mute when the stream stops
+  (Ctrl+C). If Core Audio can't be reached it warns and streams normally
+  without muting.
 - HomeKit credentials are stored at `%APPDATA%\OpenAir\pairings.json`.
 
 ## Not yet
