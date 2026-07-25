@@ -12,6 +12,10 @@ use cpal::{SampleFormat, StreamConfig};
 use thiserror::Error;
 use tracing::warn;
 
+/// `--handoff` (Windows only): mute local speakers + mirror Windows volume.
+#[cfg(windows)]
+pub mod handoff;
+
 #[derive(Debug, Error)]
 pub enum CaptureError {
     #[error("no default output device available")]

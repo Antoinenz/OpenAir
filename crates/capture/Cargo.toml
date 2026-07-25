@@ -11,3 +11,13 @@ cpal.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# Core Audio (WASAPI endpoint volume) for the --handoff feature. 0.54 is
+# already in the lockfile via cpal, so this adds no new major version.
+windows = { version = "0.54", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+] }
