@@ -346,6 +346,39 @@ fn resolve_receivers(
     Some(out)
 }
 
+/// Start the `--handoff` volume bridge (Windows): mute the local speakers and
+/// return a guard (keep it alive for the stream's lifetime — dropping it
+/// restores the original volume/mute) plus a receiver of mirrored dBFS updates
+/// to forward to the AirPlay receivers. Returns `None` if the bridge could not
+/// start, so the caller streams normally (degrade off).
+#[cfg(windows)]
+fn start_handoff() -> Option<(
+    openair_capture::handoff::VolumeBridge,
+    std::sync::mpsc::Receiver<f32>,
+)> {
+    match openair_capture::handoff::VolumeBridge::start() {
+        Ok((bridge, event_rx)) => {
+            // Adapt the capture crate's VolumeEvent → plain f32 (dBFS) so the
+            // client's stream signature stays platform-independent.
+            let (fwd_tx, fwd_rx) = std::sync::mpsc::channel::<f32>();
+            std::thread::spawn(move || {
+                for ev in event_rx {
+                    let openair_capture::handoff::VolumeEvent::Level(db) = ev;
+                    if fwd_tx.send(db).is_err() {
+                        break; // stream ended
+                    }
+                }
+            });
+            println!("  🔇 local speakers muted — Windows volume now controls AirPlay");
+            Some((bridge, fwd_rx))
+        }
+        Err(e) => {
+            println!("  ⚠ --handoff unavailable: {e} (streaming without muting local audio)");
+            None
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -360,7 +393,24 @@ async fn main() -> Result<()> {
     let (raw_args, volume_db) = extract_volume(&raw_args, DEFAULT_VOLUME_DB);
     let (raw_args, latency_ms) = util::extract_latency(&raw_args, 500);
     let (raw_args, offsets) = util::extract_offsets(&raw_args);
+    let (raw_args, handoff) = extract_flag(&raw_args, "--handoff");
     let (args, buffered) = extract_flag(&raw_args, "--buffered");
+    // --handoff mirrors live volume, which only the buffered pipeline applies,
+    // so enabling it implies --buffered.
+    let buffered = buffered || handoff;
+
+    // --handoff (mute local speakers + mirror Windows volume) is capture-only
+    // and Windows-only. Reject early with a clear message otherwise.
+    if handoff && args.first().map(String::as_str) != Some("capture") {
+        println!("--handoff is only valid with `capture` (it mutes the local");
+        println!("speakers and mirrors the Windows volume onto AirPlay).");
+        return Ok(());
+    }
+    #[cfg(not(windows))]
+    if handoff {
+        println!("--handoff is only supported on Windows.");
+        return Ok(());
+    }
 
     // Dispatches to the realtime ALAC pipeline (fixed ~2s protocol latency)
     // or the buffered AAC pipeline (sender-chosen latency, `--latency <ms>`,
@@ -368,12 +418,13 @@ async fn main() -> Result<()> {
     // always use the buffered pipeline — that's the multi-room mode.
     let stream_fn = move |targets: &[openair_client::GroupTarget],
                           source: &mut dyn openair_client::AudioSource,
-                          volume: Option<f32>| {
+                          volume: Option<f32>,
+                          volume_rx: Option<std::sync::mpsc::Receiver<f32>>| {
         if targets.len() > 1 && !buffered {
             println!("  (multi-room uses the buffered pipeline — enabling --buffered)");
         }
         if buffered || targets.len() > 1 {
-            openair_client::stream_audio_buffered_multi(targets, source, volume, latency_ms, None)
+            openair_client::stream_audio_buffered_multi(targets, source, volume, latency_ms, volume_rx)
         } else {
             openair_client::stream_audio(targets[0].addr, &targets[0].device_id, source, volume)
         }
@@ -467,7 +518,22 @@ async fn main() -> Result<()> {
             source = source.with_blocking();
         }
 
-        match stream_fn(&receivers, &mut source, Some(volume_db)) {
+        // --handoff: mute local speakers + mirror Windows volume (Windows only).
+        // `_handoff_bridge` must outlive the stream call — dropping it restores
+        // the user's original volume/mute.
+        #[cfg(windows)]
+        let (_handoff_bridge, volume_rx) = if handoff {
+            match start_handoff() {
+                Some((bridge, rx)) => (Some(bridge), Some(rx)),
+                None => (None, None),
+            }
+        } else {
+            (None, None)
+        };
+        #[cfg(not(windows))]
+        let volume_rx: Option<std::sync::mpsc::Receiver<f32>> = None;
+
+        match stream_fn(&receivers, &mut source, Some(volume_db), volume_rx) {
             Ok(()) => println!("  ✓ capture streamed successfully"),
             Err(e) => println!("  ✗ {}", e),
         }
@@ -504,7 +570,7 @@ async fn main() -> Result<()> {
             }
         };
 
-        match stream_fn(&receivers, &mut source, Some(volume_db)) {
+        match stream_fn(&receivers, &mut source, Some(volume_db), None) {
             Ok(()) => println!("  ✓ playback finished successfully"),
             Err(e) => println!("  ✗ {}", e),
         }
@@ -536,7 +602,7 @@ async fn main() -> Result<()> {
             .join(", ");
         println!("OpenAir — streaming {}s test tone to {}\n", seconds, dest);
         let mut source = openair_client::SineSource::new(440.0, seconds);
-        match stream_fn(&receivers, &mut source, Some(volume_db)) {
+        match stream_fn(&receivers, &mut source, Some(volume_db), None) {
             Ok(()) => println!("  ✓ tone streamed successfully"),
             Err(e) => println!("  ✗ {}", e),
         }
