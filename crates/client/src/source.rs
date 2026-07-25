@@ -705,6 +705,9 @@ mod tests {
         fn is_finite_i16(&self) -> bool;
     }
     impl FiniteI16 for i16 {
+        // i16 is always within its own range; the comparison is intentionally a
+        // tautology (a readability stand-in for the float `is_finite` check).
+        #[allow(clippy::absurd_extreme_comparisons)]
         fn is_finite_i16(&self) -> bool {
             *self >= i16::MIN && *self <= i16::MAX
         }
