@@ -1,26 +1,33 @@
-//! Choosing which local network interface to talk to a receiver from.
+//! Knowing which local address we talk to a receiver from.
 //!
 //! # Why this exists
 //!
-//! On a multi-homed machine the OS picks the source address for an outgoing
-//! connection from its routing table, and that choice can be wrong. Virtual
-//! adapters (VMware, Hyper-V, VPNs, phone tethering) frequently install routes
-//! that win against the real LAN interface, so a connection to a receiver at
-//! `192.168.1.106` can go out with a source address of, say, `192.168.243.92`.
+//! On a multi-homed machine the source address of an outgoing connection
+//! decides whether the session works at all: the receiver's replies go back to
+//! it, and it's also what we advertise in `SETPEERS` for the receiver's clock
+//! daemon. Get it wrong and the receiver accepts the connection, processes
+//! `pair-setup`, then its first response write fails with "connection reset by
+//! peer" — the session dies before it starts, with nothing logged receiver-side
+//! to explain why.
 //!
-//! The SYN still reaches the receiver, so the connection *looks* like it opens
-//! — but the receiver's reply comes back to an address our socket isn't on and
-//! the stack resets it. Observed symptom: the receiver accepts the connection,
-//! processes `pair-setup`, then its first response write fails with
-//! "connection reset by peer", and the session dies before it starts.
+//! # Trust the routing table
 //!
-//! The same address is advertised in `SETPEERS` for PTP, so a bad choice also
-//! points the receiver's clock daemon at an unreachable peer.
+//! An earlier version of this module tried to *out-guess* the OS by picking the
+//! interface whose subnet contained the receiver. That was a mistake. Real
+//! machines have interfaces with overlapping masks — e.g. Wi-Fi on
+//! `192.168.243.92/16` and Ethernet on `192.168.1.108/16`, where **both** claim
+//! `192.168.0.0/16` and both "match" a receiver at `192.168.1.106`. Subnet
+//! matching can't separate them, while the routing table can (and did: Ethernet
+//! at interface metric 25 beats Wi-Fi at 35). Second-guessing it turned a
+//! working configuration into a broken one.
 //!
-//! The fix is to pick the interface whose own subnet contains the receiver and
-//! bind to it explicitly, rather than trusting the routing table.
+//! So we ask the OS what source address *it* would use, and use that. The value
+//! is not in overriding the decision — it's in **knowing** the decision, so PTP
+//! can bind to the same address the RTSP connection uses and `SETPEERS` can
+//! advertise something true. [`set_source_override`] exists for the rare setup
+//! where the routing table really is wrong.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
 use std::sync::OnceLock;
 
 use tracing::{debug, warn};
@@ -63,20 +70,30 @@ fn is_unusable(ip: Ipv4Addr) -> bool {
     ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() || ip.is_broadcast()
 }
 
-/// Pick the local address to send from when talking to `dest`.
+/// Local addresses that look like they're on `dest`'s network but aren't the
+/// one we're actually using — i.e. plausible `--bind` suggestions when a
+/// connection fails.
 ///
-/// Returns the candidate whose subnet contains `dest`, preferring the most
-/// specific (longest prefix) match when several qualify — that's the interface
-/// genuinely on the receiver's network. Returns `None` when nothing matches, in
-/// which case the caller should fall back to letting the OS choose (the
-/// receiver may legitimately be off-subnet, behind a router).
-pub fn select_source_ipv4(candidates: &[LocalIpv4], dest: Ipv4Addr) -> Option<Ipv4Addr> {
-    candidates
+/// This is deliberately only a *hint*. It is not used to choose the source
+/// address (see the module docs: subnet matching cannot reliably separate
+/// interfaces with overlapping masks, and the routing table already knows
+/// better). It exists to turn an opaque connection reset into a next step.
+pub fn alternative_sources(candidates: &[LocalIpv4], dest: Ipv4Addr, in_use: Ipv4Addr) -> Vec<Ipv4Addr> {
+    let mut alts: Vec<&LocalIpv4> = candidates
         .iter()
         .filter(|c| !is_unusable(c.ip))
+        .filter(|c| c.ip != in_use)
         .filter(|c| same_subnet(c.ip, dest, c.prefixlen))
-        .max_by_key(|c| c.prefixlen)
-        .map(|c| c.ip)
+        .collect();
+    // Closest-looking first: the more leading bits an address shares with the
+    // receiver, the more likely it's on the same physical segment.
+    alts.sort_by_key(|c| std::cmp::Reverse(common_prefix_len(c.ip, dest)));
+    alts.into_iter().map(|c| c.ip).collect()
+}
+
+/// Number of leading bits `a` and `b` share.
+fn common_prefix_len(a: Ipv4Addr, b: Ipv4Addr) -> u32 {
+    (u32::from(a) ^ u32::from(b)).leading_zeros()
 }
 
 /// Enumerate this machine's usable IPv4 interface addresses.
@@ -103,11 +120,52 @@ pub fn source_addr_for(dest: IpAddr) -> Option<IpAddr> {
     if let Some(forced) = SOURCE_OVERRIDE.get() {
         return Some(*forced);
     }
-    let IpAddr::V4(dest_v4) = dest else {
-        // IPv6 selection has its own scoping rules; don't second-guess the OS.
+    os_source_for(dest)
+}
+
+/// Ask the OS which local address it would send to `dest` from, without
+/// sending anything.
+///
+/// Connecting a UDP socket only sets its default destination — no packets
+/// leave the machine — but it makes the kernel run its route lookup, after
+/// which `local_addr` reports the source it chose. This is the same decision a
+/// TCP connect would make, obtained up front so PTP and `SETPEERS` can agree
+/// with it.
+pub fn os_source_for(dest: IpAddr) -> Option<IpAddr> {
+    let bind: SocketAddr = if dest.is_ipv4() {
+        ([0, 0, 0, 0], 0).into()
+    } else {
+        (Ipv6Addr::UNSPECIFIED, 0).into()
+    };
+    let sock = std::net::UdpSocket::bind(bind).ok()?;
+    // Port is arbitrary; only the route lookup matters.
+    sock.connect(SocketAddr::new(dest, 9)).ok()?;
+    let local = sock.local_addr().ok()?.ip();
+    (!local.is_unspecified()).then_some(local)
+}
+
+/// A next step to suggest when a receiver connection fails, or `None` if
+/// nothing about the local networking looks suspicious.
+///
+/// Aimed at the case that is otherwise invisible: we're sourcing from an
+/// interface on a different physical segment than the receiver, the connection
+/// half-opens, and the receiver's first response write is reset — leaving a
+/// bare "connection forcibly closed" with no clue where to look.
+pub fn connection_hint(dest: IpAddr) -> Option<String> {
+    let (IpAddr::V4(dest_v4), Some(IpAddr::V4(src_v4))) = (dest, os_source_for(dest)) else {
         return None;
     };
-    select_source_ipv4(&local_ipv4_addrs(), dest_v4).map(IpAddr::V4)
+    let alts = alternative_sources(&local_ipv4_addrs(), dest_v4, src_v4);
+    let better = alts.first()?;
+    // Only worth mentioning if the alternative really is closer to the
+    // receiver than what we're using.
+    if common_prefix_len(*better, dest_v4) <= common_prefix_len(src_v4, dest_v4) {
+        return None;
+    }
+    Some(format!(
+        "connecting from {src_v4}, but {better} looks closer to {dest_v4}'s network \
+         — if this keeps failing, try --bind {better}"
+    ))
 }
 
 /// Connect to `dest` from the interface that can actually reach it.
@@ -166,87 +224,84 @@ mod tests {
         }
     }
 
-    /// The exact failure from the field: a virtual adapter on an unrelated
-    /// subnet must never be chosen over the real LAN interface.
+    /// The real-world layout that broke the earlier subnet-matching approach:
+    /// two interfaces on DIFFERENT networks both carrying a /16, so both
+    /// "contain" the receiver. Subnet matching cannot separate these — which is
+    /// why selection now belongs to the routing table, and this function only
+    /// suggests alternatives.
     #[test]
-    fn prefers_lan_interface_over_virtual_adapter() {
+    fn suggests_the_closer_interface_when_masks_overlap() {
         let candidates = [
-            lif([192, 168, 243, 92], 24), // VMware/Hyper-V style virtual adapter
-            lif([192, 168, 1, 108], 24),  // real Wi-Fi LAN
+            lif([192, 168, 243, 92], 16), // Wi-Fi, different segment
+            lif([192, 168, 1, 108], 16),  // Ethernet, receiver's segment
         ];
-        let picked = select_source_ipv4(&candidates, Ipv4Addr::new(192, 168, 1, 106));
-        assert_eq!(picked, Some(Ipv4Addr::new(192, 168, 1, 108)));
+        let alts = alternative_sources(
+            &candidates,
+            Ipv4Addr::new(192, 168, 1, 106),
+            Ipv4Addr::new(192, 168, 243, 92), // currently in use
+        );
+        assert_eq!(alts.first(), Some(&Ipv4Addr::new(192, 168, 1, 108)));
     }
 
     #[test]
-    fn order_does_not_matter() {
-        let candidates = [
-            lif([192, 168, 1, 108], 24),
-            lif([192, 168, 243, 92], 24),
-        ];
-        let picked = select_source_ipv4(&candidates, Ipv4Addr::new(192, 168, 1, 106));
-        assert_eq!(picked, Some(Ipv4Addr::new(192, 168, 1, 108)));
+    fn does_not_suggest_the_address_already_in_use() {
+        let candidates = [lif([192, 168, 1, 108], 16)];
+        let alts = alternative_sources(
+            &candidates,
+            Ipv4Addr::new(192, 168, 1, 106),
+            Ipv4Addr::new(192, 168, 1, 108),
+        );
+        assert!(alts.is_empty());
     }
 
     #[test]
-    fn prefers_most_specific_subnet() {
-        // Both contain the destination; the /24 is the real local segment.
-        let candidates = [lif([10, 0, 0, 5], 8), lif([10, 1, 2, 3], 24)];
-        let picked = select_source_ipv4(&candidates, Ipv4Addr::new(10, 1, 2, 200));
-        assert_eq!(picked, Some(Ipv4Addr::new(10, 1, 2, 3)));
-    }
-
-    #[test]
-    fn no_match_defers_to_the_os() {
-        // Receiver is off-subnet (behind a router) — we must not guess.
+    fn suggests_nothing_for_an_off_network_receiver() {
+        // Receiver is routed, not on any local segment — no advice to give.
         let candidates = [lif([192, 168, 1, 108], 24)];
-        assert_eq!(
-            select_source_ipv4(&candidates, Ipv4Addr::new(10, 9, 9, 9)),
-            None
+        let alts = alternative_sources(
+            &candidates,
+            Ipv4Addr::new(10, 9, 9, 9),
+            Ipv4Addr::new(192, 168, 1, 108),
         );
+        assert!(alts.is_empty());
     }
 
     #[test]
-    fn skips_loopback_and_link_local() {
-        let candidates = [
-            lif([127, 0, 0, 1], 8),
-            lif([169, 254, 3, 4], 16),
-            lif([192, 168, 1, 108], 24),
-        ];
-        // Destination on the APIPA range must not select the link-local addr.
-        assert_eq!(
-            select_source_ipv4(&candidates, Ipv4Addr::new(169, 254, 9, 9)),
-            None
+    fn never_suggests_loopback_or_link_local() {
+        let candidates = [lif([127, 0, 0, 1], 8), lif([169, 254, 3, 4], 16)];
+        let alts = alternative_sources(
+            &candidates,
+            Ipv4Addr::new(169, 254, 9, 9),
+            Ipv4Addr::new(192, 168, 1, 108),
         );
-        // And loopback is never offered for a LAN destination.
-        assert_eq!(
-            select_source_ipv4(&candidates, Ipv4Addr::new(192, 168, 1, 106)),
-            Some(Ipv4Addr::new(192, 168, 1, 108))
-        );
+        assert!(alts.is_empty());
     }
 
     #[test]
     fn zero_prefix_is_not_a_match() {
-        // A /0 route matches everything and so proves nothing about being on
-        // the receiver's network.
+        // A /0 matches everything and so proves nothing about locality.
         let candidates = [lif([25, 60, 1, 1], 0)];
-        assert_eq!(
-            select_source_ipv4(&candidates, Ipv4Addr::new(192, 168, 1, 106)),
-            None
+        let alts = alternative_sources(
+            &candidates,
+            Ipv4Addr::new(192, 168, 1, 106),
+            Ipv4Addr::new(10, 0, 0, 1),
         );
+        assert!(alts.is_empty());
     }
 
     #[test]
-    fn ipv6_destination_defers_to_the_os() {
-        assert_eq!(source_addr_for("::1".parse().unwrap()), None);
+    fn common_prefix_len_ranks_closeness() {
+        let dest = Ipv4Addr::new(192, 168, 1, 106);
+        let near = common_prefix_len(Ipv4Addr::new(192, 168, 1, 108), dest);
+        let far = common_prefix_len(Ipv4Addr::new(192, 168, 243, 92), dest);
+        assert!(near > far, "same-segment address must rank closer");
     }
 
+    /// The OS route lookup must agree with the routing table for a loopback
+    /// destination, and must not send anything to find out.
     #[test]
-    fn exact_host_route_matches() {
-        let candidates = [lif([192, 168, 1, 108], 32)];
-        assert_eq!(
-            select_source_ipv4(&candidates, Ipv4Addr::new(192, 168, 1, 108)),
-            Some(Ipv4Addr::new(192, 168, 1, 108))
-        );
+    fn os_source_for_loopback_is_loopback() {
+        let src = os_source_for("127.0.0.1".parse().unwrap());
+        assert_eq!(src, Some("127.0.0.1".parse::<IpAddr>().unwrap()));
     }
 }
