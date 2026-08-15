@@ -3,6 +3,11 @@
 ## Git Commits
 Do not add "Co-Authored-By: Claude" or any Claude attribution to commit messages.
 
+Make **many small, focused commits** rather than grouping unrelated work into one
+large commit. One logical change per commit (e.g. "add X helper", "wire X into
+CLI", "docs for X" are three commits, not one). Commit as soon as each piece
+builds and passes tests, rather than batching up to the end of a task.
+
 ## Goal
 To develop and release a cross-platform, open-source desktop utility that allows users to stream high-fidelity, low-latency system audio from Windows and Linux to AirPlay 2-compatible receivers, achieving feature parity with proprietary alternatives.
 
