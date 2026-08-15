@@ -8,3 +8,7 @@ license.workspace = true
 [dependencies]
 thiserror.workspace = true
 serde.workspace = true
+# Interface enumeration, so we can bind to the interface that actually reaches
+# the receiver instead of trusting the routing table. Already in the tree via
+# mdns-sd, so this adds no new dependency.
+if-addrs = "0.13"
