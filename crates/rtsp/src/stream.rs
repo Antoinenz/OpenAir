@@ -346,6 +346,50 @@ impl StreamSession {
         check_ok(&raw)
     }
 
+    /// SET_PARAMETER now-playing metadata (DMAP/DAAP-tagged).
+    ///
+    /// `rtptime` is the current stream position, which the receiver uses to
+    /// associate the metadata with the audio it is about to play.
+    pub fn set_metadata(&mut self, dmap: &[u8], rtptime: u32) -> Result<(), SessionError> {
+        let rtp_info = format!("rtptime={}", rtptime);
+        let raw = self.conn.request(
+            "SET_PARAMETER",
+            &self.uri.clone(),
+            &[
+                ("Session", "1"),
+                ("RTP-Info", &rtp_info),
+                ("DACP-ID", &self.dacp_id.clone()),
+                ("Active-Remote", &self.active_remote.to_string()),
+            ],
+            dmap,
+            Some("application/x-dmap-tagged"),
+        )?;
+        check_ok(&raw)
+    }
+
+    /// SET_PARAMETER cover art. `mime` is "image/jpeg" or "image/png".
+    pub fn set_artwork(
+        &mut self,
+        image: &[u8],
+        mime: &str,
+        rtptime: u32,
+    ) -> Result<(), SessionError> {
+        let rtp_info = format!("rtptime={}", rtptime);
+        let raw = self.conn.request(
+            "SET_PARAMETER",
+            &self.uri.clone(),
+            &[
+                ("Session", "1"),
+                ("RTP-Info", &rtp_info),
+                ("DACP-ID", &self.dacp_id.clone()),
+                ("Active-Remote", &self.active_remote.to_string()),
+            ],
+            image,
+            Some(mime),
+        )?;
+        check_ok(&raw)
+    }
+
     /// POST /feedback keepalive (send every ~2s while streaming).
     pub fn feedback(&mut self) -> Result<(), SessionError> {
         let raw = self.conn.request("POST", "/feedback", &[], &[], None)?;
