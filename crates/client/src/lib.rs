@@ -749,6 +749,12 @@ pub fn stream_audio_buffered_multi(
             Ok(r) => group.push(r),
             Err(e) => {
                 warn!(receiver = %name, "setup failed — skipping: {e}");
+                // A half-open connection reset by the receiver usually means we
+                // sourced it from the wrong interface; say so rather than
+                // leaving a bare OS error code.
+                if let Some(hint) = openair_core::net::connection_hint(target.addr.ip()) {
+                    warn!(receiver = %name, "{hint}");
+                }
             }
         }
     }
