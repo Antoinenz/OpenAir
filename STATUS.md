@@ -95,9 +95,8 @@ Device detection already verified on hardware via `openair devices`.
 
 - **The original failure** — reconnect after a stream on Wi-Fi with virtual
   adapters present. Previously RST at pair-setup; should now connect every time.
-- **Check the log line** — `connected from selected local address src=192.168.1.x`
-  (DEBUG). If it says "letting the OS choose", no interface matched the
-  receiver's subnet — expected only if the receiver is routed, not on-LAN.
+- **Check the log line** — `connected from selected local address src=192.168.1.108`
+  should match what `Find-NetRoute -RemoteIPAddress <receiver>` reports.
 - **PTP** — `PTP sockets bound bind_ip=192.168.1.x` should match the source
   address, and the receiver should reach "NQPTP master clock" as usual.
 - **`--bind <ip>`** — forcing a deliberately wrong IP should fail to connect

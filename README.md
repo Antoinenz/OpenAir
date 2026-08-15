@@ -88,11 +88,11 @@ Notes:
 - Flags can appear anywhere in the command line.
 - `--latency` and `--offset` only affect the buffered pipeline; the realtime
   (default single-receiver) pipeline has a protocol-fixed ~2 s latency.
-- On machines with virtual network adapters (VMware, Hyper-V, VPNs, tethering),
-  OpenAir binds to the interface on the receiver's subnet rather than trusting
-  the OS routing table — otherwise the receiver's replies come back to an
-  address we aren't listening on and the session dies at pair-setup. Override
-  with `--bind <ip>` if needed.
+- On a multi-homed machine, OpenAir asks the OS which local address it would
+  route to the receiver from, and binds RTSP and PTP to that same address so the
+  receiver's clock daemon sees us consistently. If a connection is reset during
+  pair-setup, you're most likely on an interface that can't reach the receiver's
+  network — OpenAir will suggest a `--bind <ip>` to try.
 - HomeKit credentials are stored at `%APPDATA%\OpenAir\pairings.json`.
 
 ### `--handoff`: silent speakers + Windows volume control

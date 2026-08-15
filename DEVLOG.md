@@ -35,18 +35,49 @@ Lesson: "the peer is refusing us" was an assumption, not an observation. The
 receiver's own logs settled in one run what three rounds of client-side
 theorising could not.
 
-### Fix
-New `openair_core::net`: enumerate local IPv4 interfaces (`if-addrs`, already in
-the tree via mdns-sd) and pick the one whose subnet contains the receiver,
-longest-prefix-match, falling back to OS routing when nothing matches (the
-receiver may legitimately be routed). All four receiver connections (RTSP
-control, event channel, both buffered-audio paths) now bind to it via
-`connect_from_best_source`, with `--bind <ip>` as a manual override.
+### First fix attempt — wrong, and a regression
+Enumerated local interfaces and picked the one whose subnet contained the
+receiver (longest-prefix-match). Shipped it. It **broke a working setup.**
 
-Also fixed the same class of bug in PTP: the sockets bound `0.0.0.0`, so the OS
-picked a source per packet. Since the receiver's clock daemon filters PTP on the
-address advertised in SETPEERS, a mis-sourced packet stream could leave it with
-no master clock even when RTSP was healthy.
+The machine's actual interfaces:
+
+```
+192.168.243.92   /16   WiFi        (metric 35)
+192.168.1.108    /16   Ethernet 4  (metric 25)
+```
+
+**Both are /16**, so both claim `192.168.0.0/16` and both "contain" the receiver
+at `192.168.1.106`. Subnet matching cannot separate them; the longest-prefix
+tiebreak was a coin flip and landed on Wi-Fi. Meanwhile `Find-NetRoute
+192.168.1.106` returns `192.168.1.108` — **the OS had been right all along**,
+picking Ethernet on interface metric. The heuristic overrode a correct decision.
+
+The premise was never verified: "the OS picks the wrong source" was inferred
+from the source IP differing between runs, when the real explanation was that
+the earlier failures happened with Ethernet *unplugged*, leaving only a Wi-Fi
+interface that genuinely can't reach the receiver's segment.
+
+### Actual fix
+Ask the OS for its own route decision — `connect()` a UDP socket to the receiver
+(sends nothing; just forces the kernel's route lookup) and read `local_addr()`.
+Verified on the machine: returns `192.168.1.108`, matching `Find-NetRoute`.
+
+The value was never in *overriding* the routing table, only in **knowing** its
+answer, so PTP binds to the same address RTSP connects from and SETPEERS
+advertises something true. (PTP previously bound `0.0.0.0`, letting the OS pick
+per packet — and since the receiver's clock daemon filters on the SETPEERS
+address, a mismatch could leave it with no master clock while RTSP looked fine.)
+
+Subnet matching survives, demoted to what it's actually good for: suggesting
+`--bind` candidates when a connection fails, turning a bare WSAECONNRESET into
+"connecting from X, but Y looks closer to the receiver — try `--bind Y`".
+
+### Lesson
+Two premises went unverified here, and each cost a round trip: "the receiver is
+refusing us" (it wasn't — its logs showed it being reset *by us*) and "the OS
+picks the wrong interface" (it doesn't — `Find-NetRoute` and a UDP route lookup
+both agree with reality). Both were checkable in one command on the machine
+involved. Check the cheap authoritative source before building on an inference.
 
 ### Incidental
 Earlier in the session, PTP clock identity was made stable across runs
