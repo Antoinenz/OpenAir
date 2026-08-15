@@ -15,6 +15,71 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tracing::{debug, info, warn};
 
+/// Where our PTP clock identity is persisted so it survives restarts.
+fn clock_id_path() -> Option<std::path::PathBuf> {
+    let dir = if cfg!(windows) {
+        std::env::var_os("APPDATA").map(std::path::PathBuf::from)
+    } else {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config"))
+            })
+    };
+    dir.map(|d| d.join("OpenAir").join("ptp_clock_id"))
+}
+
+/// Generate a fresh locally-administered EUI-64 clock identity.
+///
+/// Sets the locally-administered bit and clears the multicast bit, so a
+/// generated identity can never collide with a real MAC-derived one.
+fn generate_clock_id() -> u64 {
+    let seed = ptp_now_ns() ^ (std::process::id() as u64).rotate_left(32);
+    let mut bytes = seed.to_be_bytes();
+    bytes[0] = (bytes[0] | 0b0000_0010) & 0b1111_1110; // local, unicast
+    u64::from_be_bytes(bytes)
+}
+
+/// Read the clock identity from `path`, generating and persisting one if the
+/// file is missing or unreadable. Split from [`stable_clock_id`] so tests can
+/// point it at a temporary file instead of the real config directory.
+fn clock_id_from_file(path: &std::path::Path) -> u64 {
+    if let Ok(text) = std::fs::read_to_string(path) {
+        if let Ok(id) = u64::from_str_radix(text.trim(), 16) {
+            if id != 0 {
+                return id;
+            }
+        }
+    }
+
+    let id = generate_clock_id();
+    let write = path
+        .parent()
+        .map(std::fs::create_dir_all)
+        .unwrap_or(Ok(()))
+        .and_then(|()| std::fs::write(path, format!("{id:016x}")));
+    match write {
+        Ok(()) => info!(clock_id = format!("{id:016x}"), "generated PTP clock identity"),
+        Err(e) => warn!("could not persist PTP clock identity (will differ next run): {e}"),
+    }
+    id
+}
+
+/// Our PTP clock identity, **stable across runs**.
+///
+/// IEEE 1588 clockIdentity is an EUI-64 derived from the interface MAC and is
+/// expected to be constant for the life of a clock — receivers (and Shairport's
+/// `nqptp`) key their timing state on it. Generating a fresh one per process
+/// makes us look like a brand-new grandmaster on every launch, so the identity
+/// is generated once and persisted. Falls back to a per-process value if no
+/// config directory is available.
+fn stable_clock_id() -> u64 {
+    match clock_id_path() {
+        Some(p) => clock_id_from_file(&p),
+        None => generate_clock_id(),
+    }
+}
+
 /// Our PTP clock time: nanoseconds since the Unix epoch.
 /// (The epoch is arbitrary as long as anchor times use the same timeline.)
 pub fn ptp_now_ns() -> u64 {
@@ -217,11 +282,9 @@ impl PtpMaster {
         let general_dests: Vec<SocketAddr> =
             peers.iter().map(|p| SocketAddr::new(*p, 320)).collect();
 
-        let mut clock_bytes = [0u8; 8];
-        // Derive a stable-ish clock identity from process randomness.
-        let seed = ptp_now_ns() ^ (std::process::id() as u64).rotate_left(32);
-        clock_bytes.copy_from_slice(&seed.to_be_bytes());
-        let clock_id = u64::from_be_bytes(clock_bytes);
+        // Stable across runs — receivers key timing state on this identity.
+        let clock_id = stable_clock_id();
+        let clock_bytes = clock_id.to_be_bytes();
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
@@ -503,6 +566,46 @@ impl Drop for PtpMaster {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Unique temp path per test — these tests persist state to disk, so they
+    /// must not share a file (or they race when run in parallel).
+    fn temp_clock_path(tag: &str) -> std::path::PathBuf {
+        let unique = format!("{}-{}-{}", tag, std::process::id(), ptp_now_ns());
+        std::env::temp_dir().join("openair-test").join(unique)
+    }
+
+    #[test]
+    fn clock_identity_persists_across_calls() {
+        // Receivers key timing state on this identity, so a later run (a second
+        // read of the same file) must return exactly what the first generated.
+        let path = temp_clock_path("stable");
+        let first = clock_id_from_file(&path);
+        let second = clock_id_from_file(&path);
+        assert_eq!(first, second, "identity must survive a restart");
+        assert!(path.exists(), "identity should have been persisted");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn clock_identity_regenerates_when_file_is_corrupt() {
+        let path = temp_clock_path("corrupt");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "not-hex").unwrap();
+        let id = clock_id_from_file(&path);
+        assert_ne!(id, 0);
+        // The bad content must have been replaced, so the next run is stable.
+        assert_eq!(id, clock_id_from_file(&path));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn generated_identity_is_locally_administered_unicast() {
+        // A generated EUI-64 must set the local bit and clear the multicast
+        // bit so it can never collide with a real MAC-derived identity.
+        let first = generate_clock_id().to_be_bytes()[0];
+        assert_eq!(first & 0b0000_0010, 0b0000_0010, "local bit must be set");
+        assert_eq!(first & 0b0000_0001, 0, "multicast bit must be clear");
+    }
 
     #[test]
     fn timestamp_layout() {
