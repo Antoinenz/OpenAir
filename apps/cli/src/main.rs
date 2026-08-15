@@ -39,6 +39,30 @@ mod util {
         (remaining, volume)
     }
 
+    /// Extracts an optional `<flag> <value>` string pair from anywhere in
+    /// `args`, returning the remaining positional args and the value if the
+    /// flag was present with one.
+    pub fn extract_value(args: &[String], flag: &str) -> (Vec<String>, Option<String>) {
+        let mut remaining = Vec::with_capacity(args.len());
+        let mut value = None;
+        let mut skip_next = false;
+        for (i, arg) in args.iter().enumerate() {
+            if skip_next {
+                skip_next = false;
+                continue;
+            }
+            if arg == flag {
+                if let Some(v) = args.get(i + 1) {
+                    value = Some(v.clone());
+                    skip_next = true;
+                }
+                continue;
+            }
+            remaining.push(arg.clone());
+        }
+        (remaining, value)
+    }
+
     /// Extracts a boolean flag (no value) from anywhere in `args`, returning
     /// the remaining positional args (flag removed) and whether it was
     /// present.
@@ -186,6 +210,24 @@ mod util {
                 vec!["capture".to_string(), "127.0.0.1:7000".to_string(), "30".to_string()]
             );
             assert_eq!(vol, -3.0);
+        }
+
+        #[test]
+        fn extract_value_present_and_absent() {
+            let args = vec![
+                "capture".to_string(),
+                "pool".to_string(),
+                "--handoff-device".to_string(),
+                "CABLE Input".to_string(),
+            ];
+            let (rest, val) = extract_value(&args, "--handoff-device");
+            assert_eq!(rest, vec!["capture".to_string(), "pool".to_string()]);
+            assert_eq!(val, Some("CABLE Input".to_string()));
+
+            let bare = vec!["capture".to_string(), "pool".to_string()];
+            let (rest, val) = extract_value(&bare, "--handoff-device");
+            assert_eq!(rest, bare);
+            assert_eq!(val, None);
         }
 
         #[test]
@@ -346,37 +388,37 @@ fn resolve_receivers(
     Some(out)
 }
 
-/// Start the `--handoff` volume bridge (Windows): mute the local speakers and
-/// return a guard (keep it alive for the stream's lifetime — dropping it
-/// restores the original volume/mute) plus a receiver of mirrored dBFS updates
-/// to forward to the AirPlay receivers. Returns `None` if the bridge could not
-/// start, so the caller streams normally (degrade off).
+/// Start a `--handoff` session (Windows): route system audio to a virtual
+/// output device so the speakers go quiet, and mirror the Windows volume onto
+/// AirPlay. Returns the session guard (keep it alive for the stream's lifetime
+/// — dropping it restores the original output device) and a receiver of
+/// mirrored dBFS updates.
+///
+/// `Err` is fatal by design: `--handoff` promises silent speakers, and silently
+/// streaming with them still playing would be worse than refusing.
 #[cfg(windows)]
-fn start_handoff() -> Option<(
-    openair_capture::handoff::VolumeBridge,
-    std::sync::mpsc::Receiver<f32>,
-)> {
-    match openair_capture::handoff::VolumeBridge::start() {
-        Ok((bridge, event_rx)) => {
-            // Adapt the capture crate's VolumeEvent → plain f32 (dBFS) so the
-            // client's stream signature stays platform-independent.
-            let (fwd_tx, fwd_rx) = std::sync::mpsc::channel::<f32>();
-            std::thread::spawn(move || {
-                for ev in event_rx {
-                    let openair_capture::handoff::VolumeEvent::Level(db) = ev;
-                    if fwd_tx.send(db).is_err() {
-                        break; // stream ended
-                    }
-                }
-            });
-            println!("  🔇 local speakers muted — Windows volume now controls AirPlay");
-            Some((bridge, fwd_rx))
+fn start_handoff(
+    device_override: Option<String>,
+) -> Result<
+    (
+        openair_capture::handoff::HandoffSession,
+        std::sync::mpsc::Receiver<f32>,
+    ),
+    openair_capture::handoff::HandoffError,
+> {
+    let (session, event_rx) = openair_capture::handoff::HandoffSession::start(device_override)?;
+    // Adapt the capture crate's VolumeEvent → plain f32 (dBFS) so the client's
+    // stream signature stays platform-independent.
+    let (fwd_tx, fwd_rx) = std::sync::mpsc::channel::<f32>();
+    std::thread::spawn(move || {
+        for ev in event_rx {
+            let openair_capture::handoff::VolumeEvent::Level(db) = ev;
+            if fwd_tx.send(db).is_err() {
+                break; // stream ended
+            }
         }
-        Err(e) => {
-            println!("  ⚠ --handoff unavailable: {e} (streaming without muting local audio)");
-            None
-        }
-    }
+    });
+    Ok((session, fwd_rx))
 }
 
 #[tokio::main]
@@ -394,6 +436,7 @@ async fn main() -> Result<()> {
     let (raw_args, latency_ms) = util::extract_latency(&raw_args, 500);
     let (raw_args, offsets) = util::extract_offsets(&raw_args);
     let (raw_args, handoff) = extract_flag(&raw_args, "--handoff");
+    let (raw_args, handoff_device) = util::extract_value(&raw_args, "--handoff-device");
     let (args, buffered) = extract_flag(&raw_args, "--buffered");
     // --handoff mirrors live volume, which only the buffered pipeline applies,
     // so enabling it implies --buffered.
@@ -402,8 +445,8 @@ async fn main() -> Result<()> {
     // --handoff (mute local speakers + mirror Windows volume) is capture-only
     // and Windows-only. Reject early with a clear message otherwise.
     if handoff && args.first().map(String::as_str) != Some("capture") {
-        println!("--handoff is only valid with `capture` (it mutes the local");
-        println!("speakers and mirrors the Windows volume onto AirPlay).");
+        println!("--handoff is only valid with `capture` (it routes system audio");
+        println!("through a virtual device and mirrors the Windows volume to AirPlay).");
         return Ok(());
     }
     #[cfg(not(windows))]
@@ -429,6 +472,56 @@ async fn main() -> Result<()> {
             openair_client::stream_audio(targets[0].addr, &targets[0].device_id, source, volume)
         }
     };
+
+    // `openair devices` — list output devices and show which one --handoff
+    // would route through. Read-only; changes nothing.
+    #[cfg(windows)]
+    if args.first().map(String::as_str) == Some("devices") {
+        match openair_capture::handoff::list_output_devices() {
+            Ok(listing) => {
+                println!("Audio output devices ({}):\n", listing.devices.len());
+                for dev in &listing.devices {
+                    let mark = if listing.selected.as_deref() == Some(dev.id.as_str()) {
+                        " ← --handoff would use this"
+                    } else {
+                        ""
+                    };
+                    println!("  {}{}", dev.name, mark);
+                }
+                if listing.selected.is_none() {
+                    println!("\nNo virtual audio device detected.");
+                    println!("--handoff needs one — install VB-CABLE: https://vb-audio.com/Cable/");
+                    println!("(Or pass --handoff-device \"<name>\" to force a specific device.)");
+                }
+            }
+            Err(e) => println!("  ✗ could not list audio devices: {}", e),
+        }
+        return Ok(());
+    }
+
+    // `openair restore-audio` — safety hatch: if a --handoff run was killed
+    // before it could restore the default output device, the user is left
+    // routed to a silent virtual cable with no obvious cause. This puts it back.
+    #[cfg(windows)]
+    if args.first().map(String::as_str) == Some("restore-audio") {
+        match openair_capture::handoff::pending_restore() {
+            None => println!("Nothing to restore — no interrupted --handoff session found."),
+            Some(_) => match openair_capture::handoff::restore_now() {
+                Ok(name) => println!("  ✓ default output device restored to \"{}\"", name),
+                Err(e) => println!("  ✗ could not restore the default output device: {}", e),
+            },
+        }
+        return Ok(());
+    }
+
+    // Surface an unrestored --handoff switch rather than leaving the user
+    // hunting for why their speakers are silent. (Also true while a handoff
+    // stream is running in another window, hence the hedge.)
+    #[cfg(windows)]
+    if openair_capture::handoff::pending_restore().is_some() {
+        println!("⚠ A --handoff session may not have restored your audio output device.");
+        println!("  If OpenAir isn't streaming elsewhere, run: openair restore-audio\n");
+    }
 
     // `openair pair <ip:port|name>` — one-time Normal HomeKit pairing with the
     // PIN shown on the device's screen (Apple TV / HomePod). Credentials are
@@ -495,7 +588,32 @@ async fn main() -> Result<()> {
             ),
         }
 
-        let cap = match openair_capture::SystemCapture::start() {
+        // --handoff: route system audio to a virtual output device BEFORE
+        // starting capture, so we capture the cable rather than the speakers.
+        // `_handoff_session` must outlive the stream call — dropping it puts
+        // the user's default output device back.
+        #[cfg(windows)]
+        let (_handoff_session, volume_rx, capture_device) = if handoff {
+            match start_handoff(handoff_device.clone()) {
+                Ok((session, rx)) => {
+                    let name = session.device_name().to_string();
+                    println!("  🔀 system audio routed to \"{}\"", name);
+                    println!("     speakers are silent; the Windows volume now controls AirPlay");
+                    (Some(session), Some(rx), Some(name))
+                }
+                Err(e) => {
+                    println!("  ✗ --handoff failed: {}", e);
+                    return Ok(());
+                }
+            }
+        } else {
+            (None, None, None)
+        };
+        #[cfg(not(windows))]
+        let (volume_rx, capture_device): (Option<std::sync::mpsc::Receiver<f32>>, Option<String>) =
+            (None, None);
+
+        let cap = match openair_capture::SystemCapture::start_on(capture_device.as_deref()) {
             Ok(c) => c,
             Err(e) => {
                 println!("  ✗ failed to start system audio capture: {}", e);
@@ -503,7 +621,7 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
         };
-        println!("  device rate: {} Hz", cap.device_rate);
+        println!("  capturing: {} @ {} Hz", cap.device_name, cap.device_rate);
 
         let mut source = openair_client::CaptureSource::new(
             cap.ring.clone(),
@@ -517,21 +635,6 @@ async fn main() -> Result<()> {
         if buffered || receivers.len() > 1 {
             source = source.with_blocking();
         }
-
-        // --handoff: mute local speakers + mirror Windows volume (Windows only).
-        // `_handoff_bridge` must outlive the stream call — dropping it restores
-        // the user's original volume/mute.
-        #[cfg(windows)]
-        let (_handoff_bridge, volume_rx) = if handoff {
-            match start_handoff() {
-                Some((bridge, rx)) => (Some(bridge), Some(rx)),
-                None => (None, None),
-            }
-        } else {
-            (None, None)
-        };
-        #[cfg(not(windows))]
-        let volume_rx: Option<std::sync::mpsc::Receiver<f32>> = None;
 
         match stream_fn(&receivers, &mut source, Some(volume_db), volume_rx) {
             Ok(()) => println!("  ✓ capture streamed successfully"),

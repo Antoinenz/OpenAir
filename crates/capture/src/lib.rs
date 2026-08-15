@@ -43,6 +43,10 @@ pub struct SystemCapture {
     /// Ring buffer of interleaved stereo i16 samples at `device_rate`.
     pub ring: Arc<Mutex<VecDeque<i16>>>,
     pub device_rate: u32,
+    /// Friendly name of the device being captured, so callers can confirm
+    /// they're recording what they think they are (e.g. the virtual cable
+    /// under `--handoff`, not the speakers).
+    pub device_name: String,
     // Kept alive so capture keeps running; dropping this stops the stream.
     // cpal::Stream is !Send, so SystemCapture must stay on the thread that
     // created it. Never read directly — its only job is to live as long as
@@ -58,8 +62,32 @@ impl SystemCapture {
     /// device as an input source: `build_input_stream` on a device returned
     /// by `default_output_device()` yields the audio that device is playing.
     pub fn start() -> Result<Self, CaptureError> {
+        Self::start_on(None)
+    }
+
+    /// Start loopback capture of a specific output device, selected by
+    /// case-insensitive substring of its name; `None` uses the default output.
+    ///
+    /// Used by `--handoff`, which routes system audio to a virtual cable and
+    /// then captures from that cable explicitly rather than assuming the
+    /// default-device switch took effect.
+    pub fn start_on(name_filter: Option<&str>) -> Result<Self, CaptureError> {
         let host = cpal::default_host();
-        let device = host.default_output_device().ok_or(CaptureError::NoDevice)?;
+        let device = match name_filter {
+            Some(want) => {
+                let needle = want.to_lowercase();
+                host.output_devices()
+                    .map_err(|e| CaptureError::DefaultConfig(e.to_string()))?
+                    .find(|d| {
+                        d.name()
+                            .map(|n| n.to_lowercase().contains(&needle))
+                            .unwrap_or(false)
+                    })
+                    .ok_or(CaptureError::NoDevice)?
+            }
+            None => host.default_output_device().ok_or(CaptureError::NoDevice)?,
+        };
+        let device_name = device.name().unwrap_or_else(|_| "<unknown>".to_string());
         let supported_config = device
             .default_output_config()
             .map_err(|e| CaptureError::DefaultConfig(e.to_string()))?;
@@ -84,6 +112,7 @@ impl SystemCapture {
         Ok(SystemCapture {
             ring,
             device_rate,
+            device_name,
             stream,
         })
     }
