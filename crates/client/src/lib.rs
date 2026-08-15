@@ -53,7 +53,7 @@ fn connect_session(
 /// read timeout. We never send anything; a drain thread discards whatever
 /// the receiver pushes. Shairport doesn't need this — warn-and-continue.
 fn open_event_channel(peer_ip: std::net::IpAddr, event_port: u16) -> Option<TcpStream> {
-    match TcpStream::connect(SocketAddr::new(peer_ip, event_port)) {
+    match openair_core::net::connect_from_best_source(SocketAddr::new(peer_ip, event_port)) {
         Ok(s) => {
             s.set_nodelay(true).ok();
             if let Ok(mut rdr) = s.try_clone() {
@@ -438,7 +438,8 @@ fn prepare_receiver(
     if let Err(e) = session.set_peers() {
         warn!("SETPEERS failed (continuing): {e}");
     }
-    let data_stream = TcpStream::connect(SocketAddr::new(peer_ip, session.ports.data_port))?;
+    let data_stream =
+        openair_core::net::connect_from_best_source(SocketAddr::new(peer_ip, session.ports.data_port))?;
     data_stream.set_nodelay(true).ok();
     let cipher = AudioCipher::new(&session.shk);
     Ok(PreparedReceiver {
@@ -766,7 +767,7 @@ pub fn stream_audio_buffered_multi(
         let res = (|| -> Result<(), Box<dyn std::error::Error>> {
             let peer_ip = r.session.peer_ip();
             let data_stream =
-                TcpStream::connect(SocketAddr::new(peer_ip, r.session.ports.data_port))?;
+                openair_core::net::connect_from_best_source(SocketAddr::new(peer_ip, r.session.ports.data_port))?;
             data_stream.set_nodelay(true).ok();
             r.session.record(seq as u16, first_rtptime)?;
             let (tx, handle) = spawn_writer(data_stream, r.name.clone());

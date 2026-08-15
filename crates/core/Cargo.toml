@@ -12,3 +12,6 @@ serde.workspace = true
 # the receiver instead of trusting the routing table. Already in the tree via
 # mdns-sd, so this adds no new dependency.
 if-addrs = "0.13"
+# Bind-before-connect, which std::net::TcpStream doesn't expose.
+socket2 = "0.5"
+tracing.workspace = true

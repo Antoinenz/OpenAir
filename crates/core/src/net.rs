@@ -20,7 +20,19 @@
 //! The fix is to pick the interface whose own subnet contains the receiver and
 //! bind to it explicitly, rather than trusting the routing table.
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
+use std::sync::OnceLock;
+
+use tracing::{debug, warn};
+
+/// User-forced source address (`--bind`), overriding automatic selection.
+static SOURCE_OVERRIDE: OnceLock<IpAddr> = OnceLock::new();
+
+/// Force all outgoing receiver connections to originate from `ip`, bypassing
+/// interface selection. For users whose setup we guess wrong. First call wins.
+pub fn set_source_override(ip: IpAddr) {
+    let _ = SOURCE_OVERRIDE.set(ip);
+}
 
 /// A local IPv4 interface address and its subnet size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,11 +100,59 @@ pub fn local_ipv4_addrs() -> Vec<LocalIpv4> {
 /// The local address to bind to when connecting to `dest`, or `None` to let
 /// the OS decide (`dest` is IPv6, or no local interface shares its subnet).
 pub fn source_addr_for(dest: IpAddr) -> Option<IpAddr> {
+    if let Some(forced) = SOURCE_OVERRIDE.get() {
+        return Some(*forced);
+    }
     let IpAddr::V4(dest_v4) = dest else {
         // IPv6 selection has its own scoping rules; don't second-guess the OS.
         return None;
     };
     select_source_ipv4(&local_ipv4_addrs(), dest_v4).map(IpAddr::V4)
+}
+
+/// Connect to `dest` from the interface that can actually reach it.
+///
+/// Use this instead of [`TcpStream::connect`] for every receiver connection:
+/// the source address we end up with is also what gets advertised to the
+/// receiver in `SETPEERS`, so an OS mis-selection breaks PTP as well as RTSP.
+///
+/// Falls back to a plain connect when no interface matches (the receiver may
+/// legitimately be routed) or if binding fails, so this can only ever improve
+/// on the default behaviour.
+pub fn connect_from_best_source(dest: SocketAddr) -> std::io::Result<TcpStream> {
+    let Some(src) = source_addr_for(dest.ip()) else {
+        debug!(%dest, "no matching local interface; letting the OS choose the source");
+        return TcpStream::connect(dest);
+    };
+    if src.is_ipv4() != dest.is_ipv4() {
+        return TcpStream::connect(dest);
+    }
+
+    match bind_and_connect(src, dest) {
+        Ok(stream) => {
+            debug!(%dest, %src, "connected from selected local address");
+            Ok(stream)
+        }
+        Err(e) => {
+            // Binding is an optimisation over the OS default, never a
+            // requirement — a failure here must not cost us the connection.
+            warn!(%dest, %src, "bind to selected source failed ({e}); falling back to OS routing");
+            TcpStream::connect(dest)
+        }
+    }
+}
+
+fn bind_and_connect(src: IpAddr, dest: SocketAddr) -> std::io::Result<TcpStream> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let domain = if dest.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let sock = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    sock.bind(&SocketAddr::new(src, 0).into())?;
+    sock.connect(&dest.into())?;
+    Ok(sock.into())
 }
 
 #[cfg(test)]

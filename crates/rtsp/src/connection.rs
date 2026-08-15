@@ -25,7 +25,14 @@ pub struct RtspConnection {
 
 impl RtspConnection {
     pub fn connect(addr: impl ToSocketAddrs + Copy, device_id: &str) -> io::Result<Self> {
-        let stream = TcpStream::connect(addr)?;
+        // Bind to the interface that actually reaches the receiver — the OS
+        // may otherwise source this from a virtual adapter, and the address we
+        // end up with is also what SETPEERS advertises for PTP.
+        let dest = addr
+            .to_socket_addrs()?
+            .next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no address to connect to"))?;
+        let stream = openair_core::net::connect_from_best_source(dest)?;
         let peer = stream.peer_addr()?;
         stream.set_read_timeout(Some(READ_TIMEOUT))?;
         stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
