@@ -435,6 +435,22 @@ async fn main() -> Result<()> {
     let (raw_args, volume_db) = extract_volume(&raw_args, DEFAULT_VOLUME_DB);
     let (raw_args, latency_ms) = util::extract_latency(&raw_args, 500);
     let (raw_args, offsets) = util::extract_offsets(&raw_args);
+    // --bind <ip> forces the local source address for receiver connections,
+    // for setups where our interface selection guesses wrong.
+    let (raw_args, bind_ip) = util::extract_value(&raw_args, "--bind");
+    if let Some(spec) = &bind_ip {
+        match spec.parse::<std::net::IpAddr>() {
+            Ok(ip) => {
+                openair_core::net::set_source_override(ip);
+                println!("Binding receiver connections to {}", ip);
+            }
+            Err(_) => {
+                println!("--bind expects an IP address, got '{}'", spec);
+                return Ok(());
+            }
+        }
+    }
+
     let (raw_args, handoff) = extract_flag(&raw_args, "--handoff");
     let (raw_args, handoff_device) = util::extract_value(&raw_args, "--handoff-device");
     let (args, buffered) = extract_flag(&raw_args, "--buffered");
