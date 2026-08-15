@@ -1,4 +1,5 @@
 pub mod connection;
+pub mod dmap;
 pub mod session;
 pub mod stream;
 
