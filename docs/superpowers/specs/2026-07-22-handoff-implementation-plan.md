@@ -1,5 +1,15 @@
 # Implementation Plan: `--handoff` (mute local + mirror Windows volume)
 
+> ## ⚠️ SUPERSEDED — executed, but the approach it implements was scrapped
+>
+> All phases were completed and shipped; hardware testing then showed the
+> endpoint-mute approach glitches on every volume change (structural — see the
+> design doc). Replaced by virtual-device routing:
+> `2026-07-25-handoff-v2-virtual-device-design.md`.
+>
+> Phase 0's finding still holds and is worth keeping: **WASAPI loopback does
+> keep delivering full-scale audio while the endpoint is muted.**
+
 **Design doc:** `2026-07-22-handoff-local-mute-volume-mirror-design.md`
 **Task:** #16
 **Approach:** A (endpoint mute + ~50 ms polling bridge). B documented as future upgrade.

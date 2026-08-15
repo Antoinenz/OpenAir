@@ -4,7 +4,59 @@
 
 ---
 
-## 2026-07-26 — Session 11: `--handoff` — mute local speakers + mirror Windows volume
+## 2026-08-15 — Session 12: `--handoff` v2 — virtual device routing (v1 approach scrapped)
+
+**v1 shipped and was wrong.** Hardware test: volume mirroring worked well, but
+silencing via `IAudioEndpointVolume::SetMute(TRUE)` glitched audibly on every
+volume change. Root cause is structural, not tuning: **Windows auto-unmutes the
+endpoint on any volume change**, and we can only re-mute *after the fact* (~50 ms
+later on the poll). Approach B (event-driven `IAudioEndpointVolumeCallback`)
+would shrink that window but never close it — Windows always unmutes first. Any
+mute-based design is a race against the OS. Scrapped.
+
+### v2: route around the speakers instead of silencing them
+On `--handoff` we now switch the Windows **default output device** to a virtual
+audio cable (VB-CABLE et al) via the undocumented `IPolicyConfig`
+(`CLSID 870af99c-…`, vtable slot 13 — what nircmd/SoundVolumeView/AudioSwitcher
+use), capture loopback from *that cable explicitly* (`SystemCapture::start_on`),
+and restore the original device on exit. Nothing is muted, so there is no race
+and no glitch. `eCommunications` is deliberately left alone so call/voice apps
+keep using the user's headset. Bonus: users get **per-app split tunneling** free
+via Windows' own per-app output routing.
+
+### The mirror logic got *simpler*
+v1's `classify` state machine existed only because we held the mute flag and had
+to reinterpret the user's mute keypress through it (the only transition a user
+could produce was `true→false`). In v2 we never touch mute, so it means exactly
+what it says: `level_for(scalar, muted)` and done. ~90 lines of state machine
+deleted.
+
+### Third-party dependency, deliberately
+A virtual endpoint can **only** be created by a kernel-mode driver — no user-mode
+API exists (hence VB-CABLE/VAC/VoiceMeeter all ship one). Shipping our own means
+a PortCls/WDM driver + EV cert + Microsoft attestation signing (~$250–400/yr,
+admin installer, update-breakage risk). Deferred as a separate project; the
+switch/capture/restore plumbing is identical either way, so nothing is wasted.
+Per user decision `--handoff` **hard-errors** with install instructions when no
+cable is found rather than falling back to v1's glitchy mute.
+
+### Bug caught by real hardware
+`openair devices` on the user's machine listed **two** matching endpoints, with
+`CABLE In 16 Ch` enumerating *before* the canonical stereo `CABLE Input` — and
+first-match would have picked the 16-channel variant. Selection is now
+**preference-ranked** (`cable_rank`) rather than first-match, with the real
+device list captured as a regression test.
+
+### Safety net (this failure mode is genuinely nasty)
+If OpenAir dies without restoring, the user is routed to a silent cable with no
+obvious cause. So: original device id is persisted to disk **before** switching,
+cleared on restore; `openair restore-audio` repairs it; and every run warns if it
+detects an unrestored switch. Added `openair devices` (read-only) so users can
+verify detection before committing.
+
+---
+
+## 2026-07-26 — Session 11: `--handoff` v1 — mute local speakers + mirror Windows volume (SUPERSEDED by Session 12)
 
 Task #16. **Phase 0 hardware-verified** (loopback keeps delivering full-scale
 audio while the render endpoint is muted — the load-bearing assumption). Phases

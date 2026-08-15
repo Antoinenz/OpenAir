@@ -1,7 +1,21 @@
 # Design: `--handoff` — mute local speakers + mirror Windows volume to AirPlay
 
+> ## ⚠️ SUPERSEDED — do not implement from this document
+>
+> This approach shipped, was hardware-tested, and **failed**: silencing via
+> endpoint mute glitches audibly on every volume change, because Windows
+> auto-unmutes the endpoint and we can only re-mute after the fact. The flaw is
+> structural — approach B (event-driven callback) would shrink the window but
+> never close it.
+>
+> **Replaced by:** `2026-07-25-handoff-v2-virtual-device-design.md` (route audio
+> through a virtual output device instead of muting anything).
+>
+> Kept for the reasoning trail and because the volume-mirroring design carried
+> over largely intact.
+
 **Date:** 2026-07-22
-**Status:** Approved (design), pending implementation plan
+**Status:** ❌ Superseded by v2 (2026-07-25)
 **Scope:** Windows only, `capture` mode only
 **Task:** #16
 

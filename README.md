@@ -19,7 +19,8 @@ openair pair "Living Room"
 # Stream live system audio (WASAPI loopback) until Ctrl+C, ~sub-second latency
 openair capture "Living Room" --buffered --latency 300
 
-# Windows only: mute the PC speakers and let the Windows volume control AirPlay
+# Windows only: silence the PC speakers and let the Windows volume control AirPlay
+# (needs VB-CABLE installed — see the --handoff section below)
 openair capture "Living Room" --handoff
 
 # Play a WAV file (any sample rate/bit depth — resampled automatically)
@@ -70,6 +71,8 @@ automatically uses the buffered pipeline.
 | `openair capture <receiver>… [seconds]` | Stream **live system audio** (WASAPI loopback of the default output device). Runs until `Ctrl+C`, or for `seconds` if given. Pausing PC audio auto-pauses/resumes the stream. |
 | `openair play <receiver>… <file.wav>` | Stream a **WAV file** (the last argument). Any sample rate / 16-bit int or 32-bit float, mono or stereo — resampled/converted automatically. |
 | `openair tone <receiver>… [seconds]` | Stream a 440 Hz **test tone** (default 10 s). Hardware smoke test. |
+| `openair devices` (**Windows**) | List audio output devices and show which one `--handoff` would route through. Read-only — changes nothing. |
+| `openair restore-audio` (**Windows**) | Put the default output device back if a `--handoff` run was killed before it could restore it. |
 
 | Flag | Applies to | Default | What it does |
 |------|-----------|---------|--------------|
@@ -77,16 +80,43 @@ automatically uses the buffered pipeline.
 | `--latency <ms>` | buffered only | `500` | **Starting** end-to-end buffered latency (the anchor lead). Lower = tighter sync but more prone to underruns; below ~300 ms is risky. If the stream starts cutting out, OpenAir automatically raises the latency in 250 ms steps (up to 2 s) until it's stable. Ignored without `--buffered`. |
 | `--volume <dBFS>` | capture / play / tone | `-8` | Playback volume in dBFS: `0` = full scale, negative = quieter (e.g. `-14`), very low mutes. |
 | `--offset <name=ms>` | buffered / multi-room | `0` | Per-receiver play delay in milliseconds (`+` later, `-` earlier), e.g. `--offset "pool=+80ms"`. Repeatable; the `name` matches the receiver argument case-insensitively. Compensates downstream amp/DSP delay so rooms line up audibly. |
-| `--handoff` | capture only (**Windows**) | off | Silences the local speakers while streaming (so audio only comes out of AirPlay) and **mirrors the Windows master volume** — slider, volume keys and the mute key all control the AirPlay volume instead. `--volume` sets the initial level until you first touch the Windows volume, after which Windows controls it. Implies `--buffered`. |
+| `--handoff` | capture only (**Windows**) | off | Routes system audio through a **virtual audio device** so your speakers go silent and audio only comes out of AirPlay, and **mirrors the Windows master volume** — the slider, volume keys and mute key all control the AirPlay volume. Requires a virtual audio cable (see below). `--volume` sets the initial level until you first touch the Windows volume. Implies `--buffered`. |
+| `--handoff-device <name>` | with `--handoff` | auto | Force a specific output device by name substring (e.g. `--handoff-device "CABLE Input"`) instead of auto-detecting the virtual cable. |
 
 Notes:
 - Flags can appear anywhere in the command line.
 - `--latency` and `--offset` only affect the buffered pipeline; the realtime
   (default single-receiver) pipeline has a protocol-fixed ~2 s latency.
-- `--handoff` restores your original Windows volume/mute when the stream stops
-  (Ctrl+C). If Core Audio can't be reached it warns and streams normally
-  without muting.
 - HomeKit credentials are stored at `%APPDATA%\OpenAir\pairings.json`.
+
+### `--handoff`: silent speakers + Windows volume control
+
+`--handoff` switches the Windows **default output device** to a virtual audio
+cable, captures from that cable, and restores your original device on exit.
+Because nothing is muted, there's no fight with Windows — and since the audio
+now flows through a virtual device, you also get **per-app routing** for free
+(Settings → System → Sound → Volume mixer lets you send individual apps
+somewhere else).
+
+**Setup (one time):** install [VB-CABLE](https://vb-audio.com/Cable/) (free).
+Then check it's detected:
+
+```bash
+openair devices
+#   CABLE Input (VB-Audio Virtual Cable) ← --handoff would use this
+```
+
+```bash
+openair capture "Living Room" --handoff
+```
+
+Your speakers go quiet, audio plays on the AirPlay receiver, and the Windows
+volume controls it.
+
+> **If your audio stays silent after a crash:** OpenAir restores your output
+> device on exit (including Ctrl+C), but if it's killed hard it can't. Run
+> `openair restore-audio` to put it back — OpenAir also warns you on the next
+> run if it detects this.
 
 ## Not yet
 

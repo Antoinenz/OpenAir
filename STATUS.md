@@ -35,7 +35,7 @@
 | `capture` | ✅ Done (Win) | Yes | WASAPI loopback verified with live Spotify; PipeWire/CoreAudio later |
 | `ptp-helper` | ⬜ Stub | — | Privileged binary, IPC to main (Linux ports 319/320; not needed on Windows) |
 | `client` | ✅ Done (v1) | Yes | realtime + buffered pipelines, pairing store + auto-dispatch (pair-verify vs transient), event channel |
-| `apps/cli` | ✅ Done (v1) | Yes | scan, `pair` (PIN), tone/play/capture; name resolution, --volume, --buffered, --latency <ms>, --offset <name=ms>, --handoff (Windows), Ctrl+C |
+| `apps/cli` | ✅ Done (v1) | Yes | scan, `pair` (PIN), tone/play/capture, devices, restore-audio; name resolution, --volume, --buffered, --latency <ms>, --offset <name=ms>, --handoff[-device] (Windows), Ctrl+C |
 | `apps/tui` | ⬜ Stub | — | |
 
 ---
@@ -59,7 +59,7 @@
 
 ---
 
-## Awaiting hardware verification (code complete, Sessions 10–11)
+## Awaiting hardware verification (code complete, Sessions 10–12)
 
 - **Pause/resume on silence** — pausing PC audio pauses AirPlay (`rate=0`) and
   auto-resumes on sound. Verify the Apple TV resumes cleanly from rate=0 →
@@ -70,17 +70,26 @@
 - **Auto-latency** — force underruns (start with `--latency 200` on Wi-Fi);
   expect "underrun risk — raising latency" logs stepping 200→…, then stability.
 
-### `--handoff` (Windows, Session 11 — Phase 0 already verified)
+### `--handoff` v2 — virtual device routing (Windows, Session 12)
 
-- **Mute + play** — `openair capture "<room>" --handoff` → PC speakers silent,
-  AirPlay plays.
-- **Volume mirror** — drag the Windows slider / press volume keys → AirPlay
-  volume follows (~50 ms lag ok); speakers stay silent.
-- **Mute key** — press Windows mute → AirPlay goes silent; press again →
-  returns; speakers stay silent throughout.
-- **Restore** — Ctrl+C restores the original Windows volume + mute.
-- **Multi-room** — `--handoff` with two rooms: both track the volume; a
-  reconnecting room comes back at the current level.
+Requires VB-CABLE. v1's endpoint-mute approach was scrapped (glitched on every
+volume change — Windows auto-unmutes and we could only re-mute after the fact).
+Device detection already verified on hardware via `openair devices`.
+
+- **Route + play** — `openair capture "<room>" --handoff` → speakers silent,
+  AirPlay plays, and Windows' output device shows the cable while streaming.
+- **Volume mirror** — slider / volume keys → AirPlay volume follows (~50 ms lag
+  ok). **This is where v1 glitched — verify it's now clean.**
+- **Mute key** — Windows mute → AirPlay silent; press again → returns.
+- **Restore** — Ctrl+C puts the original output device back (check Windows
+  sound settings).
+- **Crash recovery** — kill the process (Task Manager, not Ctrl+C), then confirm
+  the next run warns and `openair restore-audio` fixes it.
+- **Split tunneling** — with a handoff stream running, route one app to the
+  speakers (Settings → System → Sound → Volume mixer); it should play locally
+  while everything else goes to AirPlay.
+- **Multi-room** — two rooms both track the volume; a reconnecting room comes
+  back at the current level.
 
 ## Next Steps
 
