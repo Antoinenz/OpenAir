@@ -35,7 +35,7 @@
 | `capture` | ✅ Done (Win) | Yes | WASAPI loopback verified with live Spotify; PipeWire/CoreAudio later |
 | `ptp-helper` | ⬜ Stub | — | Privileged binary, IPC to main (Linux ports 319/320; not needed on Windows) |
 | `client` | ✅ Done (v1) | Yes | realtime + buffered pipelines, pairing store + auto-dispatch (pair-verify vs transient), event channel |
-| `apps/cli` | ✅ Done (v1) | Yes | scan, `pair` (PIN), tone/play/capture, devices, restore-audio; name resolution, --volume, --buffered, --latency <ms>, --offset <name=ms>, --handoff[-device] (Windows), Ctrl+C |
+| `apps/cli` | ✅ Done (v1) | Yes | scan, `pair` (PIN), tone/play/capture, devices, restore-audio; name resolution, --volume, --buffered, --latency <ms>, --offset <name=ms>, --handoff[-device] (Windows), --bind <ip>, Ctrl+C |
 | `apps/tui` | ⬜ Stub | — | |
 
 ---
@@ -59,7 +59,7 @@
 
 ---
 
-## Awaiting hardware verification (code complete, Sessions 10–12)
+## Awaiting hardware verification (code complete, Sessions 10–13)
 
 - **Pause/resume on silence** — pausing PC audio pauses AirPlay (`rate=0`) and
   auto-resumes on sound. Verify the Apple TV resumes cleanly from rate=0 →
@@ -90,6 +90,18 @@ Device detection already verified on hardware via `openair devices`.
   while everything else goes to AirPlay.
 - **Multi-room** — two rooms both track the volume; a reconnecting room comes
   back at the current level.
+
+### Source-address binding (Session 13) — needs a repro attempt
+
+- **The original failure** — reconnect after a stream on Wi-Fi with virtual
+  adapters present. Previously RST at pair-setup; should now connect every time.
+- **Check the log line** — `connected from selected local address src=192.168.1.x`
+  (DEBUG). If it says "letting the OS choose", no interface matched the
+  receiver's subnet — expected only if the receiver is routed, not on-LAN.
+- **PTP** — `PTP sockets bound bind_ip=192.168.1.x` should match the source
+  address, and the receiver should reach "NQPTP master clock" as usual.
+- **`--bind <ip>`** — forcing a deliberately wrong IP should fail to connect
+  (proves the override is actually applied).
 
 ## Next Steps
 

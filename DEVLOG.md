@@ -4,6 +4,59 @@
 
 ---
 
+## 2026-08-15 — Session 13: the "Shairport refuses us" bug was ours all along
+
+### Symptom
+After a successful stream, reconnecting to Pool Room failed at `pair-setup M1`
+with WSAECONNRESET (10054). Intermittent; an iPhone connected fine from a
+different IP with no "replace what's playing" modal; replugging Ethernet
+"fixed" it. Two hypotheses died on contact with evidence: a stale half-open
+session (disproved — reproduced after a *clean* TEARDOWN) and a Shairport crash
+(disproved — `systemctl` showed 2.5 weeks uptime, no restarts).
+
+### Root cause (found via `shairport-sync -vv`)
+Shairport never rejected us. Its log:
+
+```
+Connection 1: New connection from 192.168.1.108:55629   <- worked
+Connection 2: New connection from 192.168.243.92:51302  <- failed
+Connection 2: handle_pair-setup Content-Length 9
+msg_write_response error 104: "Connection reset by peer".
+```
+
+Different **source IP, different subnet**. Windows was sourcing the connection
+from a virtual adapter (`192.168.243.92`) instead of the real LAN address. The
+SYN reaches the receiver so the connection looks open, but the reply returns to
+an address our socket isn't on and the stack RSTs it. Shairport was the victim.
+It always failed at M1 simply because that's the first response it tries to
+*write*. Nothing appeared in the journal because there was nothing to reject.
+
+Lesson: "the peer is refusing us" was an assumption, not an observation. The
+receiver's own logs settled in one run what three rounds of client-side
+theorising could not.
+
+### Fix
+New `openair_core::net`: enumerate local IPv4 interfaces (`if-addrs`, already in
+the tree via mdns-sd) and pick the one whose subnet contains the receiver,
+longest-prefix-match, falling back to OS routing when nothing matches (the
+receiver may legitimately be routed). All four receiver connections (RTSP
+control, event channel, both buffered-audio paths) now bind to it via
+`connect_from_best_source`, with `--bind <ip>` as a manual override.
+
+Also fixed the same class of bug in PTP: the sockets bound `0.0.0.0`, so the OS
+picked a source per packet. Since the receiver's clock daemon filters PTP on the
+address advertised in SETPEERS, a mis-sourced packet stream could leave it with
+no master clock even when RTSP was healthy.
+
+### Incidental
+Earlier in the session, PTP clock identity was made stable across runs
+(`bd5d106`) — it was derived from time+PID, so every launch announced a brand
+new grandmaster. A genuine spec deviation (clockIdentity is an EUI-64 meant to
+be constant), but *not* related to this bug; recorded here so the two aren't
+conflated later.
+
+---
+
 ## 2026-08-15 — Session 12: `--handoff` v2 — virtual device routing (v1 approach scrapped)
 
 **v1 shipped and was wrong.** Hardware test: volume mirroring worked well, but

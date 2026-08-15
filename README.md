@@ -82,11 +82,17 @@ automatically uses the buffered pipeline.
 | `--offset <name=ms>` | buffered / multi-room | `0` | Per-receiver play delay in milliseconds (`+` later, `-` earlier), e.g. `--offset "pool=+80ms"`. Repeatable; the `name` matches the receiver argument case-insensitively. Compensates downstream amp/DSP delay so rooms line up audibly. |
 | `--handoff` | capture only (**Windows**) | off | Routes system audio through a **virtual audio device** so your speakers go silent and audio only comes out of AirPlay, and **mirrors the Windows master volume** — the slider, volume keys and mute key all control the AirPlay volume. Requires a virtual audio cable (see below). `--volume` sets the initial level until you first touch the Windows volume. Implies `--buffered`. |
 | `--handoff-device <name>` | with `--handoff` | auto | Force a specific output device by name substring (e.g. `--handoff-device "CABLE Input"`) instead of auto-detecting the virtual cable. |
+| `--bind <ip>` | all streaming commands | auto | Force the local IP that receiver connections originate from. OpenAir normally picks the interface on the receiver's subnet automatically; use this only if it guesses wrong on an unusual setup. |
 
 Notes:
 - Flags can appear anywhere in the command line.
 - `--latency` and `--offset` only affect the buffered pipeline; the realtime
   (default single-receiver) pipeline has a protocol-fixed ~2 s latency.
+- On machines with virtual network adapters (VMware, Hyper-V, VPNs, tethering),
+  OpenAir binds to the interface on the receiver's subnet rather than trusting
+  the OS routing table — otherwise the receiver's replies come back to an
+  address we aren't listening on and the session dies at pair-setup. Override
+  with `--bind <ip>` if needed.
 - HomeKit credentials are stored at `%APPDATA%\OpenAir\pairings.json`.
 
 ### `--handoff`: silent speakers + Windows volume control
