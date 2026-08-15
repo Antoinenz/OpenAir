@@ -72,12 +72,38 @@ Subnet matching survives, demoted to what it's actually good for: suggesting
 `--bind` candidates when a connection fails, turning a bare WSAECONNRESET into
 "connecting from X, but Y looks closer to the receiver — try `--bind Y`".
 
+### Postscript: the Wi-Fi failure is NOT ours
+With Ethernet unplugged (Wi-Fi only, `192.168.243.92/16`, gateway `192.168.1.1`),
+a probe from that source address to each receiver:
+
+| Target | Result |
+|--------|--------|
+| `192.168.1.152` Apple TV | OK, 153 bytes |
+| `192.168.1.64` Apple TV | OK, 80 bytes |
+| `192.168.1.106` Shairport Pi | **reset on first data exchange** |
+
+Reproduced with a bare PowerShell socket sending `OPTIONS * RTSP/1.0` — no
+OpenAir involved. Both Apple TVs answer fine across the same mask, gateway and
+source address, so it is neither the subnet nor the routing.
+
+It is specific to the Shairport host: the TCP handshake completes (so the server
+*can* reach `192.168.243.92`), shairport reads the request at application level,
+and then its **response write** is reset. Suspects, server-side: a firewall rule
+scoped to `192.168.1.0/24` (fits — the iPhone and our Ethernet address both
+work, only this source fails), or `rp_filter` dropping packets whose return path
+doesn't match the arrival interface. Root oddity is the Wi-Fi DHCP handing out
+`192.168.243.92/16` against a `192.168.1.1` gateway.
+
+Logged here so this isn't re-diagnosed as an OpenAir bug later.
+
 ### Lesson
-Two premises went unverified here, and each cost a round trip: "the receiver is
-refusing us" (it wasn't — its logs showed it being reset *by us*) and "the OS
-picks the wrong interface" (it doesn't — `Find-NetRoute` and a UDP route lookup
-both agree with reality). Both were checkable in one command on the machine
-involved. Check the cheap authoritative source before building on an inference.
+Three premises went unverified in this session, and each cost a round trip:
+"the receiver is refusing us" (it wasn't — its own logs showed it being reset
+*by us*), "the OS picks the wrong interface" (it doesn't — `Find-NetRoute` and a
+UDP route lookup both agree with reality), and implicitly "this is our bug at
+all" (it isn't — a five-line PowerShell probe reproduced it without our code).
+Each was checkable with one command on a machine already at hand. Check the
+cheap authoritative source before building on an inference.
 
 ### Incidental
 Earlier in the session, PTP clock identity was made stable across runs
