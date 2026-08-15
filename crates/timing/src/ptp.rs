@@ -275,8 +275,21 @@ impl PtpMaster {
     /// Sync/Follow_Up 4 Hz to every peer while we are master; yields to the
     /// BMCA-best foreign master when any receiver runs its own clock.
     pub fn start_multi(peers: &[IpAddr]) -> std::io::Result<Self> {
-        let event = UdpSocket::bind(("0.0.0.0", 319))?;
-        let general = UdpSocket::bind(("0.0.0.0", 320))?;
+        // Bind to the interface that reaches the receivers, not 0.0.0.0.
+        // Our PTP has to arrive from the same address SETPEERS advertised —
+        // the receiver's clock daemon filters on it — so letting the OS pick a
+        // source per packet can silently leave the receiver with no master
+        // clock even when RTSP is healthy.
+        //
+        // Group members are assumed to share a subnet (they must see each
+        // other's clocks anyway), so the first peer decides the interface.
+        let bind_ip = peers
+            .first()
+            .and_then(|p| openair_core::net::source_addr_for(*p))
+            .unwrap_or(IpAddr::from([0, 0, 0, 0]));
+        let event = UdpSocket::bind(SocketAddr::new(bind_ip, 319))?;
+        let general = UdpSocket::bind(SocketAddr::new(bind_ip, 320))?;
+        info!(%bind_ip, "PTP sockets bound");
         let event_dests: Vec<SocketAddr> =
             peers.iter().map(|p| SocketAddr::new(*p, 319)).collect();
         let general_dests: Vec<SocketAddr> =
