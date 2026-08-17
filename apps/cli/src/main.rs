@@ -483,7 +483,7 @@ async fn main() -> Result<()> {
             println!("  (multi-room uses the buffered pipeline — enabling --buffered)");
         }
         if buffered || targets.len() > 1 {
-            openair_client::stream_audio_buffered_multi(targets, source, volume, latency_ms, volume_rx)
+            openair_client::stream_audio_buffered_multi(targets, source, volume, latency_ms, volume_rx, None)
         } else {
             openair_client::stream_audio(targets[0].addr, &targets[0].device_id, source, volume)
         }

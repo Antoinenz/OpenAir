@@ -15,6 +15,7 @@ use openair_audio_rtp::{
     build_audio_packet, build_buffered_audio_block, AudioCipher, ControlChannel, SyncState,
     AAC_44100_F24_2_SSRC,
 };
+use openair_core::metadata::NowPlaying;
 use openair_rtsp::{StreamFormat, StreamSession, TimingConfig};
 use openair_timing::{ptp_now_ns, ptp_ns_to_secs_frac, PtpMaster};
 use tracing::{info, warn};
@@ -364,6 +365,7 @@ pub fn stream_audio_buffered_with_latency(
         volume_db,
         latency_ms,
         None,
+        None,
     )
 }
 
@@ -673,6 +675,36 @@ fn drain_latest_volume(rx: &std::sync::mpsc::Receiver<f32>) -> Option<f32> {
     latest
 }
 
+/// Drain all pending now-playing updates, returning only the most recent.
+/// Track changes are rare, but coalescing keeps a burst from queueing several
+/// round-trips on the RTSP control channel.
+fn drain_latest_metadata(
+    rx: &std::sync::mpsc::Receiver<NowPlaying>,
+) -> Option<NowPlaying> {
+    let mut latest = None;
+    while let Ok(v) = rx.try_recv() {
+        latest = Some(v);
+    }
+    latest
+}
+
+/// Push one now-playing update to a receiver.
+///
+/// Failures are logged and swallowed: a receiver that rejects metadata (or
+/// artwork specifically — Shairport may not accept images) must keep playing
+/// audio. The screen is never worth the stream.
+fn send_metadata(r: &mut BufferedReceiver, np: &NowPlaying, rtptime: u32) {
+    let dmap = openair_rtsp::dmap::encode_now_playing(&np.title, &np.artist, &np.album);
+    if let Err(e) = r.session.set_metadata(&dmap, rtptime) {
+        warn!(receiver = %r.name, "set_metadata failed (continuing): {e}");
+    }
+    if let Some((bytes, mime)) = &np.art {
+        if let Err(e) = r.session.set_artwork(bytes, mime, rtptime) {
+            warn!(receiver = %r.name, "set_artwork failed (continuing): {e}");
+        }
+    }
+}
+
 /// Send the periodic `/feedback` keepalive to every live receiver every ~2 s
 /// (also keeps a paused stream's session from timing out).
 fn service_feedback(group: &mut [BufferedReceiver], last: &mut Instant) {
@@ -713,6 +745,7 @@ pub fn stream_audio_buffered_multi(
     volume_db: Option<f32>,
     latency_ms: u64,
     volume_rx: Option<std::sync::mpsc::Receiver<f32>>,
+    metadata_rx: Option<std::sync::mpsc::Receiver<NowPlaying>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if targets.is_empty() {
         return Err("no receivers given".into());
@@ -847,6 +880,10 @@ pub fn stream_audio_buffered_multi(
     // updates. Tracked so rejoining receivers match the group's current level.
     let mut current_volume_db = volume_db;
 
+    // Latest now-playing info, re-sent to receivers that rejoin after a drop so
+    // a reconnecting room shows the current track instead of a blank screen.
+    let mut current_metadata: Option<NowPlaying> = None;
+
     // Auto-latency: track the minimum play-deadline lead over each window; if
     // it stays under the floor, step the latency up (bump-only, capped).
     let mut min_lead_ns: i64 = i64::MAX;
@@ -867,10 +904,14 @@ pub fn stream_audio_buffered_multi(
             for h in handles.drain(..) {
                 match h.rx.try_recv() {
                     Ok(Ok(prep)) => {
-                        if let Some(br) = finish_reconnect(
+                        if let Some(mut br) = finish_reconnect(
                             &ptp, prep, seq, rtptime, anchor_t_local, anchor_rtptime,
                             current_volume_db, paused,
                         ) {
+                            // Bring the newcomer's screen up to date too.
+                            if let Some(np) = &current_metadata {
+                                send_metadata(&mut br, np, rtptime);
+                            }
                             group.push(br);
                         }
                     }
@@ -904,6 +945,20 @@ pub fn stream_audio_buffered_multi(
                         }
                     }
                 }
+            }
+        }
+
+        // Now-playing metadata: same loop position as volume, so it still runs
+        // on the paused/priming `continue` paths below.
+        if let Some(rx) = &metadata_rx {
+            if let Some(np) = drain_latest_metadata(rx) {
+                info!(title = %np.title, artist = %np.artist, "sending now-playing metadata");
+                for r in group.iter_mut() {
+                    if r.alive {
+                        send_metadata(r, &np, rtptime);
+                    }
+                }
+                current_metadata = Some(np);
             }
         }
 
@@ -1113,6 +1168,21 @@ mod tests {
     fn drain_latest_volume_empty_is_none() {
         let (_tx, rx) = std::sync::mpsc::channel::<f32>();
         assert_eq!(drain_latest_volume(&rx), None);
+    }
+
+    #[test]
+    fn drain_latest_metadata_coalesces_to_newest() {
+        let (tx, rx) = std::sync::mpsc::channel::<NowPlaying>();
+        let mk = |t: &str| NowPlaying {
+            title: t.into(),
+            artist: "A".into(),
+            album: "Al".into(),
+            art: None,
+        };
+        tx.send(mk("first")).unwrap();
+        tx.send(mk("second")).unwrap();
+        assert_eq!(drain_latest_metadata(&rx).unwrap().title, "second");
+        assert!(drain_latest_metadata(&rx).is_none());
     }
 
     #[test]
