@@ -18,7 +18,7 @@ use openair_audio_rtp::{
 use openair_core::metadata::NowPlaying;
 use openair_rtsp::{StreamFormat, StreamSession, TimingConfig};
 use openair_timing::{ptp_now_ns, ptp_ns_to_secs_frac, PtpMaster};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 mod pairings;
 mod source;
@@ -316,6 +316,12 @@ const AUTO_LATENCY_WINDOW: Duration = Duration::from_millis(1000);
 /// Wait this long after a bump before considering another, so the deeper
 /// buffer has time to fill and stabilise before we judge it again.
 const AUTO_LATENCY_COOLDOWN: Duration = Duration::from_secs(5);
+
+/// How often the current track is re-stated to receivers. The first send goes
+/// out before any audio has, and a receiver may ignore metadata for a stream it
+/// has not begun rendering; re-sending is ~90 bytes and keeps a late-joining or
+/// slow-to-start receiver's screen correct.
+const METADATA_RESEND_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Stream audio pulled from `source` to `addr` using AirPlay 2's BUFFERED
 /// pipeline (stream type 103, AAC-LC): pair → SETUP(timing=PTP) →
@@ -695,6 +701,19 @@ fn drain_latest_metadata(
 /// audio. The screen is never worth the stream.
 fn send_metadata(r: &mut BufferedReceiver, np: &NowPlaying, rtptime: u32) {
     let dmap = openair_rtsp::dmap::encode_now_playing(&np.title, &np.artist, &np.album);
+    // Log the exact bundle: the receiver answers 200 OK even when it declines to
+    // display, so the wire bytes are the only way to tell a content problem from
+    // a protocol one.
+    debug!(
+        receiver = %r.name,
+        rtptime,
+        title = %np.title,
+        artist = %np.artist,
+        album = %np.album,
+        bytes = dmap.len(),
+        dmap = %dmap.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+        "DMAP bundle"
+    );
     if let Err(e) = r.session.set_metadata(&dmap, rtptime) {
         warn!(receiver = %r.name, "set_metadata failed (continuing): {e}");
     }
@@ -883,6 +902,7 @@ pub fn stream_audio_buffered_multi(
     // Latest now-playing info, re-sent to receivers that rejoin after a drop so
     // a reconnecting room shows the current track instead of a blank screen.
     let mut current_metadata: Option<NowPlaying> = None;
+    let mut last_metadata_send = Instant::now();
 
     // Auto-latency: track the minimum play-deadline lead over each window; if
     // it stays under the floor, step the latency up (bump-only, capped).
@@ -959,6 +979,21 @@ pub fn stream_audio_buffered_multi(
                     }
                 }
                 current_metadata = Some(np);
+                last_metadata_send = Instant::now();
+            } else if let Some(np) = &current_metadata {
+                // Re-send periodically. The first send happens before a single
+                // audio packet has gone out, and a receiver may reasonably
+                // ignore metadata for a stream it hasn't started rendering.
+                // Re-stating it once playback is established costs ~90 bytes.
+                if last_metadata_send.elapsed() >= METADATA_RESEND_INTERVAL {
+                    info!(title = %np.title, "re-sending now-playing metadata");
+                    for r in group.iter_mut() {
+                        if r.alive {
+                            send_metadata(r, np, rtptime);
+                        }
+                    }
+                    last_metadata_send = Instant::now();
+                }
             }
         }
 
