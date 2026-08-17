@@ -114,7 +114,7 @@ Wire format already hardware-confirmed (title + artist rendered on AppleTV6,2).
 - **Rejoin** — drop and restore a receiver mid-stream; it should show the
   current track, not a blank screen. Also exercises the Session 14 rejoin-anchor
   fix — audio must actually resume.
-- **** — nothing is sent.
+- **`--no-metadata`** — nothing is sent.
 - **Shairport** — accepts or cleanly ignores; audio unaffected either way.
 
 ## Next Steps
