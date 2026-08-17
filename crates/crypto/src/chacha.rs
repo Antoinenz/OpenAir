@@ -23,7 +23,14 @@ pub enum ChaChaError {
     Decrypt,
     #[error("frame too short")]
     FrameTooShort,
+    #[error("plaintext too long for one frame: {0} bytes (max {MAX_FRAME_PLAINTEXT})")]
+    PlaintextTooLong(usize),
 }
+
+/// Largest plaintext one frame can describe, bounded by the 2-byte length
+/// prefix. Anything longer must be split across frames — it cannot simply be
+/// written, because the length field would silently wrap.
+pub const MAX_FRAME_PLAINTEXT: usize = u16::MAX as usize;
 
 /// One directional ChaCha20-Poly1305 channel (write or read).
 pub struct ChaChaChannel {
@@ -42,6 +49,14 @@ impl ChaChaChannel {
     /// Encrypt `plaintext` and return the framed wire bytes:
     /// `uint16_le(len) || ciphertext || tag`.
     pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, ChaChaError> {
+        // Refuse rather than truncate. `len as u16` silently wraps, which
+        // produces a frame whose header disagrees with its body — the peer
+        // reads a short frame, hits garbage, and drops the connection with no
+        // hint as to why. (Observed against an Apple TV when a 176 KB cover
+        // image was sent as one frame.)
+        if plaintext.len() > MAX_FRAME_PLAINTEXT {
+            return Err(ChaChaError::PlaintextTooLong(plaintext.len()));
+        }
         let len_bytes = (plaintext.len() as u16).to_le_bytes();
         let nonce = self.nonce();
         let ct = self

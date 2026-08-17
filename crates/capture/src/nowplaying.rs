@@ -27,9 +27,15 @@ use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITH
 /// How often we sample SMTC.
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Cover art larger than this is skipped. The RTSP control channel also
-/// carries volume and /feedback, so a pathological image must not stall it.
-const MAX_ART_BYTES: usize = 2 * 1024 * 1024;
+/// Cover art larger than this is skipped.
+///
+/// TEMPORARY CEILING. The encrypted RTSP channel frames a body with a 2-byte
+/// length prefix, so one frame carries at most 64 KiB and larger bodies must be
+/// split across frames — which we do not implement yet. Until then, sending a
+/// bigger image kills the session, so we decline rather than break the stream.
+/// Most album art exceeds this, so artwork is usually skipped for now; text
+/// metadata is unaffected. Raise this to ~2 MB once frame chunking lands.
+const MAX_ART_BYTES: usize = 60_000;
 
 /// Re-exported so callers can name the type without depending on `core`
 /// directly. The struct itself lives in `core` so the streaming API stays
