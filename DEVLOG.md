@@ -56,7 +56,49 @@ reference instant is in the past. Now expressed forward — anchor at
 `(rtptime, when that rtptime is due)`, the same schedule stated from the current
 position. Fix is committed; not yet confirmed on hardware.
 
-### Still open: the 30-second drop (and it is a timer)
+### ROOT CAUSE of the 30-second drop: we never answer the event channel
+
+Logging the reverse event channel found it immediately. At every drop the
+receiver closes the **event channel first**, and the data socket dies 40–60 ms
+later:
+
+```
+09:18:57.420  event channel closed by receiver
+09:18:57.480  data write failed ... 10053      (+60 ms)
+09:19:29.751  event channel closed by receiver
+09:19:29.793  data write failed ... 10053      (+42 ms)
+09:20:02.044  event channel closed by receiver
+09:20:02.083  data write failed ... 10053      (+40 ms)
+```
+
+That ordering makes it a deliberate teardown by the receiver, not a network
+fault — which also retires every "the socket stalled" theory.
+
+The channel is **not idle**. Right after RECORD the Apple TV sends ~2518 bytes
+framed exactly like our control channel (`uint16_le(len) || ciphertext || tag`).
+Every message opens `00 04` — little-endian **1024**, a full-size frame:
+
+```
+00045afe1012356c...    00044d258e80a444...
+000458501389e855...    00049f6d567769a6...
+```
+
+So it has been asking us something since the first session, we have been
+connecting the socket and discarding the bytes, and after 30 s of silence it
+hangs up. This is one bug, and it explains the audio interruption, the metadata
+display dying after the first drop, and why Shairport is unaffected.
+
+Two things worth noting about how this was found. The event-channel comment in
+`open_event_channel` has said since Session 8 that "we never send anything; a
+drain thread discards whatever the receiver pushes" — the behaviour was
+*documented* and still not suspected, because it had never caused a visible
+problem. And the diagnostic that cracked it was three lines of logging; it took
+far longer to reach for it than to run it.
+
+**Side finding:** the Apple TV's own frames are 1024-byte plaintext, which
+settles the chunk size for task #21 by observing the peer rather than guessing.
+
+### The 30-second measurements (superseded by the above)
 `data write failed ... (os error 10053)` recurs on a fixed schedule. Measured
 from session start to drop, across one run: **30.03, 30.03, 30.03, 30.06,
 30.03 s** — five consecutive drops within 30 ms, and a *rejoined* session

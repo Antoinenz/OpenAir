@@ -52,7 +52,42 @@
 
 ## Known Issues / Blockers
 
-### 🔴 Apple TV data connection dies every 30 s (blocks metadata display)
+### 🔴 Apple TV tears down after 30 s — we never answer the event channel
+
+**ROOT CAUSE FOUND (2026-08-17).** The Apple TV sends **encrypted protocol
+messages on the reverse event channel** right after RECORD. We connect that
+channel, discard every byte, and never reply. ~30 s later it gives up and kills
+the session.
+
+The receiver closes the **event channel first**, then the data socket 40–60 ms
+later — a deliberate teardown, not a network fault:
+
+```
+09:18:57.420  event channel closed by receiver
+09:18:57.480  data write failed ... 10053      (+60 ms)
+09:19:29.751  event channel closed by receiver
+09:19:29.793  data write failed ... 10053      (+42 ms)
+09:20:02.044  event channel closed by receiver
+09:20:02.083  data write failed ... 10053      (+40 ms)
+```
+
+What it sends: ~2518 bytes of plaintext, framed exactly like our control channel
+(`uint16_le(len) || ciphertext || tag`). Every message starts `00 04` —
+little-endian **1024**, a full-size frame:
+
+```
+00045afe1012356c...    00044d258e80a444...
+000458501389e855...    00049f6d567769a6...
+```
+
+**Fix:** decrypt the event channel (likely the same session keys as the control
+channel), parse what arrives, and respond. Until then the Apple TV drops us
+every 30 s and metadata stops displaying after the first drop.
+
+*Side finding:* the Apple TV's own frames are **1024-byte plaintext**, which
+settles the chunk size for #21 — demonstrated by the peer, not assumed.
+
+<details><summary>Earlier measurements (kept for the record)</summary>
 
 **The single most important open bug.** Reproduced consistently against
 AppleTV6,2 (AirTunes/960.13.1). Measured from session start (RECORD/anchor) to
@@ -91,13 +126,9 @@ without `TEARDOWN`), so ours stopped being the foreground session. A best-effort
 - Artwork — predates any artwork being sent, and occurs with `has_art=false`
 - Source-address selection — happens with the correct LAN source
 
-**Next diagnostic:** we connect the reverse event channel and have always
-*discarded* everything the receiver sends on it. It is now logged in full (text
-+ hex). If the Apple TV is asking us something and giving up ~30 s later, that
-is where the evidence will be. Failing that: check whether the receiver expects a
-periodic `SETRATEANCHORTIME`/rate refresh (we send it once at RECORD and never
-again), and test whether `tone`/`play` also die at 30 s to isolate the RTSP
-session from the capture/handoff path.
+*(That diagnostic is what found the root cause above.)*
+
+</details>
 
 
 
@@ -174,10 +205,12 @@ and real album art is 70–210 KB. Needs multi-frame chunking (task #21).
 
 ## Next Steps
 
-1. **🔴 30 s Apple TV data-connection timeout** (see Known Issues) — highest
-   priority; it interrupts audio every 30 s and blocks metadata display
-2. **#21 encrypted frame chunking** (>64 KiB bodies) — unblocks cover art, and
-   is general correctness: any large RTSP body is currently impossible
+1. **🔴 Answer the event channel** (see Known Issues) — root cause of the 30 s
+   Apple TV teardown; blocks stable audio *and* metadata display. Decrypt the
+   channel, parse the messages, respond.
+2. **#21 encrypted frame chunking** — unblocks cover art, and is general
+   correctness: any RTSP body >64 KiB is currently impossible. Chunk size is now
+   known to be **1024-byte plaintext** (observed from the Apple TV itself).
 3. **Step 9** — hardening (DSCP EF, thread priority, retransmit tuning)
 4. **#19** Pool Room (Shairport) refuses connections from the Wi-Fi subnet —
    server-side, reproducible without OpenAir
