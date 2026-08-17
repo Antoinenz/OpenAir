@@ -31,32 +31,10 @@ const POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// carries volume and /feedback, so a pathological image must not stall it.
 const MAX_ART_BYTES: usize = 2 * 1024 * 1024;
 
-/// What is currently playing on this machine.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NowPlaying {
-    pub title: String,
-    pub artist: String,
-    pub album: String,
-    /// Cover art bytes and its MIME type, if one was available and decodable.
-    pub art: Option<(Vec<u8>, &'static str)>,
-}
-
-impl NowPlaying {
-    /// The identity of a track for change detection. Art is excluded: it is
-    /// fetched only when this triple changes, so it can't participate.
-    fn key(&self) -> (String, String, String) {
-        (
-            self.title.clone(),
-            self.artist.clone(),
-            self.album.clone(),
-        )
-    }
-
-    /// True when there is nothing worth sending.
-    fn is_empty(&self) -> bool {
-        self.title.is_empty() && self.artist.is_empty() && self.album.is_empty()
-    }
-}
+/// Re-exported so callers can name the type without depending on `core`
+/// directly. The struct itself lives in `core` so the streaming API stays
+/// platform-neutral — see `openair_core::metadata`.
+pub use openair_core::metadata::NowPlaying;
 
 #[derive(Debug, Error)]
 pub enum MetadataError {
@@ -234,15 +212,6 @@ fn run(
 mod tests {
     use super::*;
 
-    fn np(title: &str, artist: &str, album: &str) -> NowPlaying {
-        NowPlaying {
-            title: title.into(),
-            artist: artist.into(),
-            album: album.into(),
-            art: None,
-        }
-    }
-
     #[test]
     fn sniffs_jpeg_and_png() {
         assert_eq!(
@@ -260,29 +229,6 @@ mod tests {
         assert_eq!(sniff_image_mime(b"not an image"), None);
         assert_eq!(sniff_image_mime(&[0xFF, 0xD8]), None, "truncated JPEG magic");
         assert_eq!(sniff_image_mime(&[]), None);
-    }
-
-    #[test]
-    fn key_ignores_artwork() {
-        let mut a = np("T", "A", "Al");
-        let b = np("T", "A", "Al");
-        a.art = Some((vec![1, 2, 3], "image/jpeg"));
-        assert_eq!(a.key(), b.key(), "art must not affect track identity");
-    }
-
-    #[test]
-    fn key_distinguishes_each_field() {
-        let base = np("T", "A", "Al");
-        assert_ne!(base.key(), np("T2", "A", "Al").key());
-        assert_ne!(base.key(), np("T", "A2", "Al").key());
-        assert_ne!(base.key(), np("T", "A", "Al2").key());
-    }
-
-    #[test]
-    fn is_empty_only_when_all_text_fields_are_blank() {
-        assert!(np("", "", "").is_empty());
-        assert!(!np("T", "", "").is_empty());
-        assert!(!np("", "A", "").is_empty());
     }
 
     /// Manual check against real SMTC — needs something actually playing, so
