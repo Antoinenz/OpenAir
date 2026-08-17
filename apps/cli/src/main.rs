@@ -85,6 +85,56 @@ mod util {
         raw.split("._airplay").next().unwrap_or(raw).to_string()
     }
 
+    /// Highest `--debug` level we define. Values above this are treated as a
+    /// positional argument, not a level — so `tone x --debug 10` still means
+    /// "10 seconds", which is what someone typing that almost certainly wants.
+    pub const MAX_DEBUG_LEVEL: u8 = 2;
+
+    /// Extracts `--debug [level]`. Bare `--debug` means level 1; an immediately
+    /// following `0`–`2` sets the level explicitly. Absent → level 0.
+    pub fn extract_debug_level(args: &[String]) -> (Vec<String>, u8) {
+        let mut remaining = Vec::with_capacity(args.len());
+        let mut level = 0u8;
+        let mut skip_next = false;
+        for (i, arg) in args.iter().enumerate() {
+            if skip_next {
+                skip_next = false;
+                continue;
+            }
+            if arg == "--debug" {
+                level = 1;
+                if let Some(n) = args.get(i + 1).and_then(|v| v.parse::<u8>().ok()) {
+                    if n <= MAX_DEBUG_LEVEL {
+                        level = n;
+                        skip_next = true;
+                    }
+                }
+                continue;
+            }
+            remaining.push(arg.clone());
+        }
+        (remaining, level)
+    }
+
+    /// Tracing filter directives for a verbosity level.
+    ///
+    /// - **0** (default): quiet. The CLI's own `println!` narration carries the
+    ///   normal story, so only warnings and errors need to reach the console.
+    ///   `mdns_sd` is silenced entirely — its sole output is a spurious
+    ///   "failed to send response of shutdown" error on every clean exit.
+    /// - **1**: our DEBUG plus third-party INFO — the historical default.
+    /// - **2**: our TRACE, including the full decrypted body of everything the
+    ///   receiver sends. Third-party crates stay at INFO deliberately: raising
+    ///   them to DEBUG buries the interesting traffic under ~55k lines of mDNS
+    ///   internals, which is the opposite of useful.
+    pub fn debug_directives(level: u8) -> &'static [&'static str] {
+        match level {
+            0 => &["openair=warn", "warn", "mdns_sd=off"],
+            1 => &["openair=debug", "info"],
+            _ => &["openair=trace", "info"],
+        }
+    }
+
     /// Format a Unix timestamp as `YYYYMMDD-HHMMSS` (UTC) for a log filename.
     ///
     /// UTC deliberately: the log lines themselves are UTC, so a filename in the
@@ -277,6 +327,83 @@ mod util {
         }
 
         #[test]
+        fn extract_debug_level_bare_flag_is_level_one() {
+            let args = vec!["capture".into(), "test".into(), "--debug".into()];
+            let (rest, level) = extract_debug_level(&args);
+            assert_eq!(rest, vec!["capture".to_string(), "test".to_string()]);
+            assert_eq!(level, 1);
+        }
+
+        #[test]
+        fn extract_debug_level_absent_is_zero() {
+            let args = vec!["capture".to_string(), "test".to_string()];
+            let (rest, level) = extract_debug_level(&args);
+            assert_eq!(rest, args);
+            assert_eq!(level, 0);
+        }
+
+        #[test]
+        fn extract_debug_level_explicit_level_is_consumed() {
+            let args = vec!["capture".into(), "test".into(), "--debug".into(), "2".into()];
+            let (rest, level) = extract_debug_level(&args);
+            assert_eq!(rest, vec!["capture".to_string(), "test".to_string()]);
+            assert_eq!(level, 2);
+        }
+
+        /// `tone x --debug 10` must still mean "10 seconds": a number above the
+        /// highest level we define is a positional, not a verbosity.
+        #[test]
+        fn extract_debug_level_leaves_out_of_range_numbers_as_positional() {
+            let args = vec!["tone".into(), "test".into(), "--debug".into(), "10".into()];
+            let (rest, level) = extract_debug_level(&args);
+            assert_eq!(
+                rest,
+                vec!["tone".to_string(), "test".to_string(), "10".to_string()]
+            );
+            assert_eq!(level, 1, "bare --debug still enables level 1");
+        }
+
+        #[test]
+        fn extract_debug_level_non_numeric_next_arg_is_untouched() {
+            let args = vec!["capture".into(), "--debug".into(), "--handoff".into()];
+            let (rest, level) = extract_debug_level(&args);
+            assert_eq!(rest, vec!["capture".to_string(), "--handoff".to_string()]);
+            assert_eq!(level, 1);
+        }
+
+        #[test]
+        fn debug_directives_get_progressively_louder() {
+            assert_eq!(debug_directives(0)[0], "openair=warn");
+            assert_eq!(debug_directives(1)[0], "openair=debug");
+            assert_eq!(debug_directives(2)[0], "openair=trace");
+            // Anything above the max saturates rather than falling back to quiet.
+            assert_eq!(debug_directives(9)[0], "openair=trace");
+        }
+
+        /// Raising third-party crates to DEBUG buries the traffic we care about
+        /// under tens of thousands of mDNS lines, so no level may do it.
+        #[test]
+        fn debug_directives_never_raise_third_party_above_info() {
+            for level in 0..=3 {
+                for d in debug_directives(level) {
+                    if !d.starts_with("openair") {
+                        assert!(
+                            !d.contains("debug") && !d.contains("trace"),
+                            "level {level} directive {d:?} would flood the log"
+                        );
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn quiet_level_silences_the_spurious_mdns_shutdown_error() {
+            assert!(debug_directives(0).contains(&"mdns_sd=off"));
+            // It should come back as soon as any debugging is asked for.
+            assert!(!debug_directives(1).contains(&"mdns_sd=off"));
+        }
+
+        #[test]
         fn timestamp_name_formats_known_epochs() {
             assert_eq!(timestamp_name(0), "19700101-000000");
             // 2001-09-09T01:46:40Z — the classic 1e9 epoch second.
@@ -448,12 +575,22 @@ fn resolve_receivers(
 /// A file copy matters because the interesting bugs here only show up in a
 /// full run's log — the 30 s Apple TV teardown was found by comparing event
 /// ordering across runs, which is painful to do from a scrollback buffer.
-fn init_logging(to_file: bool) -> Result<Option<std::path::PathBuf>> {
+fn init_logging(debug_level: u8, to_file: bool) -> Result<Option<std::path::PathBuf>> {
     use tracing_subscriber::prelude::*;
 
-    let filter = EnvFilter::from_default_env()
-        .add_directive("openair=debug".parse()?)
-        .add_directive("info".parse()?);
+    let build_filter = |level: u8| -> Result<EnvFilter> {
+        let mut filter = EnvFilter::from_default_env();
+        for directive in util::debug_directives(level) {
+            filter = filter.add_directive(directive.parse()?);
+        }
+        Ok(filter)
+    };
+
+    let console_filter = build_filter(debug_level)?;
+    // The log file is for reading a run after the fact, so it stays detailed
+    // even when the console is quiet — a clean terminal and a complete log at
+    // the same time. `--debug 2` raises the file too.
+    let file_filter = build_filter(debug_level.max(1))?;
 
     let path = if to_file {
         let dir = std::path::PathBuf::from("logs");
@@ -468,7 +605,8 @@ fn init_logging(to_file: bool) -> Result<Option<std::path::PathBuf>> {
     };
 
     // `Option<Layer>` is itself a Layer, so the file sink can be absent without
-    // the two branches having different subscriber types.
+    // the two branches having different subscriber types. Each layer carries
+    // its own filter so console and file verbosity are independent.
     let file_layer = match &path {
         Some(p) => {
             let file = std::fs::File::create(p)?;
@@ -476,17 +614,15 @@ fn init_logging(to_file: bool) -> Result<Option<std::path::PathBuf>> {
                 tracing_subscriber::fmt::layer()
                     // No colour codes: this is read by humans and by grep.
                     .with_ansi(false)
-                    .with_writer(move || {
-                        file.try_clone().expect("clone log file handle")
-                    }),
+                    .with_writer(move || file.try_clone().expect("clone log file handle"))
+                    .with_filter(file_filter),
             )
         }
         None => None,
     };
 
     tracing_subscriber::registry()
-        .with(filter)
-        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::fmt::layer().with_filter(console_filter))
         .with(file_layer)
         .init();
 
@@ -532,7 +668,8 @@ async fn main() -> Result<()> {
     // Parsed before logging starts so the flag itself never reaches the
     // subcommand matching below.
     let (raw_args, want_log) = extract_flag(&raw_args, "--log");
-    let log_path = init_logging(want_log)?;
+    let (raw_args, debug_level) = util::extract_debug_level(&raw_args);
+    let log_path = init_logging(debug_level, want_log)?;
     if let Some(p) = &log_path {
         println!("📝 logging this run to {}", p.display());
     }

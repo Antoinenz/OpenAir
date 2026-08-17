@@ -84,7 +84,8 @@ automatically uses the buffered pipeline.
 | `--handoff-device <name>` | with `--handoff` | auto | Force a specific output device by name substring (e.g. `--handoff-device "CABLE Input"`) instead of auto-detecting the virtual cable. |
 | `--bind <ip>` | all streaming commands | auto | Force the local IP that receiver connections originate from. OpenAir normally picks the interface on the receiver's subnet automatically; use this only if it guesses wrong on an unusual setup. |
 | `--no-metadata` | capture (**Windows**) | off | Stop sending now-playing info. By default `capture` reads the current track from Windows (title, artist, album, cover art) and pushes it to the receiver — an Apple TV shows it on its now-playing screen. |
-| `--log` | any command | off | Also write this run's full log (INFO + DEBUG) to `logs/openair-YYYYMMDD-HHMMSS.log`, alongside the normal console output. Plain text, no colour codes, UTC timestamps — greppable and diffable between runs. Invaluable for reporting a bug: attach the file instead of pasting a scrollback. |
+| `--log` | any command | off | Also write this run's log to `logs/openair-YYYYMMDD-HHMMSS.log`. Plain text, no colour codes, UTC timestamps — greppable and diffable between runs. The file always keeps full detail even when the console is quiet, so you get a clean terminal *and* a complete log. Invaluable for reporting a bug: attach the file instead of pasting a scrollback. |
+| `--debug [0-2]` | any command | `0` | Console verbosity. `0` (default) shows only the normal narration plus warnings and errors. `--debug` (= `1`) adds protocol detail — pairing, SETUP, anchors, PTP. `--debug 2` adds everything the receiver sends, including the full decrypted body of each event-channel message. Bare `--debug` means level 1, so `tone x --debug 10` still plays for 10 seconds. |
 
 Notes:
 - Flags can appear anywhere in the command line.

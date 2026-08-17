@@ -18,7 +18,7 @@ use openair_audio_rtp::{
 use openair_core::metadata::NowPlaying;
 use openair_rtsp::{StreamFormat, StreamSession, TimingConfig};
 use openair_timing::{ptp_now_ns, ptp_ns_to_secs_frac, PtpMaster};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 mod pairings;
 mod source;
@@ -174,6 +174,15 @@ fn event_reader(mut rdr: TcpStream, mut wtr: TcpStream, event_keys: Option<([u8;
                         .next()
                         .unwrap_or_default()
                         .to_string();
+                    // At `--debug 2`, dump everything the receiver said. The
+                    // body is a binary plist, so log printable text and hex
+                    // side by side rather than guessing which is readable.
+                    trace!(
+                        bytes = request.len(),
+                        text = %String::from_utf8_lossy(&request),
+                        hex = %request.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                        "event message (full)"
+                    );
                     let response = event_response(&request);
                     match tx.encrypt(&response) {
                         Ok(framed) => match std::io::Write::write_all(&mut wtr, &framed) {
