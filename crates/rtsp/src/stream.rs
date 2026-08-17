@@ -422,6 +422,11 @@ impl StreamSession {
         self.conn.peer_ip()
     }
 
+    /// `(events_write, events_read)` for the reverse event channel.
+    pub fn event_keys(&self) -> Option<([u8; 32], [u8; 32])> {
+        self.conn.event_keys()
+    }
+
     fn request_plist(
         &mut self,
         method: &str,

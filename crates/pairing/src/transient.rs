@@ -42,6 +42,26 @@ pub type SrpStepResult = Result<(Vec<u8>, Vec<u8>, Vec<u8>), PairingError>;
 pub struct PairingKeys {
     pub write: [u8; 32],
     pub read: [u8; 32],
+    /// Keys for the reverse *event* channel, derived from the same shared
+    /// secret but with the `Events-Salt` label set. Apple receivers push
+    /// encrypted messages to us on that channel; without these we cannot read
+    /// them, and an Apple TV tears the session down after ~30 s of silence.
+    pub events_write: [u8; 32],
+    pub events_read: [u8; 32],
+}
+
+/// Derive the four channel keys from a shared secret.
+///
+/// Control and Events use the identical HKDF construction, differing only in
+/// the salt/info labels — so they are derived together to keep the two label
+/// sets visibly parallel.
+pub(crate) fn derive_channel_keys(shared: &[u8]) -> PairingKeys {
+    PairingKeys {
+        write: hkdf_derive(shared, b"Control-Salt", b"Control-Write-Encryption-Key"),
+        read: hkdf_derive(shared, b"Control-Salt", b"Control-Read-Encryption-Key"),
+        events_write: hkdf_derive(shared, b"Events-Salt", b"Events-Write-Encryption-Key"),
+        events_read: hkdf_derive(shared, b"Events-Salt", b"Events-Read-Encryption-Key"),
+    }
 }
 
 /// The pairing handshake, broken into two steps matching the two HTTP round-trips.
@@ -141,11 +161,8 @@ impl TransientPairing {
         // once M1 carries the correct Transient flag.
         self.client.verify_server(m1_proof, m2_proof, session_key)?;
 
-        // Derive per-direction RTSP channel keys from the session key K.
-        let write = hkdf_derive(session_key, b"Control-Salt", b"Control-Write-Encryption-Key");
-        let read  = hkdf_derive(session_key, b"Control-Salt", b"Control-Read-Encryption-Key");
-
-        Ok(PairingKeys { write, read })
+        // Derive per-direction RTSP + event channel keys from session key K.
+        Ok(derive_channel_keys(session_key))
     }
 }
 

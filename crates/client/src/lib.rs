@@ -53,38 +53,16 @@ fn connect_session(
 /// used to receive playback events"). Without it RECORD stalls until our
 /// read timeout. We never send anything; a drain thread discards whatever
 /// the receiver pushes. Shairport doesn't need this — warn-and-continue.
-fn open_event_channel(peer_ip: std::net::IpAddr, event_port: u16) -> Option<TcpStream> {
+fn open_event_channel(
+    peer_ip: std::net::IpAddr,
+    event_port: u16,
+    event_keys: Option<([u8; 32], [u8; 32])>,
+) -> Option<TcpStream> {
     match openair_core::net::connect_from_best_source(SocketAddr::new(peer_ip, event_port)) {
         Ok(s) => {
             s.set_nodelay(true).ok();
-            if let Ok(mut rdr) = s.try_clone() {
-                std::thread::spawn(move || {
-                    let mut buf = [0u8; 2048];
-                    loop {
-                        match std::io::Read::read(&mut rdr, &mut buf) {
-                            Ok(0) => {
-                                warn!("event channel closed by receiver");
-                                break;
-                            }
-                            Ok(n) => {
-                                // We have never answered anything here. If the
-                                // receiver is asking us something and giving up
-                                // ~30 s later, this is where the evidence is.
-                                let head = &buf[..n.min(256)];
-                                warn!(
-                                    bytes = n,
-                                    text = %String::from_utf8_lossy(head),
-                                    hex = %head.iter().map(|b| format!("{b:02x}")).collect::<String>(),
-                                    "event channel data from receiver"
-                                );
-                            }
-                            Err(e) => {
-                                warn!("event channel read error: {e}");
-                                break;
-                            }
-                        }
-                    }
-                });
+            if let Ok(rdr) = s.try_clone() {
+                std::thread::spawn(move || event_reader(rdr, event_keys));
             }
             info!(event_port, "event channel connected");
             Some(s)
@@ -93,6 +71,117 @@ fn open_event_channel(peer_ip: std::net::IpAddr, event_port: u16) -> Option<TcpS
             warn!("event channel connect failed (continuing): {e}");
             None
         }
+    }
+}
+
+/// Read the reverse event channel, decrypting what the receiver pushes.
+///
+/// The receiver frames these exactly like the RTSP control channel
+/// (`uint16_le(len) || ciphertext || 16-byte tag`) but with keys derived under
+/// the `Events-Salt` label set. Which direction's key applies is the one thing
+/// the reverse-engineering notes are ambiguous about, so we try `events_read`
+/// first and fall back to `events_write`, logging whichever authenticates —
+/// the Poly1305 tag makes a wrong guess fail loudly rather than silently
+/// produce garbage.
+fn event_reader(mut rdr: TcpStream, event_keys: Option<([u8; 32], [u8; 32])>) {
+    use openair_crypto::ChaChaChannel;
+
+    let mut ciphers = event_keys.map(|(w, r)| {
+        // (label, channel) — first that authenticates wins for the session.
+        [
+            ("events_read", ChaChaChannel::new(&r)),
+            ("events_write", ChaChaChannel::new(&w)),
+        ]
+    });
+    let mut chosen: Option<usize> = None;
+    let mut pending: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 4096];
+
+    loop {
+        match std::io::Read::read(&mut rdr, &mut buf) {
+            Ok(0) => {
+                warn!("event channel closed by receiver");
+                break;
+            }
+            Ok(n) => {
+                pending.extend_from_slice(&buf[..n]);
+                // Frames can span reads, so consume only whole ones.
+                while pending.len() >= 2 {
+                    let len = u16::from_le_bytes([pending[0], pending[1]]) as usize;
+                    let frame_len = 2 + len + 16;
+                    if pending.len() < frame_len {
+                        break;
+                    }
+                    let frame: Vec<u8> = pending.drain(..frame_len).collect();
+                    decrypt_event_frame(&frame, ciphers.as_mut(), &mut chosen);
+                }
+            }
+            Err(e) => {
+                warn!("event channel read error: {e}");
+                break;
+            }
+        }
+    }
+}
+
+/// Decrypt one event frame and log it. Once a key direction authenticates we
+/// stick with it — the ChaCha counters are per-direction and must stay in step.
+fn decrypt_event_frame(
+    frame: &[u8],
+    ciphers: Option<&mut [(&'static str, openair_crypto::ChaChaChannel); 2]>,
+    chosen: &mut Option<usize>,
+) {
+    let Some(ciphers) = ciphers else {
+        warn!(bytes = frame.len(), "event frame (no keys available)");
+        return;
+    };
+
+    // Already know which direction works: stay on it.
+    if let Some(i) = *chosen {
+        match ciphers[i].1.decrypt(frame) {
+            Ok(plain) => log_event_message(&plain),
+            Err(e) => warn!(key = ciphers[i].0, "event frame failed to decrypt: {e}"),
+        }
+        return;
+    }
+
+    for (i, (label, cipher)) in ciphers.iter_mut().enumerate() {
+        // Trial-decrypt on a throwaway channel so a failed attempt doesn't
+        // advance the real one's nonce counter.
+        let mut probe = openair_crypto::ChaChaChannel::new(&[0u8; 32]);
+        std::mem::swap(&mut probe, cipher);
+        let result = probe.decrypt(frame);
+        std::mem::swap(&mut probe, cipher);
+        if let Ok(plain) = result {
+            // Re-run on the real channel to advance its counter.
+            let _ = cipher.decrypt(frame);
+            info!(key = label, "event channel decrypted — key direction found");
+            *chosen = Some(i);
+            log_event_message(&plain);
+            return;
+        }
+    }
+    warn!(
+        bytes = frame.len(),
+        "event frame did not authenticate with either Events-Salt key"
+    );
+}
+
+/// Log a decrypted event message as text when it looks like text, hex otherwise.
+fn log_event_message(plain: &[u8]) {
+    let printable = plain
+        .iter()
+        .filter(|b| b.is_ascii_graphic() || b.is_ascii_whitespace())
+        .count();
+    if printable * 10 >= plain.len() * 8 {
+        info!(bytes = plain.len(), text = %String::from_utf8_lossy(plain), "EVENT MESSAGE");
+    } else {
+        let head = &plain[..plain.len().min(256)];
+        info!(
+            bytes = plain.len(),
+            hex = %head.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            "EVENT MESSAGE (binary)"
+        );
     }
 }
 
@@ -165,7 +254,7 @@ pub fn stream_audio(
 
     // Reverse event channel — must be connected before RECORD on Apple
     // receivers (held open for the whole session).
-    let _event = open_event_channel(peer_ip, ports.event_port);
+    let _event = open_event_channel(peer_ip, ports.event_port, session.event_keys());
 
     // Real Apple receivers need SETPEERS to know which clock to monitor;
     // Shairport ignores it (warn-and-continue keeps older receivers happy).
@@ -461,7 +550,7 @@ fn prepare_receiver(
     let peer_ip = session.peer_ip();
     session.setup_timing(TimingConfig::Ptp)?;
     session.setup_stream(StreamFormat::AacBuffered, control.port)?;
-    let event = open_event_channel(peer_ip, session.ports.event_port);
+    let event = open_event_channel(peer_ip, session.ports.event_port, session.event_keys());
     if let Err(e) = session.set_peers() {
         warn!("SETPEERS failed (continuing): {e}");
     }
@@ -814,7 +903,7 @@ pub fn stream_audio_buffered_multi(
             let peer_ip = session.peer_ip();
             session.setup_timing(TimingConfig::Ptp)?;
             session.setup_stream(StreamFormat::AacBuffered, control.port)?;
-            let event = open_event_channel(peer_ip, session.ports.event_port);
+            let event = open_event_channel(peer_ip, session.ports.event_port, session.event_keys());
             if let Err(e) = session.set_peers() {
                 warn!("SETPEERS failed (continuing): {e}");
             }

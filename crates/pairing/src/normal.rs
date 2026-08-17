@@ -399,9 +399,7 @@ impl PairVerify {
         let shared = self
             .shared
             .ok_or(PairingError::CryptoFailure("no shared secret (M2 not processed)"))?;
-        let write = hkdf_derive(&shared, b"Control-Salt", b"Control-Write-Encryption-Key");
-        let read = hkdf_derive(&shared, b"Control-Salt", b"Control-Read-Encryption-Key");
-        Ok(PairingKeys { write, read })
+        Ok(crate::transient::derive_channel_keys(&shared))
     }
 }
 

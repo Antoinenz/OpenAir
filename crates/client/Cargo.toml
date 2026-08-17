@@ -10,6 +10,7 @@ openair-core = { path = "../core" }
 openair-discovery = { path = "../discovery" }
 openair-pairing = { path = "../pairing" }
 openair-rtsp = { path = "../rtsp" }
+openair-crypto = { path = "../crypto" }
 openair-audio-codec = { path = "../audio-codec" }
 openair-audio-rtp = { path = "../audio-rtp" }
 openair-timing = { path = "../timing" }

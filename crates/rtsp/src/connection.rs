@@ -21,6 +21,8 @@ pub struct RtspConnection {
     device_id: String,
     session_id: String,
     pub encrypt: Option<(ChaChaChannel, ChaChaChannel)>, // (write, read)
+    /// (events_write, events_read) for the reverse event channel.
+    event_keys: Option<([u8; 32], [u8; 32])>,
 }
 
 impl RtspConnection {
@@ -43,6 +45,7 @@ impl RtspConnection {
             device_id: device_id.to_string(),
             session_id: new_session_id(),
             encrypt: None,
+            event_keys: None,
         })
     }
 
@@ -65,6 +68,18 @@ impl RtspConnection {
             ChaChaChannel::new(write_key),
             ChaChaChannel::new(read_key),
         ));
+    }
+
+    /// Remember the reverse event channel's keys so the caller can decrypt what
+    /// the receiver pushes there. Stored rather than used here because the
+    /// event channel is a separate socket owned by the client layer.
+    pub fn set_event_keys(&mut self, write_key: [u8; 32], read_key: [u8; 32]) {
+        self.event_keys = Some((write_key, read_key));
+    }
+
+    /// `(events_write, events_read)` if pairing completed, else `None`.
+    pub fn event_keys(&self) -> Option<([u8; 32], [u8; 32])> {
+        self.event_keys
     }
 
     /// Send an RTSP request and return the raw response bytes.

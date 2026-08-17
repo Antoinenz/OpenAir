@@ -72,6 +72,7 @@ pub fn pair(addr: SocketAddr, device_id: &str) -> Result<RtspConnection, Session
     info!("verifying M4 and deriving channel keys");
     let keys = pairing.process_m4(m4_body, &m1_proof, &session_key)?;
     conn.enable_encryption(&keys.write, &keys.read);
+    conn.set_event_keys(keys.events_write, keys.events_read);
     info!("encrypted channel established");
     Ok(conn)
 }
@@ -175,6 +176,7 @@ pub fn pair_verify(
 
     let keys = pv.process_m4(connection::extract_body(&m4_raw))?;
     conn.enable_encryption(&keys.write, &keys.read);
+    conn.set_event_keys(keys.events_write, keys.events_read);
     info!("encrypted channel established (pair-verify)");
     Ok(conn)
 }
