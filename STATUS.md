@@ -52,6 +52,55 @@
 
 ## Known Issues / Blockers
 
+### 🔴 Apple TV data connection dies every 30 s (blocks metadata display)
+
+**The single most important open bug.** Reproduced consistently against
+AppleTV6,2 (AirTunes/960.13.1). Measured from session start (RECORD/anchor) to
+`data write failed ... (os error 10053)`:
+
+| Session | Delta |
+|---------|-------|
+| 08:59 initial | 30.03 s |
+| 09:00 rejoin 1 | 30.03 s |
+| 09:00 rejoin 2 | 30.03 s |
+| 09:01 rejoin 3 | 30.06 s |
+| 09:01 rejoin 4 | 30.03 s |
+
+Five consecutive drops within 30 ms of each other, and a *rejoined* session
+restarts the clock. This is a fixed timeout, not packet loss.
+
+**Only the data socket dies.** The RTSP control connection stays healthy
+throughout — `/feedback` runs every 2 s and never fails across any drop. So the
+receiver is closing the buffered-audio TCP connection specifically. Audio
+recovers on reconnect, so the user hears a ~2 s gap every 30 s.
+
+**Metadata display is downstream of this.** After restarting the Apple TV:
+- first-ever session → title/artist **displayed** ✅
+- after the 30 s drop and rejoin → accepted (200 OK), **never displays again**
+- restarting OpenAir does not help; only restarting the *receiver* does
+
+So metadata only displays on a session that has never dropped. Leading
+explanation: every drop orphaned a session on the receiver (we abandoned it
+without `TEARDOWN`), so ours stopped being the foreground session. A best-effort
+`TEARDOWN` on the drop path is now sent — unverified whether it restores display.
+
+**Not the cause** (each ruled out by evidence, not reasoning):
+- DMAP encoding — hex decoded by hand and verified correct; byte-structure is
+  identical to a bundle that *did* display
+- Wi-Fi vs Ethernet — happens identically on both
+- Artwork — predates any artwork being sent, and occurs with `has_art=false`
+- Source-address selection — happens with the correct LAN source
+
+**Next diagnostic:** we connect the reverse event channel and have always
+*discarded* everything the receiver sends on it. It is now logged in full (text
++ hex). If the Apple TV is asking us something and giving up ~30 s later, that
+is where the evidence will be. Failing that: check whether the receiver expects a
+periodic `SETRATEANCHORTIME`/rate refresh (we send it once at RECORD and never
+again), and test whether `tone`/`play` also die at 30 s to isolate the RTSP
+session from the capture/handoff path.
+
+
+
 - Timeline offset to a foreign grandmaster is captured once at session start; sender/receiver
   crystal drift (~ppm) accumulates over very long sessions (hours). Fine for typical use.
 - Bare `openair` scan mode still tries Transient against everything (does not consult the
@@ -104,10 +153,16 @@ Device detection already verified on hardware via `openair devices`.
 
 ### Now-playing metadata (Windows, Session 14)
 
-Wire format already hardware-confirmed (title + artist rendered on AppleTV6,2).
+Wire format hardware-confirmed: title + artist rendered on AppleTV6,2 on a
+freshly-restarted receiver. **Currently blocked by the 30 s drop above** — after
+the first drop the receiver accepts metadata but stops displaying it.
+
+**Cover art is currently always skipped** (`cover art too large — skipping`).
+The encrypted RTSP frame header is 2 bytes, so one frame carries at most 64 KiB
+and real album art is 70–210 KB. Needs multi-frame chunking (task #21).
 
 - **Text** — play a track; title/artist/album appear on the Apple TV.
-- **Cover art** — the album image appears alongside (probe covered text only).
+- **Cover art** — blocked on #21; expect it to be skipped with a WARN for now.
 - **Track change** — skip; the display updates within ~1 s.
 - **No spam** — pausing/resuming must not re-send; expect one
   "sending now-playing metadata" log line per track.
@@ -119,10 +174,15 @@ Wire format already hardware-confirmed (title + artist rendered on AppleTV6,2).
 
 ## Next Steps
 
-1. **Step 9** — hardening (DSCP EF, thread priority, retransmit tuning)
-3. Linux capture (PipeWire) + ptp-helper for privileged ports
-4. #15 metadata to receiver (artist/track/cover) — deferred
-5. HomePod hardware test when available; realtime-ALAC multi-room (buffered-only today)
+1. **🔴 30 s Apple TV data-connection timeout** (see Known Issues) — highest
+   priority; it interrupts audio every 30 s and blocks metadata display
+2. **#21 encrypted frame chunking** (>64 KiB bodies) — unblocks cover art, and
+   is general correctness: any large RTSP body is currently impossible
+3. **Step 9** — hardening (DSCP EF, thread priority, retransmit tuning)
+4. **#19** Pool Room (Shairport) refuses connections from the Wi-Fi subnet —
+   server-side, reproducible without OpenAir
+5. Linux capture (PipeWire) + ptp-helper for privileged ports
+6. HomePod hardware test when available; realtime-ALAC multi-room (buffered-only today)
 
 ---
 

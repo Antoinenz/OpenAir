@@ -56,14 +56,38 @@ reference instant is in the past. Now expressed forward — anchor at
 `(rtptime, when that rtptime is due)`, the same schedule stated from the current
 position. Fix is committed; not yet confirmed on hardware.
 
-### Still open
-`data write failed ... (os error 10053)` after ~30 s of good playback on
-Ethernet — the *local* stack aborting an established connection, typically the
-peer going quiet until retransmission times out. Hypothesis: the receiver
-stopped consuming, the TCP window filled, and the writer thread's `write_all`
-blocked until Windows gave up; `queue()` has a 1 s stall tolerance but the
-writer thread itself does not. A write timeout on the data socket would turn
-that into a clean drop. Did not recur on Wi-Fi. Tracked as task #20.
+### Still open: the 30-second drop (and it is a timer)
+`data write failed ... (os error 10053)` recurs on a fixed schedule. Measured
+from session start to drop, across one run: **30.03, 30.03, 30.03, 30.06,
+30.03 s** — five consecutive drops within 30 ms, and a *rejoined* session
+restarts the clock. Only the data socket dies; the RTSP control connection stays
+healthy throughout (`/feedback` every 2 s never fails).
+
+I got this wrong twice before landing on it. First I proposed "TCP window filled
+and `write_all` blocked", which a punctual timeout rules out. Then, on seeing a
+single 18.4 s outlier, I *retracted* the timer theory — when that run had its own
+explanation (a foreign PTP master announce 0.11 s earlier). Two data points were
+too few to assert it; one contrary point was too few to withdraw it. Five now
+settle it.
+
+**Metadata display turned out to be downstream of this.** After restarting the
+Apple TV, the first-ever session displayed title/artist correctly; after the
+30 s drop and rejoin it was still accepted (200 OK) but never displayed again,
+and restarting OpenAir didn't help — only restarting the receiver did. So
+metadata only displays on a session that has never dropped. Best guess: we
+abandoned dropped sessions without `TEARDOWN`, orphaning one on the receiver
+every time. Now sent best-effort on the drop path (the control connection is
+still alive at that point), though whether it restores display is unverified.
+
+Ruled out along the way, each by evidence rather than argument: DMAP encoding
+(hex decoded by hand, byte-identical in structure to a bundle that *did*
+display), Wi-Fi vs Ethernet (identical on both), artwork (predates it), and
+source-address selection.
+
+Next diagnostic committed: we have always *discarded* everything the receiver
+sends on the reverse event channel. It is now logged in full. If the Apple TV is
+asking us something and giving up 30 s later, that is where it will show.
+Tracked as task #20.
 
 ---
 
