@@ -44,7 +44,24 @@ that gap and is the last obvious "feels like real AirPlay" gap for v1.
 - **DMAP framing** is 4-byte ASCII tag + 4-byte big-endian length + payload,
   nested for containers.
 
-### ⚠️ Load-bearing uncertainty — probe before building
+## ✅ Confirmed wire format (hardware-verified 2026-08-17)
+
+Probed against **AppleTV6,2 (AirTunes/960.13.1)** mid-stream. The format this
+design assumed is correct — no iteration was needed:
+
+- `SET_PARAMETER` with `Content-Type: application/x-dmap-tagged` and
+  `RTP-Info: rtptime=<n>` → **200 OK**
+- Body: `mlit` container wrapping `minm` (title), `asar` (artist),
+  `asal` (album) — 90 bytes for the probe strings
+- **Title and artist rendered on the Apple TV's screen.** Album art was not
+  part of the probe.
+
+Variants 2 (bare items, no container) and 3 (`mlit` + leading `mikd`) were
+prepared but never needed. `encode_now_playing` stands as written.
+
+Metadata is cleared from the receiver's screen when the session drops.
+
+### ⚠️ Load-bearing uncertainty — probe before building (RESOLVED, see above)
 
 The DMAP **tag set and container framing** come from reverse-engineering notes,
 not a specification we can check. The tag/length/payload framing is well
