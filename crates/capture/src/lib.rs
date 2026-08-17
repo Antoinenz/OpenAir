@@ -16,6 +16,10 @@ use tracing::warn;
 #[cfg(windows)]
 pub mod handoff;
 
+/// Windows "now playing" metadata (SMTC), sent to the receiver's screen.
+#[cfg(windows)]
+pub mod nowplaying;
+
 #[derive(Debug, Error)]
 pub enum CaptureError {
     #[error("no default output device available")]

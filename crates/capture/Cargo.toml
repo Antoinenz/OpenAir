@@ -26,4 +26,8 @@ windows = { version = "0.54", features = [
     "Win32_Media_Audio_Endpoints",
     "Win32_Devices_FunctionDiscovery",
     "Win32_UI_Shell_PropertiesSystem",
+    # WinRT namespaces for now-playing metadata (SMTC + thumbnail streams).
+    "Foundation",
+    "Media_Control",
+    "Storage_Streams",
 ] }
