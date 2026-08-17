@@ -535,7 +535,14 @@ fn finish_reconnect(
         warn!(receiver = %br.name, "rejoin RECORD failed: {e}");
         return None;
     }
-    if let Err(e) = anchor_receiver(ptp, &mut br, anchor_t_local, anchor_rtptime) {
+    // Express the group's anchor line at the CURRENT position rather than at
+    // its origin. Both describe the same line, but anchoring at
+    // (anchor_rtptime, anchor_t_local) means telling a receiver that joins 30 s
+    // in "position 0 plays 30 s ago" — a reference instant in the past, which
+    // receivers can reject or mishandle. Anchoring at (rtptime, when rtptime is
+    // due) is the same schedule stated forward.
+    let play_at = play_deadline_ns(anchor_t_local, anchor_rtptime, rtptime);
+    if let Err(e) = anchor_receiver(ptp, &mut br, play_at, rtptime) {
         warn!(receiver = %br.name, "rejoin anchor failed: {e}");
         return None;
     }
