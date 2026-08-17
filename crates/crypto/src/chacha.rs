@@ -27,10 +27,15 @@ pub enum ChaChaError {
     PlaintextTooLong(usize),
 }
 
-/// Largest plaintext one frame can describe, bounded by the 2-byte length
-/// prefix. Anything longer must be split across frames — it cannot simply be
-/// written, because the length field would silently wrap.
-pub const MAX_FRAME_PLAINTEXT: usize = u16::MAX as usize;
+/// Largest plaintext carried by one frame.
+///
+/// **1024, not 65535.** The 2-byte length prefix could describe up to 64 KiB,
+/// but AirPlay receivers only accept 1024-byte frames — an Apple TV
+/// (AirTunes/960.13.1) sends us frames of exactly this size, and a single
+/// oversized frame makes it drop the connection outright. Every request we sent
+/// was under 1 KiB until cover art, which is why this went unnoticed for so
+/// long. Longer bodies are split across frames by [`ChaChaChannel::encrypt`].
+pub const MAX_FRAME_PLAINTEXT: usize = 1024;
 
 /// One directional ChaCha20-Poly1305 channel (write or read).
 pub struct ChaChaChannel {
@@ -46,14 +51,28 @@ impl ChaChaChannel {
         }
     }
 
-    /// Encrypt `plaintext` and return the framed wire bytes:
-    /// `uint16_le(len) || ciphertext || tag`.
+    /// Encrypt `plaintext`, splitting it across as many frames as needed.
+    ///
+    /// Returns the concatenated wire bytes, so callers hand over a whole
+    /// message and stay unaware of framing. Bodies over
+    /// [`MAX_FRAME_PLAINTEXT`] used to be written as one oversized frame,
+    /// which an Apple TV responds to by dropping the connection.
     pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, ChaChaError> {
-        // Refuse rather than truncate. `len as u16` silently wraps, which
-        // produces a frame whose header disagrees with its body — the peer
-        // reads a short frame, hits garbage, and drops the connection with no
-        // hint as to why. (Observed against an Apple TV when a 176 KB cover
-        // image was sent as one frame.)
+        if plaintext.is_empty() {
+            return self.encrypt_frame(&[]);
+        }
+        let mut out = Vec::with_capacity(plaintext.len() + 32);
+        for chunk in plaintext.chunks(MAX_FRAME_PLAINTEXT) {
+            out.extend_from_slice(&self.encrypt_frame(chunk)?);
+        }
+        Ok(out)
+    }
+
+    /// Encrypt exactly one frame: `uint16_le(len) || ciphertext || tag`.
+    fn encrypt_frame(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, ChaChaError> {
+        // Defensive: `len as u16` silently wraps, producing a frame whose
+        // header disagrees with its body. `encrypt` chunks so this cannot
+        // trigger, but a wrong split here would corrupt the stream invisibly.
         if plaintext.len() > MAX_FRAME_PLAINTEXT {
             return Err(ChaChaError::PlaintextTooLong(plaintext.len()));
         }
@@ -194,5 +213,50 @@ mod tests {
         dec.decrypt(&f2).unwrap();
         // Re-decrypting f1 with counter now at 2 → tag mismatch
         assert!(dec.decrypt(&f1).is_err());
+    }
+
+    /// A body larger than one frame must be split, not written oversized —
+    /// the Apple TV drops the connection on a single >1024-byte frame.
+    #[test]
+    fn encrypt_splits_large_plaintext_into_frames() {
+        let key = [9u8; 32];
+        let mut enc = ChaChaChannel::new(&key);
+        let mut dec = ChaChaChannel::new(&key);
+
+        // 2500 bytes -> 1024 + 1024 + 452
+        let plain: Vec<u8> = (0..2500u32).map(|i| (i % 251) as u8).collect();
+        let wire = enc.encrypt(&plain).unwrap();
+
+        let mut round = Vec::new();
+        let mut pos = 0;
+        let mut frames = 0;
+        while pos < wire.len() {
+            let len = u16::from_le_bytes([wire[pos], wire[pos + 1]]) as usize;
+            assert!(len <= MAX_FRAME_PLAINTEXT, "frame claims {len} bytes");
+            let end = pos + 2 + len + 16;
+            round.extend_from_slice(&dec.decrypt(&wire[pos..end]).unwrap());
+            pos = end;
+            frames += 1;
+        }
+        assert_eq!(frames, 3, "2500 bytes should span three frames");
+        assert_eq!(round, plain, "split then rejoined must round-trip");
+    }
+
+    #[test]
+    fn encrypt_exact_frame_boundary_is_one_frame() {
+        let key = [3u8; 32];
+        let mut enc = ChaChaChannel::new(&key);
+        let wire = enc.encrypt(&vec![7u8; MAX_FRAME_PLAINTEXT]).unwrap();
+        assert_eq!(wire.len(), 2 + MAX_FRAME_PLAINTEXT + 16);
+    }
+
+    #[test]
+    fn encrypt_empty_still_produces_one_frame() {
+        let key = [4u8; 32];
+        let mut enc = ChaChaChannel::new(&key);
+        let mut dec = ChaChaChannel::new(&key);
+        let wire = enc.encrypt(&[]).unwrap();
+        assert_eq!(wire.len(), 2 + 16);
+        assert_eq!(dec.decrypt(&wire).unwrap(), Vec::<u8>::new());
     }
 }

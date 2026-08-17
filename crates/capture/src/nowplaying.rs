@@ -29,13 +29,11 @@ const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Cover art larger than this is skipped.
 ///
-/// TEMPORARY CEILING. The encrypted RTSP channel frames a body with a 2-byte
-/// length prefix, so one frame carries at most 64 KiB and larger bodies must be
-/// split across frames — which we do not implement yet. Until then, sending a
-/// bigger image kills the session, so we decline rather than break the stream.
-/// Most album art exceeds this, so artwork is usually skipped for now; text
-/// metadata is unaffected. Raise this to ~2 MB once frame chunking lands.
-const MAX_ART_BYTES: usize = 60_000;
+/// The encrypted channel now splits large bodies across 1024-byte frames, so
+/// this is no longer a protocol limit — it is only a sanity bound so a
+/// pathological image can't monopolise the RTSP control channel, which also
+/// carries volume and `/feedback`. Real SMTC thumbnails are 70–250 KB.
+const MAX_ART_BYTES: usize = 1024 * 1024;
 
 /// Re-exported so callers can name the type without depending on `core`
 /// directly. The struct itself lives in `core` so the streaming API stays
