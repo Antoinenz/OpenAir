@@ -4,6 +4,69 @@
 
 ---
 
+## 2026-08-17 — Session 14: now-playing metadata (artist / track / cover art)
+
+`openair capture` now sends the current track to the receiver, so an Apple TV
+shows what is playing instead of a blank screen. On by default on Windows;
+`--no-metadata` opts out.
+
+### Wire format — probed before building
+The DMAP tag set came from reverse-engineering notes, not a spec, so step one
+was a throwaway probe against AppleTV6,2 (AirTunes/960.13.1) rather than three
+layers built on a guess. It worked first try:
+
+- `SET_PARAMETER`, `Content-Type: application/x-dmap-tagged`,
+  `RTP-Info: rtptime=<n>` → 200 OK
+- Body: `mlit` container wrapping `minm` (title), `asar` (artist),
+  `asal` (album) — 90 bytes
+- **Title and artist rendered on screen.**
+
+Two fallback framings (bare items; `mlit` + leading `mikd`) were prepared and
+never needed. Cheap insurance that happened not to pay out — still the right
+call given how much of the previous session went to unverified premises.
+
+### Pieces
+- `crates/rtsp/src/dmap.rs` — pure encoder, 6 tests (big-endian length, UTF-8
+  byte-length not char-count, empty fields omitted).
+- `crates/rtsp/src/stream.rs` — `set_metadata` / `set_artwork`, same shape as
+  the existing `set_volume`.
+- `crates/capture/src/nowplaying.rs` — SMTC reader on a dedicated COM thread,
+  polling 1 s. Emits only on track change and fetches the thumbnail lazily,
+  since decoding it is the expensive part. Verified live: title/artist/album
+  plus a 176 KB PNG cover. Ships an `#[ignore]`d `smtc_live_read` test for
+  manual checks against whatever is actually playing.
+- `crates/client` — drains the channel at the same loop point as volume; also
+  re-sends to receivers that rejoin after a drop, so a reconnecting room isn't
+  left blank.
+
+### Design note: the struct lives in `core`, not `capture`
+The plan's primary approach was a `#[cfg(windows)]` parameter on the client
+signature. That would have forced conditional compilation into every caller and
+call site. The reader is platform-specific; the *shape* of what it produces is
+not — so `NowPlaying` went into `openair_core::metadata` and the streaming API
+stays platform-neutral with zero `cfg` in its signature. Linux/MPRIS can feed
+the same channel later.
+
+### Bug found while probing: rejoin anchored in the past
+The probe run dropped a receiver mid-stream (see below) and auto-reconnect
+rejoined it — cleanly, and then silently. Cause: `finish_reconnect` anchored the
+rejoiner at the group's *original* point, so 32 s in it was telling the Apple TV
+"position 0 plays at 32 s ago". The line is mathematically right but the
+reference instant is in the past. Now expressed forward — anchor at
+`(rtptime, when that rtptime is due)`, the same schedule stated from the current
+position. Fix is committed; not yet confirmed on hardware.
+
+### Still open
+`data write failed ... (os error 10053)` after ~30 s of good playback on
+Ethernet — the *local* stack aborting an established connection, typically the
+peer going quiet until retransmission times out. Hypothesis: the receiver
+stopped consuming, the TCP window filled, and the writer thread's `write_all`
+blocked until Windows gave up; `queue()` has a 1 s stall tolerance but the
+writer thread itself does not. A write timeout on the data socket would turn
+that into a clean drop. Did not recur on Wi-Fi. Tracked as task #20.
+
+---
+
 ## 2026-08-15 — Session 13: the "Shairport refuses us" bug was ours all along
 
 ### Symptom

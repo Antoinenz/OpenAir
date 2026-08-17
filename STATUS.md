@@ -35,7 +35,7 @@
 | `capture` | ✅ Done (Win) | Yes | WASAPI loopback verified with live Spotify; PipeWire/CoreAudio later |
 | `ptp-helper` | ⬜ Stub | — | Privileged binary, IPC to main (Linux ports 319/320; not needed on Windows) |
 | `client` | ✅ Done (v1) | Yes | realtime + buffered pipelines, pairing store + auto-dispatch (pair-verify vs transient), event channel |
-| `apps/cli` | ✅ Done (v1) | Yes | scan, `pair` (PIN), tone/play/capture, devices, restore-audio; name resolution, --volume, --buffered, --latency <ms>, --offset <name=ms>, --handoff[-device] (Windows), --bind <ip>, Ctrl+C |
+| `apps/cli` | ✅ Done (v1) | Yes | scan, `pair` (PIN), tone/play/capture, devices, restore-audio; name resolution, --volume, --buffered, --latency <ms>, --offset <name=ms>, --handoff[-device] (Windows), --bind <ip>, --no-metadata, Ctrl+C |
 | `apps/tui` | ⬜ Stub | — | |
 
 ---
@@ -101,6 +101,21 @@ Device detection already verified on hardware via `openair devices`.
   address, and the receiver should reach "NQPTP master clock" as usual.
 - **`--bind <ip>`** — forcing a deliberately wrong IP should fail to connect
   (proves the override is actually applied).
+
+### Now-playing metadata (Windows, Session 14)
+
+Wire format already hardware-confirmed (title + artist rendered on AppleTV6,2).
+
+- **Text** — play a track; title/artist/album appear on the Apple TV.
+- **Cover art** — the album image appears alongside (probe covered text only).
+- **Track change** — skip; the display updates within ~1 s.
+- **No spam** — pausing/resuming must not re-send; expect one
+  "sending now-playing metadata" log line per track.
+- **Rejoin** — drop and restore a receiver mid-stream; it should show the
+  current track, not a blank screen. Also exercises the Session 14 rejoin-anchor
+  fix — audio must actually resume.
+- **** — nothing is sent.
+- **Shairport** — accepts or cleanly ignores; audio unaffected either way.
 
 ## Next Steps
 

@@ -83,6 +83,7 @@ automatically uses the buffered pipeline.
 | `--handoff` | capture only (**Windows**) | off | Routes system audio through a **virtual audio device** so your speakers go silent and audio only comes out of AirPlay, and **mirrors the Windows master volume** — the slider, volume keys and mute key all control the AirPlay volume. Requires a virtual audio cable (see below). `--volume` sets the initial level until you first touch the Windows volume. Implies `--buffered`. |
 | `--handoff-device <name>` | with `--handoff` | auto | Force a specific output device by name substring (e.g. `--handoff-device "CABLE Input"`) instead of auto-detecting the virtual cable. |
 | `--bind <ip>` | all streaming commands | auto | Force the local IP that receiver connections originate from. OpenAir normally picks the interface on the receiver's subnet automatically; use this only if it guesses wrong on an unusual setup. |
+| `--no-metadata` | capture (**Windows**) | off | Stop sending now-playing info. By default `capture` reads the current track from Windows (title, artist, album, cover art) and pushes it to the receiver — an Apple TV shows it on its now-playing screen. |
 
 Notes:
 - Flags can appear anywhere in the command line.
@@ -93,6 +94,10 @@ Notes:
   receiver's clock daemon sees us consistently. If a connection is reset during
   pair-setup, you're most likely on an interface that can't reach the receiver's
   network — OpenAir will suggest a `--bind <ip>` to try.
+- Now-playing metadata is read from Windows' System Media Transport Controls,
+  so it works with any player that reports there (Spotify, browsers, Apple
+  Music, foobar2000, …) — no per-app integration. It is sent once per track
+  change, not continuously.
 - HomeKit credentials are stored at `%APPDATA%\OpenAir\pairings.json`.
 
 ### `--handoff`: silent speakers + Windows volume control
