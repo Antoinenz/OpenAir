@@ -85,6 +85,36 @@ mod util {
         raw.split("._airplay").next().unwrap_or(raw).to_string()
     }
 
+    /// Format a Unix timestamp as `YYYYMMDD-HHMMSS` (UTC) for a log filename.
+    ///
+    /// UTC deliberately: the log lines themselves are UTC, so a filename in the
+    /// same zone makes it obvious which file covers which events.
+    pub fn timestamp_name(unix_secs: u64) -> String {
+        let (y, mo, d) = civil_from_days((unix_secs / 86_400) as i64);
+        let s = unix_secs % 86_400;
+        format!(
+            "{y:04}{mo:02}{d:02}-{:02}{:02}{:02}",
+            s / 3600,
+            (s % 3600) / 60,
+            s % 60
+        )
+    }
+
+    /// Days since 1970-01-01 -> (year, month, day). Howard Hinnant's
+    /// `civil_from_days`, the standard branch-free calendar conversion.
+    fn civil_from_days(z: i64) -> (i64, u32, u32) {
+        let z = z + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z.rem_euclid(146_097);
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+        (if m <= 2 { y + 1 } else { y }, m, d)
+    }
+
     /// Extracts an optional `--latency <ms>` flag (buffered pipeline anchor
     /// lead / end-to-end latency). Same semantics as `extract_volume`.
     pub fn extract_latency(args: &[String], default: u64) -> (Vec<String>, u64) {
@@ -247,6 +277,30 @@ mod util {
         }
 
         #[test]
+        fn timestamp_name_formats_known_epochs() {
+            assert_eq!(timestamp_name(0), "19700101-000000");
+            // 2001-09-09T01:46:40Z — the classic 1e9 epoch second.
+            assert_eq!(timestamp_name(1_000_000_000), "20010909-014640");
+            // 2026-08-17T09:18:20Z, from a real capture session.
+            assert_eq!(timestamp_name(1_786_958_300), "20260817-091820");
+        }
+
+        #[test]
+        fn timestamp_name_handles_leap_day() {
+            // 2024-02-29T12:00:00Z — a leap day, where naive date math breaks.
+            assert_eq!(timestamp_name(1_709_208_000), "20240229-120000");
+        }
+
+        #[test]
+        fn timestamp_names_sort_chronologically() {
+            // Filenames are sorted by name when comparing runs, so lexical
+            // order must match time order.
+            let a = timestamp_name(1_786_958_300);
+            let b = timestamp_name(1_786_958_400);
+            assert!(a < b);
+        }
+
+        #[test]
         fn clean_device_name_strips_service_suffix() {
             assert_eq!(clean_device_name("Pool Room._airplay._tcp.local."), "Pool Room");
         }
@@ -388,6 +442,57 @@ fn resolve_receivers(
     Some(out)
 }
 
+/// Set up logging: always to the console, and additionally to a timestamped
+/// file under `logs/` when `--log` is given.
+///
+/// A file copy matters because the interesting bugs here only show up in a
+/// full run's log — the 30 s Apple TV teardown was found by comparing event
+/// ordering across runs, which is painful to do from a scrollback buffer.
+fn init_logging(to_file: bool) -> Result<Option<std::path::PathBuf>> {
+    use tracing_subscriber::prelude::*;
+
+    let filter = EnvFilter::from_default_env()
+        .add_directive("openair=debug".parse()?)
+        .add_directive("info".parse()?);
+
+    let path = if to_file {
+        let dir = std::path::PathBuf::from("logs");
+        std::fs::create_dir_all(&dir)?;
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        Some(dir.join(format!("openair-{}.log", util::timestamp_name(secs))))
+    } else {
+        None
+    };
+
+    // `Option<Layer>` is itself a Layer, so the file sink can be absent without
+    // the two branches having different subscriber types.
+    let file_layer = match &path {
+        Some(p) => {
+            let file = std::fs::File::create(p)?;
+            Some(
+                tracing_subscriber::fmt::layer()
+                    // No colour codes: this is read by humans and by grep.
+                    .with_ansi(false)
+                    .with_writer(move || {
+                        file.try_clone().expect("clone log file handle")
+                    }),
+            )
+        }
+        None => None,
+    };
+
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer())
+        .with(file_layer)
+        .init();
+
+    Ok(path)
+}
+
 /// Start a `--handoff` session (Windows): route system audio to a virtual
 /// output device so the speakers go quiet, and mirror the Windows volume onto
 /// AirPlay. Returns the session guard (keep it alive for the stream's lifetime
@@ -423,15 +528,15 @@ fn start_handoff(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::from_default_env()
-                .add_directive("openair=debug".parse()?)
-                .add_directive("info".parse()?),
-        )
-        .init();
-
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    // Parsed before logging starts so the flag itself never reaches the
+    // subcommand matching below.
+    let (raw_args, want_log) = extract_flag(&raw_args, "--log");
+    let log_path = init_logging(want_log)?;
+    if let Some(p) = &log_path {
+        println!("📝 logging this run to {}", p.display());
+    }
+
     let (raw_args, volume_db) = extract_volume(&raw_args, DEFAULT_VOLUME_DB);
     let (raw_args, latency_ms) = util::extract_latency(&raw_args, 500);
     let (raw_args, offsets) = util::extract_offsets(&raw_args);

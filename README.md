@@ -84,6 +84,7 @@ automatically uses the buffered pipeline.
 | `--handoff-device <name>` | with `--handoff` | auto | Force a specific output device by name substring (e.g. `--handoff-device "CABLE Input"`) instead of auto-detecting the virtual cable. |
 | `--bind <ip>` | all streaming commands | auto | Force the local IP that receiver connections originate from. OpenAir normally picks the interface on the receiver's subnet automatically; use this only if it guesses wrong on an unusual setup. |
 | `--no-metadata` | capture (**Windows**) | off | Stop sending now-playing info. By default `capture` reads the current track from Windows (title, artist, album, cover art) and pushes it to the receiver — an Apple TV shows it on its now-playing screen. |
+| `--log` | any command | off | Also write this run's full log (INFO + DEBUG) to `logs/openair-YYYYMMDD-HHMMSS.log`, alongside the normal console output. Plain text, no colour codes, UTC timestamps — greppable and diffable between runs. Invaluable for reporting a bug: attach the file instead of pasting a scrollback. |
 
 Notes:
 - Flags can appear anywhere in the command line.
