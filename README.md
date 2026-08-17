@@ -161,4 +161,4 @@ against shairport-sync and pyatv).
 
 ## License
 
-MIT
+GPL-3.0
