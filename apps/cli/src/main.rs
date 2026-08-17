@@ -451,6 +451,7 @@ async fn main() -> Result<()> {
         }
     }
 
+    let (raw_args, no_metadata) = extract_flag(&raw_args, "--no-metadata");
     let (raw_args, handoff) = extract_flag(&raw_args, "--handoff");
     let (raw_args, handoff_device) = util::extract_value(&raw_args, "--handoff-device");
     let (args, buffered) = extract_flag(&raw_args, "--buffered");
@@ -478,13 +479,20 @@ async fn main() -> Result<()> {
     let stream_fn = move |targets: &[openair_client::GroupTarget],
                           source: &mut dyn openair_client::AudioSource,
                           volume: Option<f32>,
-                          volume_rx: Option<std::sync::mpsc::Receiver<f32>>| {
+                          volume_rx: Option<std::sync::mpsc::Receiver<f32>>,
+                          metadata_rx: Option<
+        std::sync::mpsc::Receiver<openair_core::metadata::NowPlaying>,
+    >| {
         if targets.len() > 1 && !buffered {
             println!("  (multi-room uses the buffered pipeline — enabling --buffered)");
         }
         if buffered || targets.len() > 1 {
-            openair_client::stream_audio_buffered_multi(targets, source, volume, latency_ms, volume_rx, None)
+            openair_client::stream_audio_buffered_multi(
+                targets, source, volume, latency_ms, volume_rx, metadata_rx,
+            )
         } else {
+            // The realtime ALAC path has no metadata channel.
+            let _ = metadata_rx;
             openair_client::stream_audio(targets[0].addr, &targets[0].device_id, source, volume)
         }
     };
@@ -629,6 +637,29 @@ async fn main() -> Result<()> {
         let (volume_rx, capture_device): (Option<std::sync::mpsc::Receiver<f32>>, Option<String>) =
             (None, None);
 
+        // Now-playing metadata (Windows): on by default, --no-metadata opts out.
+        // Failure here is never fatal — the stream matters, the screen doesn't.
+        #[cfg(windows)]
+        let (_metadata_watcher, metadata_rx) = if no_metadata {
+            (None, None)
+        } else {
+            match openair_capture::nowplaying::MetadataWatcher::start() {
+                Ok((w, rx)) => {
+                    println!("  ♪ sending now-playing metadata (--no-metadata to disable)");
+                    (Some(w), Some(rx))
+                }
+                Err(e) => {
+                    println!("  ⚠ now-playing metadata unavailable: {}", e);
+                    (None, None)
+                }
+            }
+        };
+        #[cfg(not(windows))]
+        let metadata_rx: Option<std::sync::mpsc::Receiver<openair_core::metadata::NowPlaying>> = {
+            let _ = no_metadata;
+            None
+        };
+
         let cap = match openair_capture::SystemCapture::start_on(capture_device.as_deref()) {
             Ok(c) => c,
             Err(e) => {
@@ -652,7 +683,7 @@ async fn main() -> Result<()> {
             source = source.with_blocking();
         }
 
-        match stream_fn(&receivers, &mut source, Some(volume_db), volume_rx) {
+        match stream_fn(&receivers, &mut source, Some(volume_db), volume_rx, metadata_rx) {
             Ok(()) => println!("  ✓ capture streamed successfully"),
             Err(e) => println!("  ✗ {}", e),
         }
@@ -689,7 +720,7 @@ async fn main() -> Result<()> {
             }
         };
 
-        match stream_fn(&receivers, &mut source, Some(volume_db), None) {
+        match stream_fn(&receivers, &mut source, Some(volume_db), None, None) {
             Ok(()) => println!("  ✓ playback finished successfully"),
             Err(e) => println!("  ✗ {}", e),
         }
@@ -721,7 +752,7 @@ async fn main() -> Result<()> {
             .join(", ");
         println!("OpenAir — streaming {}s test tone to {}\n", seconds, dest);
         let mut source = openair_client::SineSource::new(440.0, seconds);
-        match stream_fn(&receivers, &mut source, Some(volume_db), None) {
+        match stream_fn(&receivers, &mut source, Some(volume_db), None, None) {
             Ok(()) => println!("  ✓ tone streamed successfully"),
             Err(e) => println!("  ✗ {}", e),
         }
