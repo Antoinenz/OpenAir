@@ -56,7 +56,47 @@ reference instant is in the past. Now expressed forward — anchor at
 `(rtptime, when that rtptime is due)`, the same schedule stated from the current
 position. Fix is committed; not yet confirmed on hardware.
 
-### ROOT CAUSE of the 30-second drop: we never answer the event channel
+### RESOLVED: both the 30 s teardown and cover art
+
+**Answering the event channel fixed the teardown.** The Apple TV was sending
+`POST /command` with an `updateInfo` binary plist and waiting for a plain
+`200 OK`. Once we reply, sessions went from a hard 30.0 s ceiling to 167 s, then
+4m33s — ending only when stopped.
+
+Decrypting it needed one empirical step: the key direction. The `Events-*` HKDF
+labels turn out to be from the *accessory's* perspective — it encrypts with
+`Events-Write-Encryption-Key`, the reverse of the control channel's convention.
+Rather than pick one, the reader trial-decrypts with both and logs the winner;
+the Poly1305 tag makes a wrong guess fail loudly instead of yielding garbage.
+That answered a 50/50 question in a single run. (Trial decryption runs on a
+throwaway channel — a failed attempt on the real one would advance its nonce
+counter and desync the stream permanently.)
+
+**Cover art was a frame-size bug, and my earlier cap was the wrong number.**
+The encrypted frame limit is **1024 bytes of plaintext**, not the 65535 the
+2-byte length prefix implies; a single oversized frame makes the Apple TV drop
+the connection. Every request we sent was under 1 KiB until artwork, so this sat
+undiscovered.
+
+Worth recording honestly: I read 1024 off the wire when decoding the event
+channel, wrote "settles the chunk size" in the notes — and still left the
+artwork cap at 60,000, a number I had derived from the u16 limit rather than
+from the peer's actual behaviour. The hardware then produced a sub-60 KB image
+that killed the session, which is the only reason it was caught. Observing a
+constant and *using* it are separate acts.
+
+`encrypt()` now chunks transparently, so callers hand over a whole message and
+never think about framing. Verified on hardware: five consecutive track changes,
+all with art, no failures.
+
+**Still open (#22):** the receiver's own pause/play buttons send `POST /command`
+too. We answer 200 OK, keeping the session alive, but ignore the content — so
+the TV pauses its UI while we keep streaming, and a few toggles later it resets
+the connection (10054, peer reset, distinct from the old 10053 local abort).
+Next step there is logging the decrypted message *body*; we currently log only
+the request line, so the command payload is invisible.
+
+### How the root cause was found
 
 Logging the reverse event channel found it immediately. At every drop the
 receiver closes the **event channel first**, and the data socket dies 40–60 ms

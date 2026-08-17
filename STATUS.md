@@ -52,40 +52,38 @@
 
 ## Known Issues / Blockers
 
-### 🔴 Apple TV tears down after 30 s — we never answer the event channel
+### ⚠️ Receiver transport buttons (pause/play) are answered but not obeyed
 
-**ROOT CAUSE FOUND (2026-08-17).** The Apple TV sends **encrypted protocol
-messages on the reverse event channel** right after RECORD. We connect that
-channel, discard every byte, and never reply. ~30 s later it gives up and kills
-the session.
+The Apple TV's own pause/play buttons send RTSP `POST /command` on the event
+channel. We answer 200 OK — which keeps the session alive — but ignore the
+content, so the TV pauses its UI while we keep streaming. After a few toggles it
+resets the connection (`10054`, peer reset). Tracked as **#22**; needs the event
+message *body* logged first, then mapping to `set_rate(0)`/re-anchor.
 
-The receiver closes the **event channel first**, then the data socket 40–60 ms
-later — a deliberate teardown, not a network fault:
+<details><summary>RESOLVED 2026-08-17: 30 s teardown + cover art (kept for the record)</summary>
 
-```
-09:18:57.420  event channel closed by receiver
-09:18:57.480  data write failed ... 10053      (+60 ms)
-09:19:29.751  event channel closed by receiver
-09:19:29.793  data write failed ... 10053      (+42 ms)
-09:20:02.044  event channel closed by receiver
-09:20:02.083  data write failed ... 10053      (+40 ms)
-```
+**30 s teardown — fixed.** The Apple TV pushes RTSP `POST /command` (an
+`updateInfo` binary plist describing its capabilities and attached display) on
+the reverse event channel and waits for a 200 OK. We connected the socket,
+discarded every byte, and never replied; ~30 s later it tore the session down —
+closing the event channel first, then the data socket 40–60 ms after.
 
-What it sends: ~2518 bytes of plaintext, framed exactly like our control channel
-(`uint16_le(len) || ciphertext || tag`). Every message starts `00 04` —
-little-endian **1024**, a full-size frame:
+Key direction was hardware-determined: the accessory encrypts with
+`Events-Write-Encryption-Key`, so the `Events-*` labels are from *its*
+perspective, the reverse of the control channel. Trying both directions and
+logging the winner settled it in one run.
 
-```
-00045afe1012356c...    00044d258e80a444...
-000458501389e855...    00049f6d567769a6...
-```
+Result: sessions went from a hard 30.0 s ceiling to 167 s and then 4m33s,
+ending only when stopped or by the unrelated pause issue above.
 
-**Fix:** decrypt the event channel (likely the same session keys as the control
-channel), parse what arrives, and respond. Until then the Apple TV drops us
-every 30 s and metadata stops displaying after the first drop.
+**Cover art — fixed.** The encrypted frame limit is **1024 bytes of plaintext**,
+not the 65535 the 2-byte length prefix implies. A single oversized frame makes
+the Apple TV drop the connection. Every request we sent was under 1 KiB until
+artwork, so this stayed hidden; an earlier 60 KB cap derived from the u16 limit
+was simply the wrong number. `encrypt()` now chunks at 1024 transparently.
+Verified: 5 consecutive track changes, all with art, no failures.
 
-*Side finding:* the Apple TV's own frames are **1024-byte plaintext**, which
-settles the chunk size for #21 — demonstrated by the peer, not assumed.
+</details>
 
 <details><summary>Earlier measurements (kept for the record)</summary>
 
@@ -184,16 +182,16 @@ Device detection already verified on hardware via `openair devices`.
 
 ### Now-playing metadata (Windows, Session 14)
 
-Wire format hardware-confirmed: title + artist rendered on AppleTV6,2 on a
-freshly-restarted receiver. **Currently blocked by the 30 s drop above** — after
-the first drop the receiver accepts metadata but stops displaying it.
+✅ **WORKING as of 2026-08-17** on AppleTV6,2: title, artist, album and cover art
+all display, and survive track changes. Verified over a 4m33s session with five
+consecutive track changes, every one carrying art, with no
+`set_metadata`/`set_artwork` failures.
 
-**Cover art is currently always skipped** (`cover art too large — skipping`).
-The encrypted RTSP frame header is 2 bytes, so one frame carries at most 64 KiB
-and real album art is 70–210 KB. Needs multi-frame chunking (task #21).
+Note the display still breaks if the session is disrupted (see #22) — it only
+recovers by restarting the receiver, so a clean session is the precondition.
 
 - **Text** — play a track; title/artist/album appear on the Apple TV.
-- **Cover art** — blocked on #21; expect it to be skipped with a WARN for now.
+- **Cover art** — album image appears alongside (slight compression visible).
 - **Track change** — skip; the display updates within ~1 s.
 - **No spam** — pausing/resuming must not re-send; expect one
   "sending now-playing metadata" log line per track.
@@ -205,17 +203,13 @@ and real album art is 70–210 KB. Needs multi-frame chunking (task #21).
 
 ## Next Steps
 
-1. **🔴 Answer the event channel** (see Known Issues) — root cause of the 30 s
-   Apple TV teardown; blocks stable audio *and* metadata display. Decrypt the
-   channel, parse the messages, respond.
-2. **#21 encrypted frame chunking** — unblocks cover art, and is general
-   correctness: any RTSP body >64 KiB is currently impossible. Chunk size is now
-   known to be **1024-byte plaintext** (observed from the Apple TV itself).
-3. **Step 9** — hardening (DSCP EF, thread priority, retransmit tuning)
-4. **#19** Pool Room (Shairport) refuses connections from the Wi-Fi subnet —
+1. **#22 media controls** — the receiver's pause/play buttons are answered but
+   not obeyed; a few toggles reset the session. Log the event message body first.
+2. **Step 9** — hardening (DSCP EF, thread priority, retransmit tuning)
+3. **#19** Pool Room (Shairport) refuses connections from the Wi-Fi subnet —
    server-side, reproducible without OpenAir
-5. Linux capture (PipeWire) + ptp-helper for privileged ports
-6. HomePod hardware test when available; realtime-ALAC multi-room (buffered-only today)
+4. Linux capture (PipeWire) + ptp-helper for privileged ports
+5. HomePod hardware test when available; realtime-ALAC multi-room (buffered-only today)
 
 ---
 
