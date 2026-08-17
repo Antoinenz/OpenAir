@@ -61,8 +61,8 @@ fn open_event_channel(
     match openair_core::net::connect_from_best_source(SocketAddr::new(peer_ip, event_port)) {
         Ok(s) => {
             s.set_nodelay(true).ok();
-            if let Ok(rdr) = s.try_clone() {
-                std::thread::spawn(move || event_reader(rdr, event_keys));
+            if let (Ok(rdr), Ok(wtr)) = (s.try_clone(), s.try_clone()) {
+                std::thread::spawn(move || event_reader(rdr, wtr, event_keys));
             }
             info!(event_port, "event channel connected");
             Some(s)
@@ -74,27 +74,72 @@ fn open_event_channel(
     }
 }
 
-/// Read the reverse event channel, decrypting what the receiver pushes.
+/// End of the header block (index just past the blank line), if present.
+fn header_block_end(msg: &[u8]) -> Option<usize> {
+    msg.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
+}
+
+/// Value of a header, case-insensitively, from a header block.
+fn header_value<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
+    let want = name.to_ascii_lowercase();
+    headers.lines().find_map(|l| {
+        let (k, v) = l.split_once(':')?;
+        (k.trim().to_ascii_lowercase() == want).then(|| v.trim())
+    })
+}
+
+/// Total length of the RTSP message at the front of `msg`, once fully arrived.
 ///
-/// The receiver frames these exactly like the RTSP control channel
-/// (`uint16_le(len) || ciphertext || 16-byte tag`) but with keys derived under
-/// the `Events-Salt` label set. Which direction's key applies is the one thing
-/// the reverse-engineering notes are ambiguous about, so we try `events_read`
-/// first and fall back to `events_write`, logging whichever authenticates —
-/// the Poly1305 tag makes a wrong guess fail loudly rather than silently
-/// produce garbage.
-fn event_reader(mut rdr: TcpStream, event_keys: Option<([u8; 32], [u8; 32])>) {
+/// Returns `None` while the message is still incomplete — event messages span
+/// several encrypted frames (the observed `POST /command` is 2519 bytes across
+/// three), so a reply must wait for the whole thing.
+fn rtsp_message_len(msg: &[u8]) -> Option<usize> {
+    let head = header_block_end(msg)?;
+    let headers = String::from_utf8_lossy(&msg[..head]);
+    let body_len = header_value(&headers, "Content-Length")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
+    (msg.len() >= head + body_len).then_some(head + body_len)
+}
+
+/// Build the RTSP response to an event-channel request.
+///
+/// The receiver only needs acknowledgement; it carries no body. `CSeq` must be
+/// echoed back or the request is treated as unanswered.
+fn event_response(request: &[u8]) -> Vec<u8> {
+    let head = header_block_end(request).unwrap_or(request.len());
+    let headers = String::from_utf8_lossy(&request[..head]);
+    let cseq = header_value(&headers, "CSeq").unwrap_or("0");
+    format!(
+        "RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\nServer: AirTunes/770.8.1\r\nContent-Length: 0\r\n\r\n"
+    )
+    .into_bytes()
+}
+
+/// Read the reverse event channel and answer what the receiver asks.
+///
+/// The receiver pushes RTSP requests here (observed: `POST /command` carrying an
+/// `updateInfo` binary plist), framed exactly like the control channel
+/// (`uint16_le(len) || ciphertext || 16-byte tag`) but keyed under the
+/// `Events-Salt` labels. **Answering is not optional**: an Apple TV that gets no
+/// response tears the whole session down after ~30 s, taking the audio with it.
+///
+/// Key direction is hardware-verified (2026-08-17, AppleTV6,2 / AirTunes
+/// 960.13.1): the accessory encrypts with `Events-Write-Encryption-Key`, i.e.
+/// the labels are from *its* perspective, the reverse of the control channel.
+/// So we read with `events_write` and reply with `events_read`.
+fn event_reader(mut rdr: TcpStream, mut wtr: TcpStream, event_keys: Option<([u8; 32], [u8; 32])>) {
     use openair_crypto::ChaChaChannel;
 
-    let mut ciphers = event_keys.map(|(w, r)| {
-        // (label, channel) — first that authenticates wins for the session.
-        [
-            ("events_read", ChaChaChannel::new(&r)),
-            ("events_write", ChaChaChannel::new(&w)),
-        ]
-    });
-    let mut chosen: Option<usize> = None;
-    let mut pending: Vec<u8> = Vec::new();
+    let Some((events_write, events_read)) = event_keys else {
+        warn!("event channel has no keys — cannot answer the receiver");
+        return;
+    };
+    let mut rx = ChaChaChannel::new(&events_write);
+    let mut tx = ChaChaChannel::new(&events_read);
+
+    let mut frames: Vec<u8> = Vec::new(); // undecrypted bytes
+    let mut msg: Vec<u8> = Vec::new(); // decrypted, reassembled
     let mut buf = [0u8; 4096];
 
     loop {
@@ -104,16 +149,42 @@ fn event_reader(mut rdr: TcpStream, event_keys: Option<([u8; 32], [u8; 32])>) {
                 break;
             }
             Ok(n) => {
-                pending.extend_from_slice(&buf[..n]);
-                // Frames can span reads, so consume only whole ones.
-                while pending.len() >= 2 {
-                    let len = u16::from_le_bytes([pending[0], pending[1]]) as usize;
+                frames.extend_from_slice(&buf[..n]);
+                // A frame can span reads; consume only whole ones.
+                while frames.len() >= 2 {
+                    let len = u16::from_le_bytes([frames[0], frames[1]]) as usize;
                     let frame_len = 2 + len + 16;
-                    if pending.len() < frame_len {
+                    if frames.len() < frame_len {
                         break;
                     }
-                    let frame: Vec<u8> = pending.drain(..frame_len).collect();
-                    decrypt_event_frame(&frame, ciphers.as_mut(), &mut chosen);
+                    let frame: Vec<u8> = frames.drain(..frame_len).collect();
+                    match rx.decrypt(&frame) {
+                        Ok(plain) => msg.extend_from_slice(&plain),
+                        Err(e) => {
+                            warn!("event frame failed to decrypt: {e}");
+                            return; // counter is desynced; nothing sane follows
+                        }
+                    }
+                }
+                // A message can span frames; answer only complete ones.
+                while let Some(end) = rtsp_message_len(&msg) {
+                    let request: Vec<u8> = msg.drain(..end).collect();
+                    let first_line = String::from_utf8_lossy(&request)
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .to_string();
+                    let response = event_response(&request);
+                    match tx.encrypt(&response) {
+                        Ok(framed) => match std::io::Write::write_all(&mut wtr, &framed) {
+                            Ok(()) => info!(request = %first_line, "event channel: answered 200 OK"),
+                            Err(e) => {
+                                warn!(request = %first_line, "event reply write failed: {e}");
+                                return;
+                            }
+                        },
+                        Err(e) => warn!("event reply encrypt failed: {e}"),
+                    }
                 }
             }
             Err(e) => {
@@ -121,67 +192,6 @@ fn event_reader(mut rdr: TcpStream, event_keys: Option<([u8; 32], [u8; 32])>) {
                 break;
             }
         }
-    }
-}
-
-/// Decrypt one event frame and log it. Once a key direction authenticates we
-/// stick with it — the ChaCha counters are per-direction and must stay in step.
-fn decrypt_event_frame(
-    frame: &[u8],
-    ciphers: Option<&mut [(&'static str, openair_crypto::ChaChaChannel); 2]>,
-    chosen: &mut Option<usize>,
-) {
-    let Some(ciphers) = ciphers else {
-        warn!(bytes = frame.len(), "event frame (no keys available)");
-        return;
-    };
-
-    // Already know which direction works: stay on it.
-    if let Some(i) = *chosen {
-        match ciphers[i].1.decrypt(frame) {
-            Ok(plain) => log_event_message(&plain),
-            Err(e) => warn!(key = ciphers[i].0, "event frame failed to decrypt: {e}"),
-        }
-        return;
-    }
-
-    for (i, (label, cipher)) in ciphers.iter_mut().enumerate() {
-        // Trial-decrypt on a throwaway channel so a failed attempt doesn't
-        // advance the real one's nonce counter.
-        let mut probe = openair_crypto::ChaChaChannel::new(&[0u8; 32]);
-        std::mem::swap(&mut probe, cipher);
-        let result = probe.decrypt(frame);
-        std::mem::swap(&mut probe, cipher);
-        if let Ok(plain) = result {
-            // Re-run on the real channel to advance its counter.
-            let _ = cipher.decrypt(frame);
-            info!(key = label, "event channel decrypted — key direction found");
-            *chosen = Some(i);
-            log_event_message(&plain);
-            return;
-        }
-    }
-    warn!(
-        bytes = frame.len(),
-        "event frame did not authenticate with either Events-Salt key"
-    );
-}
-
-/// Log a decrypted event message as text when it looks like text, hex otherwise.
-fn log_event_message(plain: &[u8]) {
-    let printable = plain
-        .iter()
-        .filter(|b| b.is_ascii_graphic() || b.is_ascii_whitespace())
-        .count();
-    if printable * 10 >= plain.len() * 8 {
-        info!(bytes = plain.len(), text = %String::from_utf8_lossy(plain), "EVENT MESSAGE");
-    } else {
-        let head = &plain[..plain.len().min(256)];
-        info!(
-            bytes = plain.len(),
-            hex = %head.iter().map(|b| format!("{b:02x}")).collect::<String>(),
-            "EVENT MESSAGE (binary)"
-        );
     }
 }
 
@@ -1321,6 +1331,65 @@ mod tests {
     fn drain_latest_volume_empty_is_none() {
         let (_tx, rx) = std::sync::mpsc::channel::<f32>();
         assert_eq!(drain_latest_volume(&rx), None);
+    }
+
+    /// The real request the Apple TV sends, headers verbatim from a capture.
+    fn sample_request(body_len: usize) -> Vec<u8> {
+        let mut v = format!(
+            "POST /command RTSP/1.0\r\nCSeq: 7\r\nContent-Length: {body_len}\r\n\
+             Content-Type: application/x-apple-binary-plist\r\n\r\n"
+        )
+        .into_bytes();
+        v.extend(std::iter::repeat_n(b'x', body_len));
+        v
+    }
+
+    #[test]
+    fn rtsp_message_len_waits_for_the_whole_body() {
+        let full = sample_request(2414);
+        // Header block alone is not a complete message.
+        let head_only = header_block_end(&full).unwrap();
+        assert_eq!(rtsp_message_len(&full[..head_only]), None);
+        // One byte short is still incomplete — the real message spans 3 frames.
+        assert_eq!(rtsp_message_len(&full[..full.len() - 1]), None);
+        assert_eq!(rtsp_message_len(&full), Some(full.len()));
+    }
+
+    #[test]
+    fn rtsp_message_len_none_until_headers_complete() {
+        assert_eq!(rtsp_message_len(b"POST /command RTSP/1.0\r\nCSeq: 1"), None);
+    }
+
+    #[test]
+    fn rtsp_message_len_handles_bodyless_request() {
+        let msg = b"POST /command RTSP/1.0\r\nCSeq: 3\r\n\r\n";
+        assert_eq!(rtsp_message_len(msg), Some(msg.len()));
+    }
+
+    #[test]
+    fn event_response_echoes_cseq() {
+        let resp = String::from_utf8(event_response(&sample_request(10))).unwrap();
+        assert!(resp.starts_with("RTSP/1.0 200 OK\r\n"));
+        assert!(resp.contains("CSeq: 7\r\n"), "CSeq must be echoed: {resp}");
+        assert!(resp.ends_with("\r\n\r\n"));
+    }
+
+    #[test]
+    fn header_value_is_case_insensitive() {
+        let h = "POST / RTSP/1.0\r\ncontent-length: 42\r\nCSEQ: 9\r\n\r\n";
+        assert_eq!(header_value(h, "Content-Length"), Some("42"));
+        assert_eq!(header_value(h, "CSeq"), Some("9"));
+        assert_eq!(header_value(h, "Missing"), None);
+    }
+
+    #[test]
+    fn two_messages_in_one_buffer_are_split() {
+        // Frames don't align to messages, so a buffer can hold more than one.
+        let mut buf = sample_request(4);
+        buf.extend(sample_request(6));
+        let first = rtsp_message_len(&buf).unwrap();
+        assert_eq!(first, sample_request(4).len());
+        assert_eq!(rtsp_message_len(&buf[first..]), Some(sample_request(6).len()));
     }
 
     #[test]
