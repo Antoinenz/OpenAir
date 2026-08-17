@@ -60,9 +60,28 @@ fn open_event_channel(peer_ip: std::net::IpAddr, event_port: u16) -> Option<TcpS
             if let Ok(mut rdr) = s.try_clone() {
                 std::thread::spawn(move || {
                     let mut buf = [0u8; 2048];
-                    while let Ok(n) = std::io::Read::read(&mut rdr, &mut buf) {
-                        if n == 0 {
-                            break;
+                    loop {
+                        match std::io::Read::read(&mut rdr, &mut buf) {
+                            Ok(0) => {
+                                warn!("event channel closed by receiver");
+                                break;
+                            }
+                            Ok(n) => {
+                                // We have never answered anything here. If the
+                                // receiver is asking us something and giving up
+                                // ~30 s later, this is where the evidence is.
+                                let head = &buf[..n.min(256)];
+                                warn!(
+                                    bytes = n,
+                                    text = %String::from_utf8_lossy(head),
+                                    hex = %head.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                                    "event channel data from receiver"
+                                );
+                            }
+                            Err(e) => {
+                                warn!("event channel read error: {e}");
+                                break;
+                            }
                         }
                     }
                 });
@@ -578,7 +597,17 @@ fn reap_dead(group: &mut Vec<BufferedReceiver>, handles: &mut Vec<ReconnectHandl
             i += 1;
             continue;
         }
-        let dead = group.remove(i);
+        let mut dead = group.remove(i);
+        // Best effort: tell the receiver this session is finished. Only the
+        // DATA socket dies on a drop — the RTSP control connection is still
+        // healthy (/feedback keeps succeeding) — so this usually gets through.
+        // Without it every drop orphans a session on the receiver, which is the
+        // leading explanation for an Apple TV that accepts metadata (200 OK) but
+        // stops displaying it after the first reconnect.
+        match dead.session.teardown() {
+            Ok(()) => debug!(receiver = %dead.name, "tore down dropped session"),
+            Err(e) => debug!(receiver = %dead.name, "teardown of dropped session failed: {e}"),
+        }
         if reconnect {
             info!(receiver = %dead.name, "receiver dropped — scheduling reconnect");
             handles.push(spawn_reconnect(dead.addr, dead.device_id.clone(), dead.offset_ns));
