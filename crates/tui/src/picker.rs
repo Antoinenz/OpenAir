@@ -25,6 +25,9 @@ pub struct PickerRow {
     pub key: String,
     pub name: String,
     pub addr: SocketAddr,
+    /// TXT `deviceid`, when advertised. The stream needs it; receivers that
+    /// don't advertise one get the caller's default.
+    pub device_id: Option<String>,
     pub model: String,
     pub selected: bool,
     /// We hold HomeKit credentials for this device.
@@ -116,6 +119,7 @@ impl PickerState {
                     key,
                     name: d.display_name().to_string(),
                     addr: SocketAddr::new(d.addr, d.port),
+                    device_id: d.txt.device_id.clone(),
                     model: d.txt.model.clone().unwrap_or_else(|| "unknown".into()),
                 }
             })

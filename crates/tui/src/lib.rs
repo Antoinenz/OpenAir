@@ -11,10 +11,12 @@
 
 pub mod logs;
 pub mod picker;
+pub mod picker_ui;
 pub mod settings;
 pub mod term;
 
 pub use logs::{LogBuffer, LogLayer, LogLine};
 pub use picker::{PickerAction, PickerRow, PickerState};
+pub use picker_ui::{run_picker, PickerOutcome};
 pub use term::is_interactive;
 pub use settings::{GraphKind, Overrides, Settings};
