@@ -9,6 +9,8 @@
 //! concerns (`--handoff`, Windows now-playing) stay behind the CLI's `cfg`
 //! boundaries and reach the TUI as plain data.
 
+pub mod logs;
 pub mod settings;
 
+pub use logs::{LogBuffer, LogLayer, LogLine};
 pub use settings::{GraphKind, Overrides, Settings};
