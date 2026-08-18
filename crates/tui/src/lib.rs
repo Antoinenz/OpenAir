@@ -11,6 +11,8 @@
 
 pub mod logs;
 pub mod settings;
+pub mod term;
 
 pub use logs::{LogBuffer, LogLayer, LogLine};
+pub use term::is_interactive;
 pub use settings::{GraphKind, Overrides, Settings};
