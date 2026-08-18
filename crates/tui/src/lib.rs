@@ -8,3 +8,7 @@
 //! Deliberately does **not** depend on `openair-capture`: platform-specific
 //! concerns (`--handoff`, Windows now-playing) stay behind the CLI's `cfg`
 //! boundaries and reach the TUI as plain data.
+
+pub mod settings;
+
+pub use settings::{GraphKind, Overrides, Settings};
