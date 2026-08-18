@@ -25,7 +25,7 @@
 | Crate | Status | Tested Against Hardware | Notes |
 |-------|--------|------------------------|-------|
 | `core` | ✅ Scaffolded | — | `Features` bitmask, `AudioMode`, `OpenAirError` |
-| `discovery` | ✅ Done | Yes | `browse()`, `AirPlayDevice`, `AirPlayTxt`, feature-bit decoder; 4 tests pass; verified on LAN |
+| `discovery` | ✅ Done | Yes | `browse()`, `browse_live()` (non-blocking, for the picker), `DeviceSet` collation, `display_name()`, feature-bit decoder; 15 tests; verified on LAN |
 | `crypto` | ✅ Done | Yes | SRP-6a 3072-bit (N fingerprint-guarded), HKDF-SHA-512, ChaCha20-Poly1305 (channel + labeled one-shot); 12 tests |
 | `pairing` | ✅ Done | Yes | TLV8, `TransientPairing` M1–M4, `NormalPairing` M1–M6 + `PairVerify` (Ed25519/X25519); 12 tests |
 | `rtsp` | ✅ Done | Yes | Transient + Normal pair flows, SETUP×2, SETPEERS, RECORD, full SETRATEANCHORTIME, SET_PARAMETER, TEARDOWN |
@@ -34,9 +34,9 @@
 | `timing` | ✅ Done | Yes | NTP responder + PTP master with BMCA yield: tracks foreign grandmaster (offset EWMA), answers Delay_Req |
 | `capture` | ✅ Done (Win) | Yes | WASAPI loopback verified with live Spotify; PipeWire/CoreAudio later |
 | `ptp-helper` | ⬜ Stub | — | Privileged binary, IPC to main (Linux ports 319/320; not needed on Windows) |
-| `client` | ✅ Done (v1) | Yes | realtime + buffered pipelines, pairing store + auto-dispatch (pair-verify vs transient), event channel |
-| `apps/cli` | ✅ Done (v1) | Yes | scan, `pair` (PIN), tone/play/capture, devices, restore-audio; name resolution, --volume, --buffered, --latency <ms>, --offset <name=ms>, --handoff[-device] (Windows), --bind <ip>, --no-metadata, --log, --debug [0-2], Ctrl+C |
-| `apps/tui` | ⬜ Stub | — | |
+| `client` | ✅ Done (v1) | Yes | realtime + buffered pipelines, pairing store + auto-dispatch (pair-verify vs transient), event channel, `StreamStats` snapshot for observers |
+| `apps/cli` | ✅ Done (v1) | Yes | scan, `pair` (PIN), tone/play/capture, devices, restore-audio; name resolution, --volume, --buffered, --latency <ms>, --offset <name=ms>, --handoff[-device] (Windows), --bind <ip>, --no-metadata, --log, --debug [0-2], --no-tui, Ctrl+C |
+| `tui` | ✅ Done (phase 1) | Yes | Library, not a binary — `openair` drives it. Device picker + read-only dashboard, settings persistence, log ring buffer, panic-safe terminal restore; 61 tests. Phase 2 (per-receiver volume/latency, add/remove mid-stream) designed but not built |
 
 ---
 
@@ -59,6 +59,21 @@ channel. We answer 200 OK — which keeps the session alive — but ignore the
 content, so the TV pauses its UI while we keep streaming. After a few toggles it
 resets the connection (`10054`, peer reset). Tracked as **#22**; needs the event
 message *body* logged first, then mapping to `set_rate(0)`/re-anchor.
+
+### ⚠️ The dashboard only attaches to `capture`
+
+`play` and `tone` still print plain scrolling text. Nothing structural stops
+them — they call the same `stream_fn` — it just wasn't wired up.
+
+<details><summary>RESOLVED 2026-08-18: bare <code>openair</code> paired with every device it found</summary>
+
+Bare `openair` blocked for a fixed 5 s mDNS browse and then attempted Transient
+pairing plus `GET /info` against *every* device discovered. Slow at home; on a
+shared network it opened handshakes with strangers' receivers. Replaced by the
+TUI picker, which contacts nothing until Enter. The old behaviour survives
+behind `--no-tui`, where it is a deliberate diagnostic rather than the default.
+
+</details>
 
 <details><summary>RESOLVED 2026-08-17: 30 s teardown + cover art (kept for the record)</summary>
 

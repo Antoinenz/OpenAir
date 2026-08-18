@@ -36,7 +36,7 @@ openair capture "Living Room" "Pool Room" --buffered
 # Receivers can be named (discovered via mDNS) or given as ip:port
 openair capture 192.168.1.106:7000
 
-# No arguments: scan the network and list AirPlay receivers
+# No arguments: interactive picker, then a live dashboard
 openair
 ```
 
@@ -65,7 +65,7 @@ automatically uses the buffered pipeline.
 
 | Command | What it does |
 |---------|--------------|
-| `openair` | Scan the LAN for 5 s, list AirPlay receivers, and try Transient pairing + `GET /info` on each (discovery/diagnostic). |
+| `openair` | Open the **interactive picker**: receivers appear as they answer, arrow keys and space to choose, Enter to stream. Contacts nothing until you press Enter. With `--no-tui`, instead scans for 5 s and tries Transient pairing + `GET /info` on every device found (diagnostic). |
 | `openair <ip:port>` | Connect straight to one address, pair, and `GET /info` — no discovery (diagnostic). |
 | `openair pair <receiver>` | One-time **Normal HomeKit pairing**: shows a PIN on the device, prompts for it, and persists credentials so future connections are automatic. Needed for Apple TV / HomePod; Shairport needs no pairing. |
 | `openair capture <receiver>… [seconds]` | Stream **live system audio** (WASAPI loopback of the default output device). Runs until `Ctrl+C`, or for `seconds` if given. Pausing PC audio auto-pauses/resumes the stream. |
@@ -85,6 +85,7 @@ automatically uses the buffered pipeline.
 | `--bind <ip>` | all streaming commands | auto | Force the local IP that receiver connections originate from. OpenAir normally picks the interface on the receiver's subnet automatically; use this only if it guesses wrong on an unusual setup. |
 | `--no-metadata` | capture (**Windows**) | off | Stop sending now-playing info. By default `capture` reads the current track from Windows (title, artist, album, cover art) and pushes it to the receiver — an Apple TV shows it on its now-playing screen. |
 | `--log` | any command | off | Also write this run's log to `logs/openair-YYYYMMDD-HHMMSS.log`. Plain text, no colour codes, UTC timestamps — greppable and diffable between runs. The file always keeps full detail even when the console is quiet, so you get a clean terminal *and* a complete log. Invaluable for reporting a bug: attach the file instead of pasting a scrollback. |
+| `--no-tui` | any command | off | Turn off the terminal UI: no picker, no dashboard, plain scrolling text. Selected automatically when stdout isn't a terminal (pipes, scripts, CI), so redirection keeps working without it. |
 | `--debug [0-2]` | any command | `0` | Console verbosity. `0` (default) shows only the normal narration plus warnings and errors. `--debug` (= `1`) adds protocol detail — pairing, SETUP, anchors, PTP. `--debug 2` adds everything the receiver sends, including the full decrypted body of each event-channel message. Bare `--debug` means level 1, so `tone x --debug 10` still plays for 10 seconds. |
 
 Notes:
@@ -101,6 +102,43 @@ Notes:
   Music, foobar2000, …) — no per-app integration. It is sent once per track
   change, not continuously.
 - HomeKit credentials are stored at `%APPDATA%\OpenAir\pairings.json`.
+
+### The terminal UI
+
+Running `openair` with no arguments opens a **picker**:
+
+```
+┌ OpenAir — 4 found ──────────────────────────────────────────┐
+│  [x] Living Room       AppleTV6,2      192.168.1.106:7000 ✓ │
+│  [ ] Pool Room         ShairportSync   192.168.1.51:7000    │
+│> [x] Kitchen           AudioAccessory  192.168.1.88:7000    │
+└─────────────────────────────────────────────────────────────┘
+  handoff ON   latency 500 ms   volume -8 dB   selected 2
+  ↑↓ move · space select · h handoff · +/- latency · ⏎ start · q quit
+```
+
+Receivers appear as they answer — there's no fixed wait — and **nothing is
+contacted until you press Enter**: names, models and capabilities all come from
+the mDNS record, and the ✓ comes from your local pairings file. Devices needing
+a one-time `openair pair` are marked, and pressing Enter on one tells you so
+rather than failing mid-handshake.
+
+Press Enter and it becomes a **dashboard**: latency, bandwidth and now-playing
+across the top, a rolling **buffer-health** graph (press `b` for bandwidth), the
+live state of each receiver, and a log panel. Buffer health is the number that
+predicts a dropout — it's what auto-latency watches to decide when to step up —
+so you can usually see trouble coming.
+
+`q` (or Ctrl+C) stops, restoring the terminal and your audio device, and prints
+a one-line summary of the run.
+
+Preferences — handoff, latency, volume, graph choice — persist in
+`settings.json` beside `pairings.json`. Command-line flags override the file for
+that run without rewriting it. Chosen receivers are deliberately *not*
+remembered.
+
+> `--no-tui` gives the plain scrolling output, and is selected automatically
+> when stdout isn't a terminal.
 
 ### `--handoff`: silent speakers + Windows volume control
 

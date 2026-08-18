@@ -4,6 +4,95 @@
 
 ---
 
+## 2026-08-18 — Session 15: the terminal UI (picker + dashboard)
+
+**Goal.** Bare `openair` blocked 5 s on discovery and then tried to pair with
+every device it found — slow at home, and on a school network it opened
+handshakes with strangers' receivers. Replace it with a picker, and give
+streaming runs something better to look at than a scrolling log.
+
+### The seam: how does a UI see inside a blocking stream?
+
+`stream_audio_buffered_multi` owns everything and returns only when done. Three
+options were on the table:
+
+1. **Shared snapshot** — the loop overwrites current values; the UI samples them.
+2. **Telemetry channel** — the loop emits a `StreamEvent` enum; the UI folds them.
+3. **Invert control** — refactor into a `BufferedStream` the UI drives via `tick()`.
+
+Chose (1), and the argument that settled it was noticing that the discrete
+events (2) is good at — underrun, receiver dropped, reconnect succeeded — are
+**already `warn!`/`info!` lines**. They reach the log panel through a tracing
+layer whether or not the snapshot carries them. So the split became:
+
+> **Numbers by snapshot, events by tracing.**
+
+That keeps `StreamStats` from ever needing to buffer anything, and means a
+stalled renderer cannot apply backpressure to audio. (2) would have made the UI
+rebuild current state by replaying an event log, and a slow renderer would
+either grow the queue unboundedly or drop events silently — a poor failure mode
+for the panel whose whole job is telling you what went wrong.
+
+(3) was rejected for restructuring the single piece of code that took longest to
+get right — the buffered loop, PTP anchoring, reconnect handling — for a benefit
+phase 2 gets by adding one `inbox` field to the struct that already crosses the
+boundary.
+
+### The threading went the opposite way to the plan
+
+The plan said: run the stream on a worker, render on main. That would have
+forced everything the audio path touches to be `Send`. Inverting it — **dashboard
+on a worker, stream on main** — needed *zero* changes to the stream's threading,
+and `q` became a one-liner: it sets the same `Arc<AtomicBool>` stop flag the
+Ctrl+C handler already used, so quitting takes the existing graceful path (play
+out queued audio, TEARDOWN, restore the Windows audio device). A plan surviving
+contact with the code intact is usually a sign nobody checked.
+
+### Console logging vs. a rendered frame
+
+The panel has to *replace* console output while the dashboard owns the screen,
+or stray log writes scribble over the frame. Rebuilding the subscriber mid-run
+means `tracing_subscriber::reload` machinery. Instead the console layer carries a
+second, dynamic filter that consults an `AtomicBool` the dashboard sets. Same
+process narrates normally before and after, stays silent during, and `--log`
+keeps full detail throughout.
+
+### Smaller decisions
+
+- **"Needs pairing" is derived from Transient-pairing support, not `sf` status
+  flags.** The design doc said `status_flags` (PIN required), but nothing in this
+  codebase verifies what those bits mean, and a wrong warning in front of the
+  user is worse than none. A device supporting Transient pairing negotiates keys
+  per session and needs nothing stored; one that doesn't needs Normal pairing and
+  therefore a credential on disk. That is logic the project already relies on.
+- **Selection is keyed by device identity, not row index.** Rows re-sort as
+  devices arrive (paired first, then name), so an index-keyed selection would
+  silently point at a different receiver the moment a paired device showed up and
+  took the top slot. There's a regression test for exactly that.
+- **The buffer-health graph is one series for the whole group.** `min_lead_ns`
+  comes off the *shared* anchor line, so a per-receiver version would be N copies
+  of the same number.
+- **`browse_live()`**, and `browse()` reimplemented on top of it, so there is one
+  browsing code path rather than two that can drift.
+- **One config-dir helper.** `pairings`, `ptp` and `handoff` had each derived
+  `%APPDATA%\OpenAir` independently; `settings.json` would have been the fourth.
+  Now `openair_core::config`. (Linux PTP clock id moves `OpenAir` → `openair`,
+  matching what pairings already did.)
+- **No cover art in the terminal.** Kitty/sixel/iterm2 protocols vary too much;
+  the panel notes `[art]` instead.
+- **One `TestBackend` render test, not a snapshot suite.** It catches layout
+  panics and the too-small-terminal path. Golden-frame tests would break on every
+  cosmetic tweak and teach nothing.
+
+**Result:** 12 commits, 61 TUI tests, workspace green and clippy clean. Phase 2
+— per-receiver volume and latency, add/remove mid-stream — is designed in the
+spec but deliberately unbuilt.
+
+**Spec:** `docs/superpowers/specs/2026-08-18-tui-design.md` ·
+**Plan:** `docs/superpowers/plans/2026-08-18-tui.md`
+
+---
+
 ## 2026-08-17 — Session 14: now-playing metadata (artist / track / cover art)
 
 `openair capture` now sends the current track to the receiver, so an Apple TV
