@@ -6,6 +6,7 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
+openair-client = { path = "../client" }
 openair-discovery = { path = "../discovery" }
 openair-core = { path = "../core" }
 ratatui.workspace = true

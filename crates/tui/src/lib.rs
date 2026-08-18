@@ -9,6 +9,7 @@
 //! concerns (`--handoff`, Windows now-playing) stay behind the CLI's `cfg`
 //! boundaries and reach the TUI as plain data.
 
+pub mod dashboard;
 pub mod logs;
 pub mod picker;
 pub mod picker_ui;
