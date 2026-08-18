@@ -47,6 +47,30 @@ impl AirPlayDevice {
     pub fn uses_transient_pairing(&self) -> bool {
         self.txt.features.supports_transient_pairing()
     }
+
+    /// The receiver's name without mDNS decoration.
+    ///
+    /// `name` is the raw fullname, which is not what anyone calls their
+    /// speaker: `_airplay._tcp` gives `Living Room._airplay._tcp.local.` and
+    /// `_raop._tcp` prefixes the device ID as well —
+    /// `AABBCCDDEEFF@Living Room._raop._tcp.local.`
+    pub fn display_name(&self) -> &str {
+        if let Some(name) = self.name.strip_suffix("._airplay._tcp.local.") {
+            // No device-id prefix on this service, so an '@' here belongs to
+            // the user's chosen name and must be left alone.
+            return name;
+        }
+        if let Some(name) = self.name.strip_suffix("._raop._tcp.local.") {
+            // `<deviceid>@<name>`. Device IDs never contain '@', so the first
+            // one is the separator — splitting there keeps an '@' that is part
+            // of the name.
+            return match name.split_once('@') {
+                Some((_id, rest)) => rest,
+                None => name,
+            };
+        }
+        &self.name
+    }
 }
 
 impl std::fmt::Display for AirPlayDevice {
@@ -62,5 +86,48 @@ impl std::fmt::Display for AirPlayDevice {
             self.features().requires_ptp(),
             self.uses_transient_pairing(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn named(name: &str) -> AirPlayDevice {
+        AirPlayDevice::new(
+            name.into(),
+            "192.168.1.10".parse().unwrap(),
+            7000,
+            AirPlayTxt::default(),
+        )
+    }
+
+    #[test]
+    fn strips_the_airplay_service_suffix() {
+        assert_eq!(named("Living Room._airplay._tcp.local.").display_name(), "Living Room");
+    }
+
+    #[test]
+    fn strips_the_raop_suffix_and_device_id_prefix() {
+        assert_eq!(
+            named("AABBCCDDEEFF@Pool Room._raop._tcp.local.").display_name(),
+            "Pool Room"
+        );
+    }
+
+    #[test]
+    fn leaves_an_undecorated_name_alone() {
+        assert_eq!(named("Kitchen").display_name(), "Kitchen");
+    }
+
+    #[test]
+    fn keeps_an_at_sign_that_belongs_to_the_name() {
+        // Only the device-id prefix is stripped; an '@' the user put in the
+        // name stays.
+        assert_eq!(
+            named("AABBCCDDEEFF@Bar@Home._raop._tcp.local.").display_name(),
+            "Bar@Home"
+        );
+        assert_eq!(named("Bar@Home._airplay._tcp.local.").display_name(), "Bar@Home");
     }
 }

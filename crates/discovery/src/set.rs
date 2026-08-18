@@ -47,7 +47,11 @@ impl DeviceSet {
     /// Identity key: the device ID when the TXT record carries one, else
     /// address+port. Two receivers can share a display name, so the name is
     /// never part of the key.
-    fn key_for(device: &AirPlayDevice) -> String {
+    ///
+    /// Public because a UI needs to track a selection across re-sorts, and
+    /// keying that on a list index would silently select the wrong receiver
+    /// the moment a new device arrives and shifts the rows.
+    pub fn key_for(device: &AirPlayDevice) -> String {
         device
             .txt
             .device_id
