@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing_subscriber::EnvFilter;
 
-use util::{clean_device_name, extract_flag, extract_volume};
+use util::{extract_flag, extract_volume};
 
 const DEFAULT_DEVICE_ID: &str = "AA:BB:CC:DD:EE:FF";
 const DEFAULT_VOLUME_DB: f32 = -8.0;
@@ -77,12 +77,6 @@ mod util {
             remaining.push(arg.clone());
         }
         (remaining, present)
-    }
-
-    /// Cleans an mDNS-advertised AirPlay service name for display/matching,
-    /// e.g. "Pool Room._airplay._tcp.local." -> "Pool Room".
-    pub fn clean_device_name(raw: &str) -> String {
-        raw.split("._airplay").next().unwrap_or(raw).to_string()
     }
 
     /// Highest `--debug` level we define. Values above this are treated as a
@@ -428,13 +422,11 @@ mod util {
         }
 
         #[test]
-        fn clean_device_name_strips_service_suffix() {
-            assert_eq!(clean_device_name("Pool Room._airplay._tcp.local."), "Pool Room");
-        }
-
-        #[test]
-        fn clean_device_name_passthrough_when_no_suffix() {
-            assert_eq!(clean_device_name("Pool Room"), "Pool Room");
+        fn extract_flag_removes_no_tui() {
+            let args = vec!["capture".into(), "--no-tui".into(), "Pool".into()];
+            let (rest, found) = extract_flag(&args, "--no-tui");
+            assert!(found);
+            assert_eq!(rest, ["capture", "Pool"], "the flag must not reach dispatch");
         }
     }
 }
@@ -459,7 +451,7 @@ fn resolve_receiver(arg: &str) -> Option<(SocketAddr, String)> {
     let needle = arg.to_lowercase();
     let matches: Vec<_> = devices
         .iter()
-        .filter(|d| clean_device_name(&d.name).to_lowercase().contains(&needle))
+        .filter(|d| d.display_name().to_lowercase().contains(&needle))
         .collect();
 
     match matches.len() {
@@ -476,14 +468,14 @@ fn resolve_receiver(arg: &str) -> Option<(SocketAddr, String)> {
         0 => {
             println!("No receiver matched '{}'. Discovered device(s):", arg);
             for d in &devices {
-                println!("  - {}", clean_device_name(&d.name));
+                println!("  - {}", d.display_name());
             }
             None
         }
         _ => {
             println!("Multiple receivers matched '{}':", arg);
             for d in &matches {
-                println!("  - {}", clean_device_name(&d.name));
+                println!("  - {}", d.display_name());
             }
             None
         }
@@ -534,7 +526,7 @@ fn resolve_receivers(
         let needle = arg.to_lowercase();
         let matches: Vec<_> = devices
             .iter()
-            .filter(|d| clean_device_name(&d.name).to_lowercase().contains(&needle))
+            .filter(|d| d.display_name().to_lowercase().contains(&needle))
             .collect();
         match matches.len() {
             1 => {
@@ -553,20 +545,67 @@ fn resolve_receivers(
             0 => {
                 println!("No receiver matched '{}'. Discovered device(s):", arg);
                 for d in &devices {
-                    println!("  - {}", clean_device_name(&d.name));
+                    println!("  - {}", d.display_name());
                 }
                 return None;
             }
             _ => {
                 println!("Multiple receivers matched '{}':", arg);
                 for d in &matches {
-                    println!("  - {}", clean_device_name(&d.name));
+                    println!("  - {}", d.display_name());
                 }
                 return None;
             }
         }
     }
     Some(out)
+}
+
+/// Placeholder receiver argument used when the picker chose the receivers.
+///
+/// The capture branch is reached by argument shape, and the picker's result is
+/// a list of resolved targets rather than a list of names — so it stands in for
+/// them and is never parsed.
+const PICKER_SELECTION: &str = "<picker>";
+
+/// Run the TUI device picker, returning the chosen receivers and the settings
+/// the user left it in. `Ok(None)` means they quit.
+fn run_picker() -> Result<Option<(Vec<openair_client::GroupTarget>, openair_tui::Settings)>> {
+    // "Paired" and "a cable is available" both come from local state — the
+    // picker touches the network only for mDNS.
+    let paired = openair_client::PairingStore::load()
+        .map(|s| s.peer_ids())
+        .unwrap_or_default();
+
+    #[cfg(windows)]
+    let handoff_available = openair_capture::handoff::list_output_devices()
+        .map(|l| l.selected.is_some())
+        .unwrap_or(false);
+    #[cfg(not(windows))]
+    let handoff_available = false;
+
+    let settings = openair_tui::Settings::load();
+    let Some(outcome) = openair_tui::run_picker(settings, paired, handoff_available)? else {
+        return Ok(None);
+    };
+
+    let targets: Vec<openair_client::GroupTarget> = outcome
+        .receivers
+        .iter()
+        .map(|r| openair_client::GroupTarget {
+            addr: r.addr,
+            device_id: r
+                .device_id
+                .clone()
+                .unwrap_or_else(|| DEFAULT_DEVICE_ID.to_string()),
+            offset_ms: 0,
+        })
+        .collect();
+
+    let names: Vec<&str> = outcome.receivers.iter().map(|r| r.name.as_str()).collect();
+    println!("OpenAir — streaming to {}\n", names.join(", "));
+
+    Ok(Some((targets, outcome.settings)))
 }
 
 /// Set up logging: always to the console, and additionally to a timestamped
@@ -668,6 +707,7 @@ async fn main() -> Result<()> {
     // Parsed before logging starts so the flag itself never reaches the
     // subcommand matching below.
     let (raw_args, want_log) = extract_flag(&raw_args, "--log");
+    let (raw_args, no_tui) = extract_flag(&raw_args, "--no-tui");
     let (raw_args, debug_level) = util::extract_debug_level(&raw_args);
     let log_path = init_logging(debug_level, want_log)?;
     if let Some(p) = &log_path {
@@ -697,9 +737,39 @@ async fn main() -> Result<()> {
     let (raw_args, handoff) = extract_flag(&raw_args, "--handoff");
     let (raw_args, handoff_device) = util::extract_value(&raw_args, "--handoff-device");
     let (args, buffered) = extract_flag(&raw_args, "--buffered");
+
+    // --- Interactive picker -------------------------------------------------
+    //
+    // Bare `openair` on a terminal opens the TUI picker instead of scanning and
+    // then trying to pair with every device it found — which was slow, and on a
+    // shared network meant opening handshakes with strangers' receivers.
+    // `--no-tui` (or a non-terminal stdout, e.g. a pipe) keeps the old
+    // behaviour.
+    let use_tui = !no_tui && openair_tui::is_interactive();
+    let mut args = args;
+    let mut handoff = handoff;
+    let mut latency_ms = latency_ms;
+    let mut volume_db = volume_db;
+    let mut picked: Option<Vec<openair_client::GroupTarget>> = None;
+
+    if args.is_empty() && use_tui {
+        match run_picker()? {
+            None => return Ok(()),
+            Some((targets, settings)) => {
+                picked = Some(targets);
+                // The picker's toggles stand in for the flags on this path.
+                handoff = settings.handoff;
+                latency_ms = settings.latency_ms;
+                volume_db = settings.volume_db;
+                args = vec!["capture".to_string(), PICKER_SELECTION.to_string()];
+            }
+        }
+    }
+
     // --handoff mirrors live volume, which only the buffered pipeline applies,
-    // so enabling it implies --buffered.
-    let buffered = buffered || handoff;
+    // so enabling it implies --buffered. Picked receivers always stream
+    // buffered — it is the pipeline with selectable latency.
+    let buffered = buffered || handoff || picked.is_some();
 
     // --handoff (mute local speakers + mirror Windows volume) is capture-only
     // and Windows-only. Reject early with a clear message otherwise.
@@ -828,8 +898,14 @@ async fn main() -> Result<()> {
             println!("usage: openair capture <receiver>... [seconds]");
             return Ok(());
         }
-        let Some(receivers) = resolve_receivers(&recv_args, &offsets) else {
-            return Ok(());
+        // The picker already resolved its choices; only the name-argument path
+        // needs a discovery round.
+        let receivers = match picked.take() {
+            Some(targets) => targets,
+            None => match resolve_receivers(&recv_args, &offsets) {
+                Some(r) => r,
+                None => return Ok(()),
+            },
         };
 
         let stop = Arc::new(AtomicBool::new(false));

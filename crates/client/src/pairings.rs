@@ -94,6 +94,15 @@ impl PairingStore {
         Some(PeerCredentials { peer_id, ltpk })
     }
 
+    /// Device IDs we hold credentials for.
+    ///
+    /// The picker uses this to mark receivers as already paired without
+    /// contacting anything — the whole point being that it can show useful
+    /// state from local knowledge alone.
+    pub fn peer_ids(&self) -> Vec<String> {
+        self.file.peers.keys().cloned().collect()
+    }
+
     /// Record (or replace) the accessory credentials for a device and save.
     pub fn set_peer(&mut self, device_id: &str, peer: &PeerCredentials) -> io::Result<()> {
         self.file.peers.insert(
