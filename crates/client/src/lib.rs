@@ -22,8 +22,10 @@ use tracing::{debug, info, trace, warn};
 
 mod pairings;
 mod source;
+mod stats;
 pub use pairings::PairingStore;
 pub use source::{CaptureSource, SineSource, WavSource};
+pub use stats::{ReceiverStat, ReceiverState, StreamStats};
 
 pub(crate) const SAMPLE_RATE: u32 = 44100;
 
@@ -499,6 +501,7 @@ pub fn stream_audio_buffered_with_latency(
         latency_ms,
         None,
         None,
+        None,
     )
 }
 
@@ -552,6 +555,11 @@ struct PreparedReceiver {
 /// first successful attempt or `Err(())` once it gives up.
 struct ReconnectHandle {
     name: String,
+    /// Kept so an observer can list a recovering receiver without waiting for
+    /// it to rejoin — otherwise a dropped receiver simply disappears from the
+    /// dashboard until it comes back, which reads like data loss.
+    addr: SocketAddr,
+    offset_ns: i64,
     rx: std::sync::mpsc::Receiver<Result<PreparedReceiver, ()>>,
 }
 
@@ -614,7 +622,12 @@ fn spawn_reconnect(addr: SocketAddr, device_id: String, offset_ns: i64) -> Recon
         warn!(receiver = %thread_name, "giving up reconnecting");
         let _ = tx.send(Err(()));
     });
-    ReconnectHandle { name, rx }
+    ReconnectHandle {
+        name,
+        addr,
+        offset_ns,
+        rx,
+    }
 }
 
 /// Spawn the per-receiver TCP writer thread: it drains its bounded queue and
@@ -861,6 +874,41 @@ fn send_metadata(r: &mut BufferedReceiver, np: &NowPlaying, rtptime: u32) {
     }
 }
 
+/// Snapshot the group for an observer: the receivers currently streaming, plus
+/// one entry per reconnect still in flight so a dropped receiver stays visible
+/// rather than vanishing from the list while it recovers.
+fn receiver_stats(
+    group: &[BufferedReceiver],
+    handles: &[ReconnectHandle],
+    reconnect: bool,
+) -> Vec<ReceiverStat> {
+    let mut out: Vec<ReceiverStat> = group
+        .iter()
+        .map(|r| ReceiverStat {
+            name: r.name.clone(),
+            addr: r.addr,
+            state: ReceiverState::Connected,
+            offset_ms: r.offset_ns / 1_000_000,
+        })
+        .collect();
+
+    for h in handles {
+        // Without reconnect enabled (file playback) a gone receiver is gone.
+        let state = if reconnect {
+            ReceiverState::Reconnecting
+        } else {
+            ReceiverState::Dead
+        };
+        out.push(ReceiverStat {
+            name: h.name.clone(),
+            addr: h.addr,
+            state,
+            offset_ms: h.offset_ns / 1_000_000,
+        });
+    }
+    out
+}
+
 /// Send the periodic `/feedback` keepalive to every live receiver every ~2 s
 /// (also keeps a paused stream's session from timing out).
 fn service_feedback(group: &mut [BufferedReceiver], last: &mut Instant) {
@@ -902,6 +950,7 @@ pub fn stream_audio_buffered_multi(
     latency_ms: u64,
     volume_rx: Option<std::sync::mpsc::Receiver<f32>>,
     metadata_rx: Option<std::sync::mpsc::Receiver<NowPlaying>>,
+    stats: Option<Arc<StreamStats>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if targets.is_empty() {
         return Err("no receivers given".into());
@@ -1115,6 +1164,9 @@ pub fn stream_audio_buffered_multi(
                         send_metadata(r, &np, rtptime);
                     }
                 }
+                if let Some(s) = &stats {
+                    s.set_now_playing(np.clone());
+                }
                 current_metadata = Some(np);
                 last_metadata_send = Instant::now();
             } else if let Some(np) = &current_metadata {
@@ -1232,11 +1284,24 @@ pub fn stream_audio_buffered_multi(
             // Receivers that just dropped go to background reconnect.
             reap_dead(&mut group, &mut handles, reconnect);
 
+            if let Some(s) = &stats {
+                // One AAC frame goes to every receiver, so this is per-receiver
+                // payload — the number a bandwidth reading should reflect.
+                s.add_bytes(aac_frame.len() as u64);
+                // Rebuilt here rather than inside `reap_dead` and the reconnect
+                // path: this is the one place that sees the group after every
+                // change, so the view cannot drift out of step with reality.
+                s.set_receivers(receiver_stats(&group, &handles, reconnect));
+            }
+
             // Auto-latency: how much headroom does the just-queued frame have
             // before its play deadline? Track the window minimum.
             let lead = play_deadline_ns(anchor_t_local, anchor_rtptime, rtptime) as i64
                 - ptp_now_ns() as i64;
             min_lead_ns = min_lead_ns.min(lead);
+            if let Some(s) = &stats {
+                s.record_lead_ms(lead / 1_000_000);
+            }
 
             if window_start.elapsed() >= AUTO_LATENCY_WINDOW {
                 if min_lead_ns < UNDERRUN_LEAD_FLOOR.as_nanos() as i64
@@ -1268,6 +1333,9 @@ pub fn stream_audio_buffered_multi(
                     anchor_t_local = t_local;
                     anchor_rtptime = rtptime;
                     last_bump = Instant::now();
+                    if let Some(s) = &stats {
+                        s.set_latency_ms(current_latency);
+                    }
                 }
                 min_lead_ns = i64::MAX;
                 window_start = Instant::now();
@@ -1298,6 +1366,9 @@ pub fn stream_audio_buffered_multi(
     info!("stream finished, tearing down");
     for r in &mut group {
         r.finish();
+    }
+    if let Some(s) = &stats {
+        s.mark_ended();
     }
     Ok(())
 }

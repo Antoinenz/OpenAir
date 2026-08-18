@@ -794,17 +794,18 @@ async fn main() -> Result<()> {
                           volume_rx: Option<std::sync::mpsc::Receiver<f32>>,
                           metadata_rx: Option<
         std::sync::mpsc::Receiver<openair_core::metadata::NowPlaying>,
-    >| {
+    >,
+                          stats: Option<Arc<openair_client::StreamStats>>| {
         if targets.len() > 1 && !buffered {
             println!("  (multi-room uses the buffered pipeline — enabling --buffered)");
         }
         if buffered || targets.len() > 1 {
             openair_client::stream_audio_buffered_multi(
-                targets, source, volume, latency_ms, volume_rx, metadata_rx,
+                targets, source, volume, latency_ms, volume_rx, metadata_rx, stats,
             )
         } else {
-            // The realtime ALAC path has no metadata channel.
-            let _ = metadata_rx;
+            // The realtime ALAC path has neither a metadata channel nor stats.
+            let _ = (metadata_rx, stats);
             openair_client::stream_audio(targets[0].addr, &targets[0].device_id, source, volume)
         }
     };
@@ -1001,7 +1002,7 @@ async fn main() -> Result<()> {
             source = source.with_blocking();
         }
 
-        match stream_fn(&receivers, &mut source, Some(volume_db), volume_rx, metadata_rx) {
+        match stream_fn(&receivers, &mut source, Some(volume_db), volume_rx, metadata_rx, None) {
             Ok(()) => println!("  ✓ capture streamed successfully"),
             Err(e) => println!("  ✗ {}", e),
         }
@@ -1038,7 +1039,7 @@ async fn main() -> Result<()> {
             }
         };
 
-        match stream_fn(&receivers, &mut source, Some(volume_db), None, None) {
+        match stream_fn(&receivers, &mut source, Some(volume_db), None, None, None) {
             Ok(()) => println!("  ✓ playback finished successfully"),
             Err(e) => println!("  ✗ {}", e),
         }
@@ -1070,7 +1071,7 @@ async fn main() -> Result<()> {
             .join(", ");
         println!("OpenAir — streaming {}s test tone to {}\n", seconds, dest);
         let mut source = openair_client::SineSource::new(440.0, seconds);
-        match stream_fn(&receivers, &mut source, Some(volume_db), None, None) {
+        match stream_fn(&receivers, &mut source, Some(volume_db), None, None, None) {
             Ok(()) => println!("  ✓ tone streamed successfully"),
             Err(e) => println!("  ✗ {}", e),
         }
