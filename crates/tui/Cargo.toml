@@ -5,17 +5,12 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
-[[bin]]
-name = "openair-tui"
-path = "src/main.rs"
-
 [dependencies]
-openair-client = { path = "../../crates/client" }
-openair-discovery = { path = "../../crates/discovery" }
-openair-core = { path = "../../crates/core" }
-tokio.workspace = true
+openair-discovery = { path = "../discovery" }
+openair-core = { path = "../core" }
 ratatui.workspace = true
 crossterm.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-anyhow.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true

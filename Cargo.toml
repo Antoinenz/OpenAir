@@ -12,8 +12,8 @@ members = [
     "crates/capture",
     "crates/ptp-helper",
     "crates/client",
+    "crates/tui",
     "apps/cli",
-    "apps/tui",
 ]
 
 [workspace.package]

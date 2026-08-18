@@ -15,6 +15,7 @@ openair-discovery = { path = "../../crates/discovery" }
 openair-rtsp = { path = "../../crates/rtsp" }
 openair-core = { path = "../../crates/core" }
 openair-capture = { path = "../../crates/capture" }
+openair-tui = { path = "../../crates/tui" }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
