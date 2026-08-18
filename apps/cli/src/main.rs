@@ -614,7 +614,11 @@ fn run_picker() -> Result<Option<(Vec<openair_client::GroupTarget>, openair_tui:
 /// A file copy matters because the interesting bugs here only show up in a
 /// full run's log — the 30 s Apple TV teardown was found by comparing event
 /// ordering across runs, which is painful to do from a scrollback buffer.
-fn init_logging(debug_level: u8, to_file: bool) -> Result<Option<std::path::PathBuf>> {
+fn init_logging(
+    debug_level: u8,
+    to_file: bool,
+    panel: openair_tui::LogBuffer,
+) -> Result<Option<std::path::PathBuf>> {
     use tracing_subscriber::prelude::*;
 
     let build_filter = |level: u8| -> Result<EnvFilter> {
@@ -660,8 +664,22 @@ fn init_logging(debug_level: u8, to_file: bool) -> Result<Option<std::path::Path
         None => None,
     };
 
+    // While the dashboard owns the screen, console writes would scribble over
+    // the frame. Rather than rebuilding the subscriber when it starts, the
+    // console layer carries a second, dynamic filter that consults a flag the
+    // dashboard sets — so the same process narrates normally before and after,
+    // and stays silent during.
+    let console_layer = tracing_subscriber::fmt::layer()
+        .with_filter(console_filter)
+        .with_filter(tracing_subscriber::filter::filter_fn(|_| {
+            !openair_tui::logs::console_quiet()
+        }));
+
     tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer().with_filter(console_filter))
+        .with(console_layer)
+        // The panel's own filter matches the console's, so `--debug` controls
+        // both the same way.
+        .with(openair_tui::LogLayer::new(panel).with_filter(build_filter(debug_level)?))
         .with(file_layer)
         .init();
 
@@ -709,7 +727,11 @@ async fn main() -> Result<()> {
     let (raw_args, want_log) = extract_flag(&raw_args, "--log");
     let (raw_args, no_tui) = extract_flag(&raw_args, "--no-tui");
     let (raw_args, debug_level) = util::extract_debug_level(&raw_args);
-    let log_path = init_logging(debug_level, want_log)?;
+    // Shared with the dashboard's log panel. Always installed — it is 500
+    // bounded lines, and having it ready means the panel shows what happened
+    // *before* it opened, including setup and pairing.
+    let log_panel = openair_tui::LogBuffer::default();
+    let log_path = init_logging(debug_level, want_log, log_panel.clone())?;
     if let Some(p) = &log_path {
         println!("📝 logging this run to {}", p.display());
     }
@@ -751,6 +773,9 @@ async fn main() -> Result<()> {
     let mut latency_ms = latency_ms;
     let mut volume_db = volume_db;
     let mut picked: Option<Vec<openair_client::GroupTarget>> = None;
+    // Which series the dashboard graph opens on; the dashboard writes the
+    // user's choice back when it exits.
+    let mut dashboard_graph = openair_tui::Settings::load().graph;
 
     if args.is_empty() && use_tui {
         match run_picker()? {
@@ -761,6 +786,7 @@ async fn main() -> Result<()> {
                 handoff = settings.handoff;
                 latency_ms = settings.latency_ms;
                 volume_db = settings.volume_db;
+                dashboard_graph = settings.graph;
                 args = vec!["capture".to_string(), PICKER_SELECTION.to_string()];
             }
         }
@@ -993,7 +1019,7 @@ async fn main() -> Result<()> {
             cap.ring.clone(),
             cap.device_rate,
             seconds,
-            Some(stop),
+            Some(stop.clone()),
         );
         // Buffered pipelines send ahead of realtime; a live source must
         // rate-limit them by blocking for data instead of padding silence
@@ -1002,7 +1028,53 @@ async fn main() -> Result<()> {
             source = source.with_blocking();
         }
 
-        match stream_fn(&receivers, &mut source, Some(volume_db), volume_rx, metadata_rx, None) {
+        // The dashboard renders on a worker thread while the stream keeps this
+        // one — that way nothing in the audio path has to become `Send`, and
+        // `q` simply sets the same `stop` flag Ctrl+C already used, so quitting
+        // takes the existing graceful path.
+        let (stats, dashboard) = if use_tui {
+            let stats = openair_client::StreamStats::new(latency_ms);
+            let handle = openair_tui::spawn_dashboard(
+                Arc::clone(&stats),
+                log_panel.clone(),
+                stop.clone(),
+                dashboard_graph,
+            );
+            (Some(stats), Some(handle))
+        } else {
+            (None, None)
+        };
+
+        let result = stream_fn(
+            &receivers,
+            &mut source,
+            Some(volume_db),
+            volume_rx,
+            metadata_rx,
+            stats.clone(),
+        );
+
+        // Let the dashboard notice the stream is over even if it failed, or it
+        // would keep drawing a frozen frame forever.
+        if let Some(stats) = &stats {
+            stats.mark_ended();
+        }
+        if let Some(dashboard) = dashboard {
+            match dashboard.join() {
+                Ok(summary) => {
+                    println!("{summary}");
+                    // Remember which graph was left showing.
+                    let mut settings = openair_tui::Settings::load();
+                    if settings.graph != summary.graph {
+                        settings.graph = summary.graph;
+                        let _ = settings.save();
+                    }
+                }
+                Err(e) => println!("  ⚠ dashboard error: {e}"),
+            }
+        }
+
+        match result {
             Ok(()) => println!("  ✓ capture streamed successfully"),
             Err(e) => println!("  ✗ {}", e),
         }

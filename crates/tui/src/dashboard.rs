@@ -148,6 +148,11 @@ impl DashboardState {
     pub fn latest_lead_ms(&self) -> Option<i64> {
         self.buffer_history.back().copied()
     }
+
+    /// Total bytes sent as of the last sample.
+    pub fn bytes_total(&self) -> u64 {
+        self.last_bytes.map(|(bytes, _)| bytes).unwrap_or(0)
+    }
 }
 
 fn push_bounded<T>(q: &mut VecDeque<T>, v: T) {

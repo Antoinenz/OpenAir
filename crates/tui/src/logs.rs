@@ -165,6 +165,22 @@ impl Visit for MessageVisitor {
     }
 }
 
+/// Whether console log output is currently suppressed.
+///
+/// While the dashboard owns the screen, a stray log write would scribble over
+/// the frame. Rather than rebuilding the subscriber mid-run, the console layer
+/// carries a filter that consults this flag — so the same process can narrate
+/// normally before and after the dashboard, and stay silent during it.
+static CONSOLE_QUIET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_console_quiet(quiet: bool) {
+    CONSOLE_QUIET.store(quiet, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn console_quiet() -> bool {
+    CONSOLE_QUIET.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// `HH:MM:SS` UTC, without pulling in a date library.
 fn clock_time() -> String {
     let secs = SystemTime::now()

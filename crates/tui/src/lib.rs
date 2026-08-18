@@ -10,12 +10,14 @@
 //! boundaries and reach the TUI as plain data.
 
 pub mod dashboard;
+pub mod dashboard_ui;
 pub mod logs;
 pub mod picker;
 pub mod picker_ui;
 pub mod settings;
 pub mod term;
 
+pub use dashboard_ui::{spawn_dashboard, DashboardHandle, Summary};
 pub use logs::{LogBuffer, LogLayer, LogLine};
 pub use picker::{PickerAction, PickerRow, PickerState};
 pub use picker_ui::{run_picker, PickerOutcome};
