@@ -17,16 +17,7 @@ use tracing::{debug, info, warn};
 
 /// Where our PTP clock identity is persisted so it survives restarts.
 fn clock_id_path() -> Option<std::path::PathBuf> {
-    let dir = if cfg!(windows) {
-        std::env::var_os("APPDATA").map(std::path::PathBuf::from)
-    } else {
-        std::env::var_os("XDG_CONFIG_HOME")
-            .map(std::path::PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config"))
-            })
-    };
-    dir.map(|d| d.join("OpenAir").join("ptp_clock_id"))
+    openair_core::config::config_file("ptp_clock_id")
 }
 
 /// Generate a fresh locally-administered EUI-64 clock identity.

@@ -125,17 +125,7 @@ impl PairingStore {
 }
 
 fn store_path() -> io::Result<PathBuf> {
-    let base = if cfg!(windows) {
-        std::env::var_os("APPDATA")
-            .map(PathBuf::from)
-            .map(|p| p.join("OpenAir"))
-    } else {
-        std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-            .map(|p| p.join("openair"))
-    };
-    base.map(|p| p.join("pairings.json")).ok_or_else(|| {
+    openair_core::config::config_file("pairings.json").ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
             "cannot locate config directory (APPDATA/HOME unset)",

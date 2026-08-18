@@ -358,9 +358,7 @@ fn endpoint_volume_for(device_id: &str) -> Result<IAudioEndpointVolume, HandoffE
 
 /// Where the pre-handoff device id is stashed while a session is active.
 fn restore_file() -> Option<PathBuf> {
-    std::env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .map(|d| d.join("OpenAir").join("handoff_restore.txt"))
+    openair_core::config::config_file("handoff_restore.txt")
 }
 
 fn persist_restore(device_id: &str) {
