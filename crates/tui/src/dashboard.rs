@@ -363,6 +363,7 @@ mod tests {
             addr: "192.168.1.51:7000".parse().unwrap(),
             state: openair_client::ReceiverState::Connected,
             offset_ms: 0,
+            trim_db: 0.0,
         }]);
         d.sample(&stats, Instant::now());
         assert_eq!(d.latency_ms, 750);

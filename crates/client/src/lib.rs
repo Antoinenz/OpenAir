@@ -25,7 +25,9 @@ mod source;
 mod stats;
 pub use pairings::PairingStore;
 pub use source::{CaptureSource, SineSource, WavSource};
-pub use stats::{ReceiverStat, ReceiverState, StreamStats};
+pub use stats::{
+    ReceiverStat, ReceiverState, StreamCommand, StreamStats, TRIM_MAX_DB, TRIM_MIN_DB,
+};
 
 pub(crate) const SAMPLE_RATE: u32 = 44100;
 
@@ -525,6 +527,12 @@ struct BufferedReceiver {
     cipher: AudioCipher,
     /// Per-receiver anchor offset in ns (from `GroupTarget::offset_ms`).
     offset_ns: i64,
+    /// Per-receiver volume trim in dB, applied on top of the group's master
+    /// level. A *trim* rather than an absolute level because `--handoff`
+    /// mirrors the Windows master onto every receiver — an absolute
+    /// per-receiver volume would be flattened the moment the user touched the
+    /// Windows slider, whereas a trim preserves the balance they dialled in.
+    trim_db: f32,
     /// Bounded queue to this receiver's TCP writer thread. `None` once closed.
     tx: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
     writer: Option<std::thread::JoinHandle<()>>,
@@ -544,6 +552,10 @@ struct PreparedReceiver {
     addr: SocketAddr,
     device_id: String,
     offset_ns: i64,
+    /// Carried through a reconnect so a receiver keeps the trim the user set
+    /// before it dropped, rather than silently snapping back to the group
+    /// level when it rejoins.
+    trim_db: f32,
     session: StreamSession,
     cipher: AudioCipher,
     control: ControlChannel,
@@ -555,6 +567,7 @@ struct PreparedReceiver {
 /// first successful attempt or `Err(())` once it gives up.
 struct ReconnectHandle {
     name: String,
+    trim_db: f32,
     /// Kept so an observer can list a recovering receiver without waiting for
     /// it to rejoin — otherwise a dropped receiver simply disappears from the
     /// dashboard until it comes back, which reads like data loss.
@@ -570,6 +583,7 @@ fn prepare_receiver(
     target_addr: SocketAddr,
     device_id: &str,
     offset_ns: i64,
+    trim_db: f32,
 ) -> Result<PreparedReceiver, Box<dyn std::error::Error>> {
     let name = format!("{target_addr}");
     let control = ControlChannel::bind()?;
@@ -590,6 +604,7 @@ fn prepare_receiver(
         addr: target_addr,
         device_id: device_id.to_string(),
         offset_ns,
+        trim_db,
         session,
         cipher,
         control,
@@ -603,15 +618,23 @@ fn prepare_receiver(
 /// first success (or final failure) back to the main loop. Runs off the audio
 /// thread so healthy receivers keep playing uninterrupted during the
 /// seconds-long re-pair/SETUP.
-fn spawn_reconnect(addr: SocketAddr, device_id: String, offset_ns: i64) -> ReconnectHandle {
+fn spawn_reconnect(
+    addr: SocketAddr,
+    device_id: String,
+    offset_ns: i64,
+    trim_db: f32,
+    delay_first: bool,
+) -> ReconnectHandle {
     let name = format!("{addr}");
     let (tx, rx) = std::sync::mpsc::channel();
     let thread_name = name.clone();
     std::thread::spawn(move || {
         for attempt in 1..=MAX_RECONNECT_ATTEMPTS {
-            std::thread::sleep(RECONNECT_BACKOFF * attempt);
+            if delay_first || attempt > 1 {
+                std::thread::sleep(RECONNECT_BACKOFF * attempt);
+            }
             info!(receiver = %thread_name, attempt, "reconnect attempt");
-            match prepare_receiver(addr, &device_id, offset_ns) {
+            match prepare_receiver(addr, &device_id, offset_ns, trim_db) {
                 Ok(prep) => {
                     let _ = tx.send(Ok(prep));
                     return;
@@ -624,6 +647,7 @@ fn spawn_reconnect(addr: SocketAddr, device_id: String, offset_ns: i64) -> Recon
     });
     ReconnectHandle {
         name,
+        trim_db,
         addr,
         offset_ns,
         rx,
@@ -673,6 +697,7 @@ fn finish_reconnect(
         session: prep.session,
         cipher: prep.cipher,
         offset_ns: prep.offset_ns,
+        trim_db: prep.trim_db,
         tx: None,
         writer: None,
         _event: prep.event,
@@ -694,9 +719,7 @@ fn finish_reconnect(
         warn!(receiver = %br.name, "rejoin anchor failed: {e}");
         return None;
     }
-    if let Some(db) = volume_db {
-        br.session.set_volume(db).ok();
-    }
+    apply_volume(&mut br, volume_db);
     if paused {
         // Group is mid-pause; keep the newcomer quiet until the group resumes.
         br.session.set_rate(0).ok();
@@ -731,7 +754,13 @@ fn reap_dead(group: &mut Vec<BufferedReceiver>, handles: &mut Vec<ReconnectHandl
         }
         if reconnect {
             info!(receiver = %dead.name, "receiver dropped — scheduling reconnect");
-            handles.push(spawn_reconnect(dead.addr, dead.device_id.clone(), dead.offset_ns));
+            handles.push(spawn_reconnect(
+                dead.addr,
+                dead.device_id.clone(),
+                dead.offset_ns,
+                dead.trim_db,
+                true,
+            ));
         }
     }
 }
@@ -874,6 +903,105 @@ fn send_metadata(r: &mut BufferedReceiver, np: &NowPlaying, rtptime: u32) {
     }
 }
 
+/// Push a receiver's effective volume: the group master plus that receiver's
+/// trim, clamped to the protocol's usable range.
+///
+/// Failure is logged and swallowed — a receiver that rejects a volume change
+/// must keep playing. Being at the wrong level is a nuisance; going silent is a
+/// bug.
+fn apply_volume(r: &mut BufferedReceiver, master_db: Option<f32>) {
+    let Some(master) = master_db else { return };
+    // -144 is the AirPlay "muted" sentinel; clamping to it means a deep trim
+    // mutes rather than wrapping into nonsense.
+    let effective = stats::effective_volume_db(master, r.trim_db);
+    if let Err(e) = r.session.set_volume(effective) {
+        warn!(receiver = %r.name, "set_volume failed (continuing): {e}");
+    }
+}
+
+/// Apply one observer command to the live group.
+///
+/// Every arm follows the rule the codebase already uses for metadata: log the
+/// failure, drop the receiver if it is unrecoverable, never take the stream
+/// down. A UI control that misfires must not cost the user their audio.
+#[allow(clippy::too_many_arguments)]
+fn apply_command(
+    cmd: stats::StreamCommand,
+    group: &mut Vec<BufferedReceiver>,
+    handles: &mut Vec<ReconnectHandle>,
+    ptp: &PtpMaster,
+    master_db: Option<f32>,
+    anchor_t_local: u64,
+    anchor_rtptime: u32,
+    rtptime: u32,
+) {
+    use stats::{StreamCommand, TRIM_MAX_DB, TRIM_MIN_DB};
+
+    match cmd {
+        StreamCommand::SetTrim { addr, db } => {
+            let db = db.clamp(TRIM_MIN_DB, TRIM_MAX_DB);
+            // Update the pending reconnect too, so a receiver that is away
+            // when the user trims it comes back at the level they chose.
+            for h in handles.iter_mut().filter(|h| h.addr == addr) {
+                h.trim_db = db;
+            }
+            let Some(r) = group.iter_mut().find(|r| r.addr == addr && r.alive) else {
+                return;
+            };
+            r.trim_db = db;
+            info!(receiver = %r.name, trim_db = db, "volume trim");
+            apply_volume(r, master_db);
+        }
+
+        StreamCommand::SetOffset { addr, ms } => {
+            for h in handles.iter_mut().filter(|h| h.addr == addr) {
+                h.offset_ns = ms * 1_000_000;
+            }
+            let Some(r) = group.iter_mut().find(|r| r.addr == addr && r.alive) else {
+                return;
+            };
+            r.offset_ns = ms * 1_000_000;
+            // Re-state the group's schedule for this receiver alone, at the
+            // current position, so its new offset takes effect without
+            // disturbing anyone else's anchor.
+            let play_at = play_deadline_ns(anchor_t_local, anchor_rtptime, rtptime);
+            match anchor_receiver(ptp, r, play_at, rtptime) {
+                Ok(()) => info!(receiver = %r.name, offset_ms = ms, "offset changed"),
+                Err(e) => {
+                    warn!(receiver = %r.name, "re-anchor after offset change failed — dropping: {e}");
+                    r.alive = false;
+                }
+            }
+        }
+
+        StreamCommand::Remove { addr } => {
+            // Cancel a pending reconnect for the same address, or the receiver
+            // the user just removed would reappear moments later.
+            handles.retain(|h| h.addr != addr);
+            let Some(i) = group.iter().position(|r| r.addr == addr) else {
+                return;
+            };
+            let mut gone = group.remove(i);
+            info!(receiver = %gone.name, "removed from group");
+            gone.finish();
+        }
+
+        StreamCommand::Add { addr, device_id } => {
+            if group.iter().any(|r| r.addr == addr) || handles.iter().any(|h| h.addr == addr) {
+                info!(%addr, "already in the group — ignoring add");
+                return;
+            }
+            // Adding mid-stream is the same operation as recovering a dropped
+            // receiver: prepare off-thread, then RECORD and anchor against the
+            // live baseline when it is ready. Reusing that path means a new
+            // receiver lands in sync by the same code that keeps a rejoining
+            // one in sync.
+            info!(%addr, "adding receiver to the group");
+            handles.push(spawn_reconnect(addr, device_id, 0, 0.0, false));
+        }
+    }
+}
+
 /// Snapshot the group for an observer: the receivers currently streaming, plus
 /// one entry per reconnect still in flight so a dropped receiver stays visible
 /// rather than vanishing from the list while it recovers.
@@ -889,6 +1017,7 @@ fn receiver_stats(
             addr: r.addr,
             state: ReceiverState::Connected,
             offset_ms: r.offset_ns / 1_000_000,
+            trim_db: r.trim_db,
         })
         .collect();
 
@@ -904,6 +1033,7 @@ fn receiver_stats(
             addr: h.addr,
             state,
             offset_ms: h.offset_ns / 1_000_000,
+            trim_db: h.trim_db,
         });
     }
     out
@@ -983,6 +1113,7 @@ pub fn stream_audio_buffered_multi(
                 session,
                 cipher,
                 offset_ns: target.offset_ms * 1_000_000,
+                trim_db: 0.0,
                 tx: None,
                 writer: None,
                 _event: event,
@@ -1049,11 +1180,7 @@ pub fn stream_audio_buffered_multi(
             warn!(receiver = %r.name, "anchor failed — dropping: {e}");
             r.alive = false;
         }
-        if let Some(db) = volume_db {
-            if let Err(e) = r.session.set_volume(db) {
-                warn!(receiver = %r.name, "set_volume failed (continuing): {e}");
-            }
-        }
+        apply_volume(r, volume_db);
     }
     group.retain(|r| r.alive);
     if group.is_empty() {
@@ -1144,13 +1271,31 @@ pub fn stream_audio_buffered_multi(
         if let Some(rx) = &volume_rx {
             if let Some(db) = drain_latest_volume(rx) {
                 current_volume_db = Some(db);
+                // Each receiver keeps its own trim, so moving the master
+                // preserves the balance the user dialled in.
                 for r in group.iter_mut() {
                     if r.alive {
-                        if let Err(e) = r.session.set_volume(db) {
-                            warn!(receiver = %r.name, "handoff set_volume failed: {e}");
-                        }
+                        apply_volume(r, Some(db));
                     }
                 }
+            }
+        }
+
+        // Commands from an observer (the TUI dashboard). Drained at the same
+        // loop position as the volume mirror so they still land on the
+        // paused/priming `continue` paths below.
+        if let Some(s) = &stats {
+            for cmd in s.drain_commands() {
+                apply_command(
+                    cmd,
+                    &mut group,
+                    &mut handles,
+                    &ptp,
+                    current_volume_db,
+                    anchor_t_local,
+                    anchor_rtptime,
+                    rtptime,
+                );
             }
         }
 

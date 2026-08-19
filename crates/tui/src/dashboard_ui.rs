@@ -401,6 +401,7 @@ mod tests {
             addr: "192.168.1.51:7000".parse().unwrap(),
             state: ReceiverState::Connected,
             offset_ms: 80,
+            trim_db: 0.0,
         }]);
         state.sample(&stats, Instant::now());
 
