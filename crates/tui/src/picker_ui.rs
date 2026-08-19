@@ -15,10 +15,6 @@ use crate::picker::{PickerAction, PickerRow, PickerState};
 use crate::settings::Settings;
 use crate::term;
 
-/// Inline viewport height. Tall enough for a handful of receivers without
-/// taking over the screen — the picker should feel like a prompt.
-const VIEWPORT_ROWS: u16 = 14;
-
 /// How long to wait for a key before redrawing. Also the rate at which newly
 /// discovered devices appear.
 const TICK: Duration = Duration::from_millis(100);
@@ -43,7 +39,10 @@ pub fn run_picker(
     let browse = openair_discovery::browse_live()
         .map_err(|e| io::Error::other(format!("mDNS discovery failed: {e}")))?;
 
-    let (mut terminal, _guard) = term::enter_inline(VIEWPORT_ROWS)?;
+    // Full screen, like the dashboard it leads into — the two screens are one
+    // flow, and having the first be an inline prompt that then jumps to an
+    // alternate screen made the transition jarring.
+    let (mut terminal, _guard) = term::enter_alt()?;
 
     let outcome = loop {
         while let Ok(device) = browse.devices.try_recv() {
@@ -108,7 +107,7 @@ fn render(frame: &mut Frame, state: &PickerState) {
             Style::default().fg(Color::Yellow),
         ))),
         None => Paragraph::new(Line::from(Span::styled(
-            "  ↑↓ move · space select · h handoff · +/- latency · ⏎ start · q quit",
+            "  ↑↓ move · ⏎ select · space start · h handoff · +/- latency · q quit",
             Style::default().fg(Color::DarkGray),
         ))),
     };

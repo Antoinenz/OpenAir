@@ -263,7 +263,7 @@ fn render_add_overlay(frame: &mut Frame, state: &PickerState) {
     let hint = match state.hint() {
         Some(h) => Span::styled(format!("  {h}"), Style::default().fg(Color::Yellow)),
         None => Span::styled(
-            "  ↑↓ move · space select · ⏎ add · esc cancel",
+            "  ↑↓ move · ⏎ select · space add · esc cancel",
             Style::default().fg(Color::DarkGray),
         ),
     };
