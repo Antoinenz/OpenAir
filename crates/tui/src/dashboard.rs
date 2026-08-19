@@ -5,11 +5,13 @@
 //! where sampling turns them into the series the graph draws, which is what
 //! keeps the audio path free of any notion of a display rate.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
+use std::net::SocketAddr;
+
 use crossterm::event::KeyCode;
-use openair_client::{ReceiverStat, StreamStats};
+use openair_client::{ReceiverStat, StreamCommand, StreamStats, TRIM_MAX_DB, TRIM_MIN_DB};
 use openair_core::metadata::NowPlaying;
 
 use crate::settings::GraphKind;
@@ -22,7 +24,24 @@ pub const HISTORY: usize = 120;
 pub enum DashAction {
     None,
     Quit,
+    /// Send this to the stream.
+    Command(StreamCommand),
+    /// Open the add-a-receiver overlay.
+    OpenPicker,
 }
+
+/// Volume trim step per key press, in dB. One dB is the smallest step that is
+/// reliably audible, so a key press always does something.
+pub const TRIM_STEP_DB: f32 = 1.0;
+
+/// Offset step per key press, in ms. Ten is about the smallest shift that
+/// changes where a room sits in a stereo image.
+pub const OFFSET_STEP_MS: i64 = 10;
+
+/// Offset bounds. Beyond this the receiver is no longer in the same room as
+/// the rest of the group in any useful sense.
+pub const OFFSET_MIN_MS: i64 = -500;
+pub const OFFSET_MAX_MS: i64 = 500;
 
 pub struct DashboardState {
     /// Milliseconds of headroom, oldest first.
@@ -40,6 +59,24 @@ pub struct DashboardState {
     /// Lowest headroom seen for the whole run — the number worth remembering
     /// after a dropout, since the graph will have scrolled past it.
     pub worst_lead_ms: Option<i64>,
+    /// The highlighted receiver, tracked by address rather than row index.
+    /// The group's membership changes underneath the cursor as receivers drop,
+    /// reconnect and get added — an index would quietly come to mean a
+    /// different receiver, and the next key press would hit the wrong one.
+    selected: Option<SocketAddr>,
+    /// Values the user has asked for but the stream hasn't confirmed yet.
+    ///
+    /// Without this, a held key loses steps: the UI samples at 10 Hz but key
+    /// repeat is ~30 Hz, so a sample carrying the pre-keypress value would
+    /// overwrite the local one and the next press would recompute from stale
+    /// state. An entry is dropped as soon as the stream reports the value back.
+    pending: HashMap<SocketAddr, Pending>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct Pending {
+    trim_db: Option<f32>,
+    offset_ms: Option<i64>,
 }
 
 impl DashboardState {
@@ -55,6 +92,8 @@ impl DashboardState {
             now_playing: None,
             log_scroll: 0,
             worst_lead_ms: None,
+            selected: None,
+            pending: HashMap::new(),
         }
     }
 
@@ -91,9 +130,73 @@ impl DashboardState {
 
         self.latency_ms = stats.latency_ms();
         self.receivers = stats.receivers();
+        self.reconcile_pending();
+        self.ensure_selection();
         if let Some(np) = stats.now_playing() {
             self.now_playing = Some(np);
         }
+    }
+
+    /// Keep locally-set values visible until the stream confirms them, then
+    /// let the stream's value stand — it is the authority, and a trim it
+    /// clamped or refused must show up rather than being hidden forever.
+    fn reconcile_pending(&mut self) {
+        self.pending.retain(|addr, pending| {
+            let Some(r) = self.receivers.iter_mut().find(|r| r.addr == *addr) else {
+                // Receiver is gone; so is anything pending for it.
+                return false;
+            };
+            if let Some(want) = pending.trim_db {
+                if (r.trim_db - want).abs() < f32::EPSILON {
+                    pending.trim_db = None;
+                } else {
+                    r.trim_db = want;
+                }
+            }
+            if let Some(want) = pending.offset_ms {
+                if r.offset_ms == want {
+                    pending.offset_ms = None;
+                } else {
+                    r.offset_ms = want;
+                }
+            }
+            pending.trim_db.is_some() || pending.offset_ms.is_some()
+        });
+    }
+
+    /// Select something sensible: the first receiver on the first sample, and
+    /// a surviving neighbour if the selected one disappears.
+    fn ensure_selection(&mut self) {
+        if self.receivers.is_empty() {
+            self.selected = None;
+            return;
+        }
+        let still_there = self
+            .selected
+            .is_some_and(|addr| self.receivers.iter().any(|r| r.addr == addr));
+        if !still_there {
+            self.selected = Some(self.receivers[0].addr);
+        }
+    }
+
+    /// Index of the highlighted receiver, or `None` when the list is empty.
+    pub fn cursor(&self) -> Option<usize> {
+        let selected = self.selected?;
+        self.receivers.iter().position(|r| r.addr == selected)
+    }
+
+    pub fn selected_receiver(&self) -> Option<&ReceiverStat> {
+        self.cursor().and_then(|i| self.receivers.get(i))
+    }
+
+    fn move_cursor(&mut self, delta: isize) {
+        if self.receivers.is_empty() {
+            self.selected = None;
+            return;
+        }
+        let current = self.cursor().unwrap_or(0) as isize;
+        let next = (current + delta).clamp(0, self.receivers.len() as isize - 1);
+        self.selected = Some(self.receivers[next as usize].addr);
     }
 
     pub fn on_key(&mut self, key: KeyCode) -> DashAction {
@@ -103,16 +206,64 @@ impl DashboardState {
                 DashAction::None
             }
             KeyCode::Up => {
-                self.log_scroll = self.log_scroll.saturating_add(1);
+                self.move_cursor(-1);
                 DashAction::None
             }
             KeyCode::Down => {
+                self.move_cursor(1);
+                DashAction::None
+            }
+            // Log scrolling moved off the arrow keys, which now drive the
+            // receiver cursor.
+            KeyCode::PageUp => {
+                self.log_scroll = self.log_scroll.saturating_add(1);
+                DashAction::None
+            }
+            KeyCode::PageDown => {
                 self.log_scroll = self.log_scroll.saturating_sub(1);
                 DashAction::None
             }
+            KeyCode::Char('+') | KeyCode::Char('=') => self.nudge_trim(TRIM_STEP_DB),
+            KeyCode::Char('-') | KeyCode::Char('_') => self.nudge_trim(-TRIM_STEP_DB),
+            KeyCode::Char('>') | KeyCode::Char('.') => self.nudge_offset(OFFSET_STEP_MS),
+            KeyCode::Char('<') | KeyCode::Char(',') => self.nudge_offset(-OFFSET_STEP_MS),
+            KeyCode::Char('a') => DashAction::OpenPicker,
+            KeyCode::Char('d') | KeyCode::Delete => match self.selected_receiver() {
+                Some(r) => DashAction::Command(StreamCommand::Remove { addr: r.addr }),
+                None => DashAction::None,
+            },
             KeyCode::Char('q') | KeyCode::Esc => DashAction::Quit,
             _ => DashAction::None,
         }
+    }
+
+    fn nudge_trim(&mut self, delta: f32) -> DashAction {
+        let Some(r) = self.selected_receiver() else {
+            return DashAction::None;
+        };
+        let db = (r.trim_db + delta).clamp(TRIM_MIN_DB, TRIM_MAX_DB);
+        let addr = r.addr;
+        // Reflect it locally straight away. The stream is the authority and
+        // will confirm on the next sample, but waiting ~100 ms for that makes
+        // a held key feel broken.
+        if let Some(i) = self.cursor() {
+            self.receivers[i].trim_db = db;
+        }
+        self.pending.entry(addr).or_default().trim_db = Some(db);
+        DashAction::Command(StreamCommand::SetTrim { addr, db })
+    }
+
+    fn nudge_offset(&mut self, delta: i64) -> DashAction {
+        let Some(r) = self.selected_receiver() else {
+            return DashAction::None;
+        };
+        let ms = (r.offset_ms + delta).clamp(OFFSET_MIN_MS, OFFSET_MAX_MS);
+        let addr = r.addr;
+        if let Some(i) = self.cursor() {
+            self.receivers[i].offset_ms = ms;
+        }
+        self.pending.entry(addr).or_default().offset_ms = Some(ms);
+        DashAction::Command(StreamCommand::SetOffset { addr, ms })
     }
 
     pub fn bandwidth_bps(&self) -> Option<f64> {
@@ -344,14 +495,228 @@ mod tests {
         assert_eq!(d.on_key(KeyCode::Esc), DashAction::Quit);
     }
 
-    #[test]
-    fn log_scroll_never_goes_negative() {
-        let mut d = dash();
-        d.on_key(KeyCode::Down);
-        assert_eq!(d.log_scroll, 0);
-        d.on_key(KeyCode::Up);
-        assert_eq!(d.log_scroll, 1);
+    // --- per-receiver controls ---
+
+    fn addr(n: u8) -> SocketAddr {
+        format!("192.168.1.{n}:7000").parse().unwrap()
     }
+
+    fn receiver(n: u8, name: &str) -> ReceiverStat {
+        ReceiverStat {
+            name: name.into(),
+            addr: addr(n),
+            state: openair_client::ReceiverState::Connected,
+            offset_ms: 0,
+            trim_db: 0.0,
+        }
+    }
+
+    /// A dashboard with `n` receivers already sampled in.
+    fn dash_with(receivers: Vec<ReceiverStat>) -> (DashboardState, std::sync::Arc<StreamStats>) {
+        let mut d = dash();
+        let stats = StreamStats::new(500);
+        stats.set_receivers(receivers);
+        d.sample(&stats, Instant::now());
+        (d, stats)
+    }
+
+    #[test]
+    fn the_first_receiver_is_selected_automatically() {
+        let (d, _) = dash_with(vec![receiver(51, "Pool"), receiver(52, "Living")]);
+        assert_eq!(d.cursor(), Some(0));
+        assert_eq!(d.selected_receiver().unwrap().name, "Pool");
+    }
+
+    #[test]
+    fn arrows_move_the_cursor_and_clamp() {
+        let (mut d, _) = dash_with(vec![receiver(51, "Pool"), receiver(52, "Living")]);
+        d.on_key(KeyCode::Up);
+        assert_eq!(d.cursor(), Some(0), "already at the top");
+        d.on_key(KeyCode::Down);
+        assert_eq!(d.cursor(), Some(1));
+        d.on_key(KeyCode::Down);
+        assert_eq!(d.cursor(), Some(1), "already at the bottom");
+    }
+
+    #[test]
+    fn the_cursor_follows_the_receiver_when_the_list_reorders() {
+        // Same lesson as the picker: an index-keyed cursor would silently come
+        // to mean a different receiver.
+        let (mut d, stats) = dash_with(vec![receiver(51, "Pool"), receiver(52, "Living")]);
+        d.on_key(KeyCode::Down);
+        assert_eq!(d.selected_receiver().unwrap().name, "Living");
+
+        // A new receiver arrives at the head of the list.
+        stats.set_receivers(vec![
+            receiver(50, "Kitchen"),
+            receiver(51, "Pool"),
+            receiver(52, "Living"),
+        ]);
+        d.sample(&stats, Instant::now());
+        assert_eq!(
+            d.selected_receiver().unwrap().name,
+            "Living",
+            "the highlight stayed with the receiver, not the row"
+        );
+    }
+
+    #[test]
+    fn selection_falls_back_when_the_selected_receiver_disappears() {
+        let (mut d, stats) = dash_with(vec![receiver(51, "Pool"), receiver(52, "Living")]);
+        d.on_key(KeyCode::Down);
+        stats.set_receivers(vec![receiver(51, "Pool")]);
+        d.sample(&stats, Instant::now());
+        assert_eq!(d.selected_receiver().unwrap().name, "Pool");
+    }
+
+    #[test]
+    fn plus_and_minus_emit_a_trim_command_for_the_selected_receiver() {
+        let (mut d, _) = dash_with(vec![receiver(51, "Pool"), receiver(52, "Living")]);
+        d.on_key(KeyCode::Down); // select Living
+
+        assert_eq!(
+            d.on_key(KeyCode::Char('-')),
+            DashAction::Command(StreamCommand::SetTrim {
+                addr: addr(52),
+                db: -TRIM_STEP_DB
+            })
+        );
+    }
+
+    #[test]
+    fn trim_clamps_at_the_bounds() {
+        let mut receivers = vec![receiver(51, "Pool")];
+        receivers[0].trim_db = TRIM_MAX_DB;
+        let (mut d, _) = dash_with(receivers);
+        assert_eq!(
+            d.on_key(KeyCode::Char('+')),
+            DashAction::Command(StreamCommand::SetTrim {
+                addr: addr(51),
+                db: TRIM_MAX_DB
+            })
+        );
+    }
+
+    #[test]
+    fn a_held_key_keeps_stepping_despite_a_stale_sample() {
+        // The real failure this guards: key repeat is faster than the 10 Hz
+        // sample rate, so a sample carrying the pre-keypress value must not
+        // overwrite what the user has already asked for.
+        let (mut d, stats) = dash_with(vec![receiver(51, "Pool")]);
+
+        d.on_key(KeyCode::Char('-'));
+        d.on_key(KeyCode::Char('-'));
+        assert_eq!(d.selected_receiver().unwrap().trim_db, -2.0 * TRIM_STEP_DB);
+
+        // The stream hasn't caught up: it still reports 0.
+        d.sample(&stats, Instant::now());
+        assert_eq!(
+            d.selected_receiver().unwrap().trim_db,
+            -2.0 * TRIM_STEP_DB,
+            "a stale sample must not undo the user's presses"
+        );
+
+        // Next press continues from where the user was, not from stale state.
+        let action = d.on_key(KeyCode::Char('-'));
+        assert_eq!(
+            action,
+            DashAction::Command(StreamCommand::SetTrim {
+                addr: addr(51),
+                db: -3.0 * TRIM_STEP_DB
+            })
+        );
+    }
+
+    #[test]
+    fn the_stream_wins_once_it_confirms() {
+        // The stream is the authority: once it reports the value back, its
+        // number stands, so a trim it clamped or refused becomes visible.
+        let (mut d, stats) = dash_with(vec![receiver(51, "Pool")]);
+        d.on_key(KeyCode::Char('-'));
+
+        let mut confirmed = receiver(51, "Pool");
+        confirmed.trim_db = -TRIM_STEP_DB;
+        stats.set_receivers(vec![confirmed]);
+        d.sample(&stats, Instant::now());
+
+        // Now a value the stream chose on its own must show through.
+        let mut clamped = receiver(51, "Pool");
+        clamped.trim_db = 0.0;
+        stats.set_receivers(vec![clamped]);
+        d.sample(&stats, Instant::now());
+        assert_eq!(d.selected_receiver().unwrap().trim_db, 0.0);
+    }
+
+    #[test]
+    fn angle_brackets_emit_an_offset_command() {
+        let (mut d, _) = dash_with(vec![receiver(51, "Pool")]);
+        assert_eq!(
+            d.on_key(KeyCode::Char('>')),
+            DashAction::Command(StreamCommand::SetOffset {
+                addr: addr(51),
+                ms: OFFSET_STEP_MS
+            })
+        );
+    }
+
+    #[test]
+    fn offset_clamps_at_the_bounds() {
+        let mut receivers = vec![receiver(51, "Pool")];
+        receivers[0].offset_ms = OFFSET_MAX_MS;
+        let (mut d, _) = dash_with(receivers);
+        assert_eq!(
+            d.on_key(KeyCode::Char('>')),
+            DashAction::Command(StreamCommand::SetOffset {
+                addr: addr(51),
+                ms: OFFSET_MAX_MS
+            })
+        );
+    }
+
+    #[test]
+    fn d_removes_the_selected_receiver() {
+        let (mut d, _) = dash_with(vec![receiver(51, "Pool"), receiver(52, "Living")]);
+        d.on_key(KeyCode::Down);
+        assert_eq!(
+            d.on_key(KeyCode::Char('d')),
+            DashAction::Command(StreamCommand::Remove { addr: addr(52) })
+        );
+    }
+
+    #[test]
+    fn a_opens_the_picker() {
+        let (mut d, _) = dash_with(vec![receiver(51, "Pool")]);
+        assert_eq!(d.on_key(KeyCode::Char('a')), DashAction::OpenPicker);
+    }
+
+    #[test]
+    fn control_keys_are_inert_with_no_receivers() {
+        // Every one of these dereferences the selection.
+        let mut d = dash();
+        for key in [
+            KeyCode::Char('+'),
+            KeyCode::Char('-'),
+            KeyCode::Char('>'),
+            KeyCode::Char('<'),
+            KeyCode::Char('d'),
+            KeyCode::Up,
+            KeyCode::Down,
+        ] {
+            assert_eq!(d.on_key(key), DashAction::None, "{key:?} must be a no-op");
+        }
+    }
+
+    #[test]
+    fn page_keys_scroll_the_logs() {
+        let mut d = dash();
+        d.on_key(KeyCode::PageUp);
+        assert_eq!(d.log_scroll, 1);
+        d.on_key(KeyCode::PageDown);
+        assert_eq!(d.log_scroll, 0);
+        d.on_key(KeyCode::PageDown);
+        assert_eq!(d.log_scroll, 0, "never negative");
+    }
+
 
     #[test]
     fn latency_and_receivers_come_from_the_snapshot() {

@@ -13,7 +13,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use openair_client::{ReceiverState, StreamStats};
+use openair_client::{ReceiverState, StreamCommand, StreamStats};
+use tracing::warn;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -24,7 +25,8 @@ use crate::dashboard::{
     format_bitrate, format_bytes, format_elapsed, DashAction, DashboardState,
 };
 use crate::logs::{self, LogBuffer};
-use crate::settings::GraphKind;
+use crate::picker::{PickerAction, PickerState};
+use crate::settings::{GraphKind, Settings};
 use crate::term;
 
 /// Render rate. Fast enough to feel live, slow enough to be invisible next to
@@ -126,14 +128,28 @@ fn run_dashboard(
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
-                let quit = (key.code == KeyCode::Char('c')
-                    && key.modifiers.contains(KeyModifiers::CONTROL))
-                    || state.on_key(key.code) == DashAction::Quit;
-                if quit {
-                    // Hand shutdown to the stream rather than doing it here:
-                    // it still has queued audio to play out and sessions to
-                    // tear down.
+                if key.code == KeyCode::Char('c')
+                    && key.modifiers.contains(KeyModifiers::CONTROL)
+                {
                     stop.store(true, Ordering::SeqCst);
+                    continue;
+                }
+                match state.on_key(key.code) {
+                    DashAction::Quit => {
+                        // Hand shutdown to the stream rather than doing it
+                        // here: it still has queued audio to play out and
+                        // sessions to tear down.
+                        stop.store(true, Ordering::SeqCst);
+                    }
+                    DashAction::Command(cmd) => {
+                        if !stats.send(cmd) {
+                            warn!("could not queue command — stream mailbox unavailable");
+                        }
+                    }
+                    DashAction::OpenPicker => {
+                        add_receiver(&mut terminal, &stats)?;
+                    }
+                    DashAction::None => {}
                 }
             }
         }
@@ -150,6 +166,105 @@ fn run_dashboard(
         bytes_sent: stats.bytes_sent(),
         graph: state.graph,
     })
+}
+
+/// Modal overlay: browse for receivers and add the chosen ones to the live
+/// group.
+///
+/// Reuses [`PickerState`] wholesale rather than growing a second list widget —
+/// the sort order, de-duplication and "needs pairing" rules are the ones the
+/// startup picker already got right, and having two implementations of them
+/// would mean fixing every such bug twice.
+fn add_receiver(terminal: &mut term::Tui, stats: &StreamStats) -> io::Result<()> {
+    let paired = openair_client::PairingStore::load()
+        .map(|s| s.peer_ids())
+        .unwrap_or_default();
+    // Handoff is already decided for this run; the overlay only picks devices.
+    let mut state = PickerState::new(Settings::default(), paired, false);
+
+    let browse = openair_discovery::browse_live()
+        .map_err(|e| io::Error::other(format!("mDNS discovery failed: {e}")))?;
+
+    // Receivers already in the group must not be offered again.
+    let existing: Vec<std::net::SocketAddr> = stats.receivers().iter().map(|r| r.addr).collect();
+
+    loop {
+        while let Ok(device) = browse.devices.try_recv() {
+            let addr = std::net::SocketAddr::new(device.addr, device.port);
+            if !existing.contains(&addr) {
+                state.insert(device);
+            }
+        }
+
+        terminal.draw(|frame| render_add_overlay(frame, &state))?;
+
+        if !event::poll(TICK)? {
+            continue;
+        }
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return Ok(());
+        }
+
+        match state.on_key(key.code) {
+            PickerAction::Quit => return Ok(()),
+            PickerAction::Start => {
+                for row in state.chosen() {
+                    let device_id = row
+                        .device_id
+                        .clone()
+                        .unwrap_or_else(|| DEFAULT_DEVICE_ID.to_string());
+                    stats.send(StreamCommand::Add {
+                        addr: row.addr,
+                        device_id,
+                    });
+                }
+                return Ok(());
+            }
+            PickerAction::None | PickerAction::Hint(_) => {}
+        }
+    }
+}
+
+/// Fallback device id for a receiver that advertises none, matching the CLI.
+const DEFAULT_DEVICE_ID: &str = "AA:BB:CC:DD:EE:FF";
+
+fn render_add_overlay(frame: &mut Frame, state: &PickerState) {
+    let area = centred(frame.area(), 70, 14);
+    // Clear first: this is drawn over a live dashboard frame, and without it
+    // the panel underneath shows through the gaps.
+    frame.render_widget(ratatui::widgets::Clear, area);
+
+    let [list_area, hint_area] =
+        Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(area);
+
+    crate::picker_ui::render_device_list(frame, list_area, state, " add a receiver ");
+
+    let hint = match state.hint() {
+        Some(h) => Span::styled(format!("  {h}"), Style::default().fg(Color::Yellow)),
+        None => Span::styled(
+            "  ↑↓ move · space select · ⏎ add · esc cancel",
+            Style::default().fg(Color::DarkGray),
+        ),
+    };
+    frame.render_widget(Paragraph::new(Line::from(hint)), hint_area);
+}
+
+/// A rectangle of at most `width`×`height`, centred in `area`.
+fn centred(area: Rect, width: u16, height: u16) -> Rect {
+    let w = width.min(area.width);
+    let h = height.min(area.height);
+    Rect {
+        x: area.x + (area.width - w) / 2,
+        y: area.y + (area.height - h) / 2,
+        width: w,
+        height: h,
+    }
 }
 
 fn render(frame: &mut Frame, state: &DashboardState, buffer: &LogBuffer) {
@@ -308,24 +423,46 @@ fn render_receivers(frame: &mut Frame, area: Rect, state: &DashboardState) {
             Style::default().fg(Color::DarkGray),
         ))]
     } else {
+        let cursor = state.cursor();
         state
             .receivers
             .iter()
-            .map(|r| {
+            .enumerate()
+            .map(|(i, r)| {
                 let (colour, label) = match r.state {
                     ReceiverState::Connected => (Color::Green, r.state.label()),
                     ReceiverState::Reconnecting => (Color::Yellow, r.state.label()),
                     ReceiverState::Dead => (Color::Red, r.state.label()),
                 };
-                let offset = if r.offset_ms == 0 {
-                    String::new()
+                let selected = cursor == Some(i);
+                let row = Style::default();
+                let row = if selected {
+                    row.add_modifier(Modifier::REVERSED)
                 } else {
-                    format!("   {:+} ms", r.offset_ms)
+                    row
                 };
                 Line::from(vec![
-                    Span::raw(format!("  {:<24}", r.name)),
-                    Span::styled(format!("{label:<16}"), Style::default().fg(colour)),
-                    Span::styled(offset, Style::default().fg(Color::DarkGray)),
+                    Span::styled(if selected { " ▸ " } else { "   " }, row),
+                    Span::styled(format!("{:<22}", r.name), row),
+                    Span::styled(format!("{label:<15}"), row.fg(colour)),
+                    // Only show a trim or offset that has been set — zeroes
+                    // for every receiver would be noise.
+                    Span::styled(
+                        if r.trim_db == 0.0 {
+                            format!("{:<9}", "")
+                        } else {
+                            format!("{:<+9.0} dB", r.trim_db)
+                        },
+                        row.fg(Color::Cyan),
+                    ),
+                    Span::styled(
+                        if r.offset_ms == 0 {
+                            String::new()
+                        } else {
+                            format!("{:+} ms", r.offset_ms)
+                        },
+                        row.fg(Color::Magenta),
+                    ),
                 ])
             })
             .collect()
@@ -335,7 +472,10 @@ fn render_receivers(frame: &mut Frame, area: Rect, state: &DashboardState) {
         Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!(" receivers ({}) ", state.receivers.len())),
+                .title(format!(
+                    " receivers ({})   [↑↓] select · [+/-] volume · [<>] offset · [a] add · [d] drop ",
+                    state.receivers.len()
+                )),
         ),
         area,
     );
@@ -344,7 +484,7 @@ fn render_receivers(frame: &mut Frame, area: Rect, state: &DashboardState) {
 fn render_logs(frame: &mut Frame, area: Rect, buffer: &LogBuffer, state: &DashboardState) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" logs   [↑↓] scroll · [q] stop ");
+        .title(" logs   [PgUp/PgDn] scroll · [b] graph · [q] stop ");
     let rows = block.inner(area).height as usize;
 
     // `log_scroll` counts lines back from the newest.
@@ -424,6 +564,49 @@ mod tests {
         let state = DashboardState::new(GraphKind::Buffer, 500);
         let terminal = draw(MIN_WIDTH, MIN_HEIGHT, &state);
         assert!(!terminal.backend().to_string().contains("too small"));
+    }
+
+    #[test]
+    fn renders_trim_and_offset_for_a_receiver_that_has_them() {
+        let mut state = DashboardState::new(GraphKind::Buffer, 500);
+        let stats = StreamStats::new(500);
+        stats.set_receivers(vec![openair_client::ReceiverStat {
+            name: "Pool Room".into(),
+            addr: "192.168.1.51:7000".parse().unwrap(),
+            state: ReceiverState::Connected,
+            offset_ms: 80,
+            trim_db: -6.0,
+        }]);
+        state.sample(&stats, Instant::now());
+
+        let rendered = draw(120, 32, &state).backend().to_string();
+        assert!(rendered.contains("-6"), "trim shown: {rendered}");
+        assert!(rendered.contains("+80 ms"), "offset shown");
+    }
+
+    #[test]
+    fn the_add_overlay_renders_over_the_dashboard() {
+        let state = PickerState::new(Settings::default(), Vec::new(), false);
+        let mut terminal = Terminal::new(TestBackend::new(100, 32)).unwrap();
+        terminal
+            .draw(|frame| render_add_overlay(frame, &state))
+            .unwrap();
+        assert!(terminal.backend().to_string().contains("add a receiver"));
+    }
+
+    #[test]
+    fn centred_never_exceeds_its_container() {
+        // A popup wider than the terminal would panic ratatui on render.
+        let small = Rect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 6,
+        };
+        let r = centred(small, 70, 14);
+        assert!(r.width <= small.width && r.height <= small.height);
+        assert!(r.x + r.width <= small.x + small.width);
+        assert!(r.y + r.height <= small.y + small.height);
     }
 
     #[test]

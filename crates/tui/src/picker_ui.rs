@@ -97,7 +97,7 @@ fn render(frame: &mut Frame, state: &PickerState) {
     ])
     .areas(frame.area());
 
-    render_list(frame, list_area, state);
+    render_device_list(frame, list_area, state, " OpenAir ");
 
     let status = Paragraph::new(status_line(state)).style(Style::default().fg(Color::DarkGray));
     frame.render_widget(status, status_area);
@@ -115,10 +115,17 @@ fn render(frame: &mut Frame, state: &PickerState) {
     frame.render_widget(keys, keys_area);
 }
 
-fn render_list(frame: &mut Frame, area: ratatui::layout::Rect, state: &PickerState) {
+/// Draw the device list. Shared with the dashboard's add-a-receiver overlay so
+/// both screens agree on how a device is presented.
+pub fn render_device_list(
+    frame: &mut Frame,
+    area: ratatui::layout::Rect,
+    state: &PickerState,
+    title: &str,
+) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(format!(" OpenAir — {} found ", state.rows().len()));
+        .title(format!("{title}({} found) ", state.rows().len()));
 
     if state.rows().is_empty() {
         let msg = Paragraph::new(Line::from(Span::styled(
