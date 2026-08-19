@@ -191,20 +191,21 @@ impl PickerState {
                 }
                 PickerAction::None
             }
-            // Enter toggles, space confirms. The reverse of the usual
-            // convention, chosen deliberately: this list is multi-select, and
-            // Enter is the key a hand reaches for while picking through it.
-            KeyCode::Enter => {
+            KeyCode::Char(' ') => {
                 self.toggle_selection();
                 PickerAction::None
             }
-            KeyCode::Char(' ') => self.confirm(),
+            KeyCode::Enter => self.confirm(),
             KeyCode::Char('h') => self.toggle_handoff(),
-            KeyCode::Char('+') | KeyCode::Char('=') => {
+            // `<`/`>` rather than `+`/`-`: the dashboard uses `+`/`-` for
+            // volume and `<`/`>` for timing, and these two screens sit in one
+            // flow. One key meaning volume on one screen and latency on the
+            // next is a trap.
+            KeyCode::Char('>') | KeyCode::Char('.') => {
                 self.settings.nudge_latency(true);
                 PickerAction::None
             }
-            KeyCode::Char('-') | KeyCode::Char('_') => {
+            KeyCode::Char('<') | KeyCode::Char(',') => {
                 self.settings.nudge_latency(false);
                 PickerAction::None
             }
@@ -238,7 +239,7 @@ impl PickerState {
     fn confirm(&mut self) -> PickerAction {
         let chosen = self.chosen();
         if chosen.is_empty() {
-            return self.hint_action("press enter to select a receiver first");
+            return self.hint_action("select a receiver with space first");
         }
         // Catch this here rather than letting the handshake fail with
         // something opaque several seconds later.
@@ -338,7 +339,7 @@ mod tests {
         // receiver.
         let mut p = PickerState::new(Settings::default(), vec!["2".into()], true);
         p.insert(device("Alpha", "192.168.1.10", "1", TRANSIENT));
-        p.on_key(KeyCode::Enter);
+        p.on_key(KeyCode::Char(' '));
         assert_eq!(p.chosen()[0].name, "Alpha");
 
         p.insert(device("Zulu", "192.168.1.11", "2", TRANSIENT)); // paired, sorts first
@@ -379,36 +380,36 @@ mod tests {
         let mut p = picker();
         assert_eq!(p.on_key(KeyCode::Up), PickerAction::None);
         assert_eq!(p.on_key(KeyCode::Down), PickerAction::None);
-        assert_eq!(p.on_key(KeyCode::Enter), PickerAction::None);
-        assert!(matches!(p.on_key(KeyCode::Char(' ')), PickerAction::Hint(_)));
+        assert_eq!(p.on_key(KeyCode::Char(' ')), PickerAction::None);
+        assert!(matches!(p.on_key(KeyCode::Enter), PickerAction::Hint(_)));
     }
 
     #[test]
-    fn enter_toggles_selection_off_again() {
+    fn space_toggles_selection_off_again() {
         let mut p = picker();
         p.insert(device("Alpha", "192.168.1.10", "1", TRANSIENT));
-        p.on_key(KeyCode::Enter);
+        p.on_key(KeyCode::Char(' '));
         assert_eq!(p.chosen().len(), 1);
-        p.on_key(KeyCode::Enter);
+        p.on_key(KeyCode::Char(' '));
         assert!(p.chosen().is_empty());
     }
 
     #[test]
-    fn confirming_with_nothing_selected_hints_instead_of_starting() {
+    fn enter_with_nothing_selected_hints_instead_of_starting() {
         let mut p = picker();
         p.insert(device("Alpha", "192.168.1.10", "1", TRANSIENT));
-        match p.on_key(KeyCode::Char(' ')) {
-            PickerAction::Hint(msg) => assert!(msg.contains("enter"), "got: {msg}"),
+        match p.on_key(KeyCode::Enter) {
+            PickerAction::Hint(msg) => assert!(msg.contains("space"), "got: {msg}"),
             other => panic!("expected a hint, got {other:?}"),
         }
     }
 
     #[test]
-    fn confirming_an_unpaired_device_names_the_pair_command() {
+    fn enter_on_an_unpaired_device_names_the_pair_command() {
         let mut p = picker();
         p.insert(device("Living Room", "192.168.1.106", "1", NEEDS_PAIRING));
-        p.on_key(KeyCode::Enter);
-        match p.on_key(KeyCode::Char(' ')) {
+        p.on_key(KeyCode::Char(' '));
+        match p.on_key(KeyCode::Enter) {
             PickerAction::Hint(msg) => {
                 assert!(msg.contains(r#"openair pair "Living Room""#), "got: {msg}");
             }
@@ -417,18 +418,18 @@ mod tests {
     }
 
     #[test]
-    fn confirming_a_valid_selection_starts() {
+    fn enter_with_a_valid_selection_starts() {
         let mut p = picker();
         p.insert(device("Pool Room", "192.168.1.51", "1", TRANSIENT));
-        p.on_key(KeyCode::Enter);
-        assert_eq!(p.on_key(KeyCode::Char(' ')), PickerAction::Start);
+        p.on_key(KeyCode::Char(' '));
+        assert_eq!(p.on_key(KeyCode::Enter), PickerAction::Start);
     }
 
     #[test]
     fn a_keystroke_clears_the_previous_hint() {
         let mut p = picker();
         p.insert(device("Alpha", "192.168.1.10", "1", TRANSIENT));
-        p.on_key(KeyCode::Char(' '));
+        p.on_key(KeyCode::Enter);
         assert!(p.hint().is_some());
         p.on_key(KeyCode::Down);
         assert!(p.hint().is_none(), "a stale explanation is worse than none");
@@ -438,11 +439,11 @@ mod tests {
     fn latency_keys_clamp_at_the_bounds() {
         let mut p = picker();
         p.settings.latency_ms = crate::settings::LATENCY_MAX_MS;
-        p.on_key(KeyCode::Char('+'));
+        p.on_key(KeyCode::Char('>'));
         assert_eq!(p.settings.latency_ms, crate::settings::LATENCY_MAX_MS);
 
         p.settings.latency_ms = crate::settings::LATENCY_MIN_MS;
-        p.on_key(KeyCode::Char('-'));
+        p.on_key(KeyCode::Char('<'));
         assert_eq!(p.settings.latency_ms, crate::settings::LATENCY_MIN_MS);
     }
 

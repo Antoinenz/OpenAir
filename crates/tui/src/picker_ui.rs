@@ -107,7 +107,7 @@ fn render(frame: &mut Frame, state: &PickerState) {
             Style::default().fg(Color::Yellow),
         ))),
         None => Paragraph::new(Line::from(Span::styled(
-            "  ↑↓ move · ⏎ select · space start · h handoff · +/- latency · q quit",
+            "  ↑↓ move · space select · ⏎ start · h handoff · <> latency · q quit",
             Style::default().fg(Color::DarkGray),
         ))),
     };
