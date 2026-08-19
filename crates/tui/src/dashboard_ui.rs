@@ -115,15 +115,30 @@ fn run_dashboard(
         }
     };
 
+    // Sampling runs on a clock, not on loop iterations. `event::poll` returns
+    // early when a key arrives, so tying `sample()` to the loop made the graph
+    // scroll and the bandwidth figure jump around whenever a key was held —
+    // each reading would cover a shorter window than the one before it.
+    // Drawing still happens every iteration, so a key press is reflected
+    // immediately.
+    let mut last_sample = Instant::now();
+    state.sample(&stats, last_sample);
+
     loop {
-        state.sample(&stats, Instant::now());
+        let now = Instant::now();
+        if now.duration_since(last_sample) >= TICK {
+            state.sample(&stats, now);
+            last_sample = now;
+        }
         terminal.draw(|frame| render(frame, &state, &buffer))?;
 
         if stats.ended() {
             break;
         }
 
-        if event::poll(TICK)? {
+        // Wait out the remainder of the tick rather than a fresh full one, or
+        // a burst of keys would postpone the next sample indefinitely.
+        if event::poll(poll_timeout(last_sample.elapsed()))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press {
                     continue;
@@ -265,6 +280,15 @@ fn centred(area: Rect, width: u16, height: u16) -> Rect {
         width: w,
         height: h,
     }
+}
+
+/// How long to wait for a key, given how long ago the last sample was taken.
+///
+/// Never longer than what remains of the tick (or keys would delay sampling),
+/// and never zero (which would spin the CPU when rendering overruns a tick).
+fn poll_timeout(since_last_sample: Duration) -> Duration {
+    TICK.saturating_sub(since_last_sample)
+        .max(Duration::from_millis(1))
 }
 
 fn render(frame: &mut Frame, state: &DashboardState, buffer: &LogBuffer) {
@@ -592,6 +616,21 @@ mod tests {
             .draw(|frame| render_add_overlay(frame, &state))
             .unwrap();
         assert!(terminal.backend().to_string().contains("add a receiver"));
+    }
+
+    #[test]
+    fn poll_timeout_waits_only_the_rest_of_the_tick() {
+        // The bug this guards: keys arriving mid-tick used to restart a full
+        // wait each time, so holding a key sampled far more often than 10 Hz
+        // and the graph and bandwidth readings jumped around.
+        assert_eq!(poll_timeout(Duration::ZERO), TICK);
+        assert_eq!(poll_timeout(TICK / 4), TICK - TICK / 4);
+    }
+
+    #[test]
+    fn poll_timeout_is_never_zero() {
+        // A zero timeout spins the CPU when a render overruns the tick.
+        assert!(poll_timeout(TICK * 2) > Duration::ZERO);
     }
 
     #[test]
