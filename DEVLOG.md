@@ -4,6 +4,102 @@
 
 ---
 
+## 2026-08-20 — Session 16: one continuous TUI (project B)
+
+**Goal.** The TUI was two islands with the command line in between: a picker,
+then a restored terminal and plain text while sessions were established, then a
+dashboard. Anything needing input in that gap — a pairing PIN — fell back to a
+`stdin` prompt from an earlier era of the program.
+
+### The threading inverted back, and it cost nothing
+
+Phase 1 deliberately put the dashboard on a worker so the audio path never
+needed to be `Send`. A continuous TUI cannot work that way: it owns the terminal
+across screens that exist *before* any stream, so it must hold the main thread
+for the program's life.
+
+The plan flagged `AudioSource: Send` as the project's main risk. It never
+materialised, and the reason is worth recording: the `StreamLauncher` closure
+stays on the main thread and constructs its source **inside** the thread it
+spawns. Only the ingredients cross the boundary — an `Arc` on the capture ring,
+a sample rate, a stop flag — and those were already `Send`. `AudioSource` is
+untouched; the `HandoffSession` guard and the WASAPI handle never move.
+
+The lesson generalises: *what* crosses a thread boundary is a design choice, not
+a fact about the types involved.
+
+### Connect progress rode the seam that already existed
+
+`stream_audio_buffered_multi` establishes every session inside itself. Two
+options: move connection out so the TUI can drive it, or have the stream publish
+progress. Moving it out looks cleaner until you notice the stream re-establishes
+receivers on reconnect anyway — connection logic would end up in two places, or
+in a shared module both call, for no behavioural gain.
+
+So the setup loop now publishes each receiver as `Connecting` before its
+handshake and `Connected`/`Failed` after, through the same `StreamStats` the
+dashboard already reads. The connecting screen needed no machinery of its own.
+
+One subtlety cost a test to pin down: `receiver_stats` rebuilds from the live
+group, which by definition never contained a receiver that *failed* to connect.
+Without an explicit merge a failure vanished on the next audio packet — exactly
+when the user is reading the list to find out what went wrong.
+
+### Decisions that shaped the flow
+
+- **Pairing happens after confirming, not before.** The picker stays
+  network-silent and now *allows* selecting a device that needs a PIN, rather
+  than refusing it with an instruction to run another command.
+- **One pairing worker per attempt.** A rejected PIN ends the exchange and the
+  receiver issues a fresh one, so a retry is a new connection, not a resumed
+  one. The error says to re-read the screen — retyping the PIN still written on
+  a notepad fails identically.
+- **The worker spawns on first submit, not on entering the screen.** It opens a
+  socket and blocks; holding one open while the user hunts for their remote is
+  how sessions get dropped.
+- **Esc during pairing skips that device.** One un-pairable speaker must not
+  cost the user the rest of the group.
+- **Partial success proceeds.** Some connected, some didn't → stream to the ones
+  that worked. None connected → back to the picker, with the reason as a banner
+  *and the selection intact*, so a retry is one keystroke.
+- **Retry is manual (`r`), never automatic.** A receiver that is asleep or on
+  another network fails identically ten seconds later, and silent retrying is
+  the unsolicited-connection behaviour the picker exists to avoid.
+- **Selection travels as device keys, not rows.** A receiver that has gone quiet
+  is still selected; dropping it on the way back to the picker is the bug that
+  representation prevents.
+
+### Two self-inflicted bugs, both caught by the work itself
+
+**Sampling was tied to loop iterations.** `event::poll` returns early when a key
+arrives, so holding a key made the loop iterate sooner — which meant
+`take_min_lead_ms` reset over a shorter window and bandwidth divided by a smaller
+`dt`. Holding a key was *distorting* the numbers, not merely refreshing them.
+The user spotted it as "the graph updates faster when I hold a key". Sampling now
+runs on a clock; drawing still happens every iteration so input stays instant.
+
+**Removing the `PICKER_SELECTION` sentinel broke `openair capture`.** The capture
+branch was selected by argument *shape* (`len >= 2`), so dropping the magic
+placeholder made a bare `capture` fall through to the address parser and report
+"invalid socket address syntax" instead of usage. Caught by smoke-testing the
+non-TUI paths after the change rather than assuming the tests covered it.
+
+### Also
+
+Narration is silent on a TUI run. Setup messages printed before the alternate
+screen opens are not merely redundant — they come *back* when it is left, so a
+clean session ended in a screenful of stale chatter. They now route through
+`say!`, with the log panel carrying the same information via `tracing`, and the
+run ends with one summary line plus the log path. Several messages that were
+`println!`-only now reach `--log` for the first time.
+
+**Result:** 8 tasks, 141 TUI tests, workspace green and clippy clean.
+
+**Spec:** `docs/superpowers/specs/2026-08-19-tui-unified-flow-design.md` ·
+**Plan:** `docs/superpowers/plans/2026-08-19-b-unified-tui-flow.md`
+
+---
+
 ## 2026-08-18 — Session 15: the terminal UI (picker + dashboard)
 
 **Goal.** Bare `openair` blocked 5 s on discovery and then tried to pair with

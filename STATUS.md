@@ -36,7 +36,7 @@
 | `ptp-helper` | ⬜ Stub | — | Privileged binary, IPC to main (Linux ports 319/320; not needed on Windows) |
 | `client` | ✅ Done (v1) | Yes | realtime + buffered pipelines, pairing store + auto-dispatch (pair-verify vs transient), event channel, `StreamStats` snapshot for observers |
 | `apps/cli` | ✅ Done (v1) | Yes | scan, `pair` (PIN), tone/play/capture, devices, restore-audio; name resolution, --volume, --buffered, --latency <ms>, --offset <name=ms>, --handoff[-device] (Windows), --bind <ip>, --no-metadata, --log, --debug [0-2], --no-tui, Ctrl+C |
-| `tui` | ✅ Done (phase 1) | Yes | Library, not a binary — `openair` drives it. Device picker + read-only dashboard, settings persistence, log ring buffer, panic-safe terminal restore; 61 tests. Phase 2 (per-receiver volume/latency, add/remove mid-stream) designed but not built |
+| `tui` | ✅ Done (unified flow) | Yes | Library, not a binary — `openair` drives it. One App owns the terminal for the whole run: picker → pairing (in-TUI PIN) → connecting → dashboard, never dropping to a shell. Per-receiver volume/offset, add/remove/retry mid-stream, settings persistence, log panel, panic-safe restore; 141 tests |
 
 ---
 
@@ -60,10 +60,19 @@ content, so the TV pauses its UI while we keep streaming. After a few toggles it
 resets the connection (`10054`, peer reset). Tracked as **#22**; needs the event
 message *body* logged first, then mapping to `set_rate(0)`/re-anchor.
 
-### ⚠️ The dashboard only attaches to `capture`
+### ⚠️ The TUI only attaches to `capture`
 
 `play` and `tone` still print plain scrolling text. Nothing structural stops
 them — they call the same `stream_fn` — it just wasn't wired up.
+
+<details><summary>RESOLVED 2026-08-20: pairing required leaving the TUI</summary>
+
+A receiver needing a HomeKit PIN was refused by the picker with an instruction
+to run `openair pair` separately, because the PIN prompt was a `stdin` read and
+the TUI owned the screen. Pairing now happens inside the flow, after the user
+confirms their selection, on a worker whose PIN provider waits on a channel.
+
+</details>
 
 <details><summary>RESOLVED 2026-08-18: bare <code>openair</code> paired with every device it found</summary>
 

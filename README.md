@@ -65,9 +65,9 @@ automatically uses the buffered pipeline.
 
 | Command | What it does |
 |---------|--------------|
-| `openair` | Open the **interactive picker**: receivers appear as they answer, arrow keys and space to choose, Enter to stream. Contacts nothing until you press Enter. With `--no-tui`, instead scans for 5 s and tries Transient pairing + `GET /info` on every device found (diagnostic). |
+| `openair` | Open the **terminal UI**: pick receivers, pair any that need a PIN, watch them connect, then stream — all in one screen. Contacts nothing until you press Enter. With `--no-tui`, instead scans for 5 s and tries Transient pairing + `GET /info` on every device found (diagnostic). |
 | `openair <ip:port>` | Connect straight to one address, pair, and `GET /info` — no discovery (diagnostic). |
-| `openair pair <receiver>` | One-time **Normal HomeKit pairing**: shows a PIN on the device, prompts for it, and persists credentials so future connections are automatic. Needed for Apple TV / HomePod; Shairport needs no pairing. |
+| `openair pair <receiver>` | One-time **Normal HomeKit pairing** from the command line. Rarely needed now: the TUI pairs a receiver in the flow when you select it. Persists credentials either way. Apple TV / HomePod need this; Shairport needs no pairing. |
 | `openair capture <receiver>… [seconds]` | Stream **live system audio** (WASAPI loopback of the default output device). Runs until `Ctrl+C`, or for `seconds` if given. Pausing PC audio auto-pauses/resumes the stream. |
 | `openair play <receiver>… <file.wav>` | Stream a **WAV file** (the last argument). Any sample rate / 16-bit int or 32-bit float, mono or stereo — resampled/converted automatically. |
 | `openair tone <receiver>… [seconds]` | Stream a 440 Hz **test tone** (default 10 s). Hardware smoke test. |
@@ -105,7 +105,10 @@ Notes:
 
 ### The terminal UI
 
-Running `openair` with no arguments opens a **picker**:
+`openair` is one continuous terminal application: from choosing receivers to
+streaming, it never hands the screen back to a shell.
+
+Running it with no arguments opens the **picker**:
 
 ```
 ┌ OpenAir — 4 found ──────────────────────────────────────────┐
@@ -114,28 +117,53 @@ Running `openair` with no arguments opens a **picker**:
 │> [x] Kitchen           AudioAccessory  192.168.1.88:7000    │
 └─────────────────────────────────────────────────────────────┘
   handoff ON   latency 500 ms   volume -8 dB   selected 2
-  ↑↓ move · space select · h handoff · +/- latency · ⏎ start · q quit
+  ↑↓ move · space select · ⏎ start · h handoff · <> latency · q quit
 ```
 
 Receivers appear as they answer — there's no fixed wait — and **nothing is
 contacted until you press Enter**: names, models and capabilities all come from
-the mDNS record, and the ✓ comes from your local pairings file. Devices needing
-a one-time `openair pair` are marked, and pressing Enter on one tells you so
-rather than failing mid-handshake.
+the mDNS record, and the ✓ comes from your local pairings file.
 
-Press Enter and it becomes a **dashboard**: latency, bandwidth and now-playing
-across the top, a rolling **buffer-health** graph (press `b` for bandwidth), the
-live state of each receiver, and a log panel. Buffer health is the number that
-predicts a dropout — it's what auto-latency watches to decide when to step up —
-so you can usually see trouble coming.
+Press Enter and the flow continues in place:
+
+1. **Pairing**, if any chosen receiver needs a HomeKit PIN. Type the four digits
+   shown on the device. Esc skips *that* receiver and carries on with the rest —
+   one un-pairable speaker doesn't cost you the group.
+2. **Connecting**, with per-receiver progress. Any receiver that fails shows why.
+   If some connect and some don't, streaming starts with the ones that worked;
+   if none do, you're returned to the picker with the reason and your selection
+   still made, so a retry is one keystroke.
+3. **The dashboard**: latency, bandwidth and now-playing across the top, a
+   rolling **buffer-health** graph (`b` for bandwidth), the live state of each
+   receiver, and a log panel. Buffer health is the number that predicts a
+   dropout — it's what auto-latency watches to decide when to step up — so you
+   can usually see trouble coming.
+
+In the dashboard, `↑↓` selects a receiver and:
+
+| Key | Does |
+|-----|------|
+| `+` / `-` | volume trim for that receiver, ±1 dB |
+| `<` / `>` | play offset for that receiver, ∓/±10 ms |
+| `a` | add another receiver mid-stream |
+| `r` | retry one that failed |
+| `d` | drop it |
+| `b` | switch the graph between buffer health and bandwidth |
+| `PgUp` / `PgDn` | scroll the log panel |
+| `q` / Ctrl+C | stop |
+
+Per-receiver volume is a **trim** on the group level, not an absolute level, so
+`--handoff` moving the Windows master preserves the balance you dialled in.
 
 `q` (or Ctrl+C) stops, restoring the terminal and your audio device, and prints
-a one-line summary of the run.
+one summary line — duration, data sent, final latency, and where the log went if
+you passed `--log`. Nothing else is printed during a TUI run; the log panel
+carries the narration instead.
 
 Preferences — handoff, latency, volume, graph choice — persist in
 `settings.json` beside `pairings.json`. Command-line flags override the file for
 that run without rewriting it. Chosen receivers are deliberately *not*
-remembered.
+remembered between runs.
 
 > `--no-tui` gives the plain scrolling output, and is selected automatically
 > when stdout isn't a terminal.
