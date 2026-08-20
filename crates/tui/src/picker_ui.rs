@@ -121,9 +121,12 @@ pub fn render_device_list(
     state: &PickerState,
     title: &str,
 ) {
+    // `total()`, not `rows().len()`: on a large network the list is windowed
+    // for drawing, and a count that reported the window would say "50 found"
+    // forever while devices kept arriving.
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(format!("{title}({} found) ", state.rows().len()));
+        .title(format!("{title}({} found) ", state.total()));
 
     if state.rows().is_empty() {
         let msg = Paragraph::new(Line::from(Span::styled(

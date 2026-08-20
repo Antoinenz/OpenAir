@@ -49,10 +49,24 @@ pub enum PickerAction {
     Hint(String),
 }
 
+/// How many rows are built at a time, and how far the window grows each time
+/// the cursor approaches its end.
+const ROW_LIMIT_STEP: usize = 50;
+
+/// How close to the end of the window the cursor gets before it is extended.
+/// Large enough that a held arrow key never catches up with the growth.
+const ROW_LIMIT_MARGIN: usize = 10;
+
 pub struct PickerState {
     seen: DeviceSet,
-    /// Rebuilt from `seen` whenever it changes; the order the user sees.
-    rows: Vec<PickerRow>,
+    /// Every known device, sorted — **not** the window.
+    ///
+    /// The window is applied in [`PickerState::rows`], so anything that has to
+    /// be right regardless of what is on screen (selection, above all) reads
+    /// this instead.
+    all_rows: Vec<PickerRow>,
+    /// How many of `all_rows` are offered for drawing.
+    visible_limit: usize,
     selected: HashSet<String>,
     cursor: usize,
     pub settings: Settings,
@@ -86,7 +100,8 @@ impl PickerState {
     ) -> Self {
         let mut state = Self {
             seen: DeviceSet::new(),
-            rows: Vec::new(),
+            all_rows: Vec::new(),
+            visible_limit: ROW_LIMIT_STEP,
             selected: selection.into_iter().collect(),
             cursor: 0,
             settings,
@@ -118,7 +133,7 @@ impl PickerState {
         // Remember what the cursor was pointing at: rows re-sort as devices
         // arrive, and a cursor pinned to an index would drift onto a different
         // receiver mid-keystroke.
-        let anchored = self.rows.get(self.cursor).map(|r| r.key.clone());
+        let anchored = self.all_rows.get(self.cursor).map(|r| r.key.clone());
 
         let mut rows: Vec<PickerRow> = self
             .seen
@@ -153,10 +168,10 @@ impl PickerState {
                 .then_with(|| a.key.cmp(&b.key))
         });
 
-        self.rows = rows;
+        self.all_rows = rows;
         self.cursor = match anchored {
             Some(key) => self
-                .rows
+                .all_rows
                 .iter()
                 .position(|r| r.key == key)
                 .unwrap_or(self.cursor),
@@ -166,15 +181,41 @@ impl PickerState {
     }
 
     fn clamp_cursor(&mut self) {
-        if self.rows.is_empty() {
+        if self.all_rows.is_empty() {
             self.cursor = 0;
-        } else if self.cursor >= self.rows.len() {
-            self.cursor = self.rows.len() - 1;
+        } else if self.cursor >= self.all_rows.len() {
+            self.cursor = self.all_rows.len() - 1;
+        }
+        self.extend_window();
+    }
+
+    /// Grow the window when the cursor nears its end.
+    ///
+    /// Only ever grows. Shrinking it back would move rows out from under a
+    /// cursor that is already there, and the memory saved is a few dozen
+    /// structs.
+    fn extend_window(&mut self) {
+        while self.cursor + ROW_LIMIT_MARGIN >= self.visible_limit
+            && self.visible_limit < self.all_rows.len()
+        {
+            self.visible_limit += ROW_LIMIT_STEP;
         }
     }
 
+    /// The rows to draw: the first [`ROW_LIMIT_STEP`] devices, extended as the
+    /// cursor travels down.
+    ///
+    /// **A rendering cap, not a discovery cap.** `DeviceSet` still keeps every
+    /// device it hears about — limiting discovery would mean missing one that
+    /// announces late, which on a busy network is exactly the receiver someone
+    /// is waiting for.
     pub fn rows(&self) -> &[PickerRow] {
-        &self.rows
+        &self.all_rows[..self.visible_limit.min(self.all_rows.len())]
+    }
+
+    /// How many devices are known, whether or not they are drawn.
+    pub fn total(&self) -> usize {
+        self.all_rows.len()
     }
 
     pub fn cursor(&self) -> usize {
@@ -199,8 +240,12 @@ impl PickerState {
     }
 
     /// The devices the user chose, in display order.
+    ///
+    /// Reads `all_rows`, not the window. Filtering to what happens to be on
+    /// screen would silently drop a receiver the user picked before more
+    /// devices arrived and pushed it out of view.
     pub fn chosen(&self) -> Vec<&PickerRow> {
-        self.rows.iter().filter(|r| r.selected).collect()
+        self.all_rows.iter().filter(|r| r.selected).collect()
     }
 
     /// The selected device keys, including any not currently on screen.
@@ -224,8 +269,9 @@ impl PickerState {
                 PickerAction::None
             }
             KeyCode::Down => {
-                if !self.rows.is_empty() && self.cursor + 1 < self.rows.len() {
+                if self.cursor + 1 < self.all_rows.len() {
                     self.cursor += 1;
+                    self.extend_window();
                 }
                 PickerAction::None
             }
@@ -253,7 +299,7 @@ impl PickerState {
     }
 
     fn toggle_selection(&mut self) {
-        let Some(row) = self.rows.get_mut(self.cursor) else {
+        let Some(row) = self.all_rows.get_mut(self.cursor) else {
             return;
         };
         row.selected = !row.selected;
@@ -329,6 +375,121 @@ mod tests {
 
     fn picker() -> PickerState {
         PickerState::new(Settings::default(), Vec::new(), true)
+    }
+
+    /// `n` transient devices, named so their sort order is the insertion
+    /// order — `dev-000` … `dev-199`.
+    fn many_devices(p: &mut PickerState, n: usize) {
+        for i in 0..n {
+            p.insert(device(
+                &format!("dev-{i:03}"),
+                &format!("192.168.{}.{}", i / 250, i % 250 + 1),
+                &format!("{i}"),
+                TRANSIENT,
+            ));
+        }
+    }
+
+    #[test]
+    fn a_large_network_renders_a_window_not_everything() {
+        let mut p = picker();
+        many_devices(&mut p, 200);
+        assert_eq!(p.rows().len(), ROW_LIMIT_STEP, "only a window is drawn");
+        assert_eq!(p.total(), 200, "but every device is still known");
+    }
+
+    #[test]
+    fn the_window_extends_as_the_cursor_approaches_its_end() {
+        let mut p = picker();
+        many_devices(&mut p, 200);
+        for _ in 0..45 {
+            p.on_key(KeyCode::Down);
+        }
+        assert_eq!(p.cursor(), 45);
+        assert_eq!(p.rows().len(), ROW_LIMIT_STEP * 2);
+    }
+
+    #[test]
+    fn the_cursor_can_reach_the_last_device() {
+        // The window must never become a floor the cursor cannot climb past.
+        let mut p = picker();
+        many_devices(&mut p, 200);
+        for _ in 0..500 {
+            p.on_key(KeyCode::Down);
+        }
+        assert_eq!(p.cursor(), 199);
+        assert_eq!(p.rows().len(), 200, "fully extended, never over-extended");
+        assert_eq!(p.rows()[p.cursor()].name, "dev-199");
+    }
+
+    #[test]
+    fn a_selection_beyond_the_window_is_still_reported() {
+        // The trap this whole task walks past: a chosen receiver ends up
+        // outside the drawn window and must still be streamed to. Filtering
+        // the selection to the visible rows would drop it silently, which is
+        // the worst failure available here.
+        //
+        // Staged the way it actually happens: the user comes back from a
+        // failed connect with the selection remembered as a key, then a busy
+        // network fills the list in ahead of it. The cursor stays where it
+        // is, so nothing extends the window to reveal it.
+        let mut p = PickerState::with_selection(
+            Settings::default(),
+            Vec::new(),
+            true,
+            vec!["pool".to_string()],
+        );
+        many_devices(&mut p, 200);
+        // Named to sort last, so it lands well outside the window.
+        p.insert(device("zzz Pool Room", "192.168.9.9", "pool", TRANSIENT));
+
+        assert_eq!(p.cursor(), 0, "the cursor never travelled");
+        assert!(
+            !p.rows().iter().any(|r| r.name == "zzz Pool Room"),
+            "fixture check: it must actually be outside the window"
+        );
+        assert_eq!(p.chosen().len(), 1, "still chosen");
+        assert_eq!(p.chosen()[0].name, "zzz Pool Room");
+        assert_eq!(
+            p.selection_keys(),
+            ["pool"],
+            "and survives another trip back here"
+        );
+    }
+
+    #[test]
+    fn sort_order_survives_an_extension() {
+        // Paired devices sort first, and an extension must not reshuffle.
+        let mut p = PickerState::new(Settings::default(), vec!["150".into()], true);
+        many_devices(&mut p, 200);
+        assert_eq!(p.rows()[0].name, "dev-150", "the paired one leads");
+
+        for _ in 0..60 {
+            p.on_key(KeyCode::Down);
+        }
+        assert_eq!(p.rows()[0].name, "dev-150", "and still leads after growing");
+        let names: Vec<&str> = p.rows()[1..4].iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["dev-000", "dev-001", "dev-002"]);
+    }
+
+    #[test]
+    fn a_device_arriving_below_the_cursor_does_not_shrink_the_window() {
+        let mut p = picker();
+        many_devices(&mut p, 200);
+        for _ in 0..45 {
+            p.on_key(KeyCode::Down);
+        }
+        let grown = p.rows().len();
+        p.insert(device("aaa-first", "192.168.200.1", "aaa", TRANSIENT));
+        assert!(p.rows().len() >= grown, "the window only ever grows");
+    }
+
+    #[test]
+    fn a_small_network_is_unaffected() {
+        let mut p = picker();
+        many_devices(&mut p, 3);
+        assert_eq!(p.rows().len(), 3);
+        assert_eq!(p.total(), 3);
     }
 
     #[test]
