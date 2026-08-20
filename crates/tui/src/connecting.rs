@@ -291,28 +291,18 @@ pub fn render(frame: &mut Frame, state: &ConnectingState) {
     ])
     .areas(area);
 
-    let failed = state.outcome() == ConnectOutcome::AllFailed;
-    let title = if failed {
-        Span::styled(
-            "  could not connect",
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        )
-    } else {
-        Span::styled(
-            format!("  {} connecting…", state.spinner()),
-            Style::default().add_modifier(Modifier::BOLD),
-        )
-    };
-    let subtitle = if failed {
-        state.failure_summary()
-    } else {
-        format!("  {:.0}s elapsed", state.elapsed().as_secs_f32())
-    };
+    // No all-failed rendering here: the app leaves for the picker as soon as
+    // the group settles that way, carrying the reason as a banner, so this
+    // screen only ever shows work in progress. Individual failures still
+    // appear in the list below while others are still connecting.
     frame.render_widget(
         Paragraph::new(vec![
-            Line::from(title),
             Line::from(Span::styled(
-                format!("  {subtitle}"),
+                format!("  {} connecting…", state.spinner()),
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                format!("  {:.0}s elapsed", state.elapsed().as_secs_f32()),
                 Style::default().fg(Color::DarkGray),
             )),
         ])
@@ -356,14 +346,9 @@ pub fn render(frame: &mut Frame, state: &ConnectingState) {
         list,
     );
 
-    let hint = if failed {
-        "  esc to choose again"
-    } else {
-        "  esc to cancel"
-    };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            hint,
+            "  esc to cancel",
             Style::default().fg(Color::DarkGray),
         ))),
         footer,
@@ -416,23 +401,34 @@ mod render_tests {
     }
 
     #[test]
-    fn renders_the_failure_reason() {
+    fn a_failure_shows_its_reason_while_others_connect() {
+        // A partial failure stays on screen: the user can see which receiver
+        // dropped out and why, without losing the ones still connecting.
         let stats = StreamStats::new(500);
-        stats.set_receivers(vec![ReceiverStat {
-            name: "Pool Room".into(),
-            addr: "192.168.1.51:7000".parse().unwrap(),
-            state: ReceiverState::Failed,
-            offset_ms: 0,
-            trim_db: 0.0,
-            error: Some("connection refused".into()),
-        }]);
+        stats.set_receivers(vec![
+            ReceiverStat {
+                name: "Pool Room".into(),
+                addr: "192.168.1.51:7000".parse().unwrap(),
+                state: ReceiverState::Failed,
+                offset_ms: 0,
+                trim_db: 0.0,
+                error: Some("connection refused".into()),
+            },
+            ReceiverStat {
+                name: "Living Room".into(),
+                addr: "192.168.1.52:7000".parse().unwrap(),
+                state: ReceiverState::Connecting,
+                offset_ms: 0,
+                trim_db: 0.0,
+                error: None,
+            },
+        ]);
         let mut state = ConnectingState::new();
         state.sample(&stats);
 
         let out = draw(100, 30, &state);
-        assert!(out.contains("could not connect"));
         assert!(out.contains("refused"), "the reason must be on screen: {out}");
-        assert!(out.contains("choose again"));
+        assert!(out.contains("Living Room"));
     }
 
     #[test]

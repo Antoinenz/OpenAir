@@ -162,6 +162,9 @@ pub struct App<'a> {
     settings: Settings,
     launch: StreamLauncher<'a>,
     handoff_available: bool,
+    /// Device keys the user last chose, so a return to the picker does not
+    /// make them pick again.
+    last_selection: Vec<String>,
     /// Set when the user asks to leave entirely.
     quitting: bool,
 }
@@ -182,6 +185,7 @@ impl<'a> App<'a> {
             settings,
             launch,
             handoff_available,
+            last_selection: Vec::new(),
             quitting: false,
         }
     }
@@ -330,8 +334,20 @@ impl<'a> App<'a> {
         let Screen::Connecting(c) = &self.screen else {
             return;
         };
-        if c.state.outcome() != ConnectOutcome::Ready {
-            return;
+        match c.state.outcome() {
+            ConnectOutcome::Waiting => return,
+            ConnectOutcome::AllFailed => {
+                // Nothing to stream to, so waiting for the user to press
+                // esc would just be a dead screen. Go back and say why.
+                let banner = c.state.failure_summary();
+                c.running.stop();
+                self.open_picker();
+                if let Screen::Picker(p) = &mut self.screen {
+                    p.state.set_banner(banner);
+                }
+                return;
+            }
+            ConnectOutcome::Ready => {}
         }
         let placeholder = Screen::Picker(Box::new(PickerScreen {
             state: PickerState::new(self.settings.clone(), Vec::new(), self.handoff_available),
@@ -426,6 +442,7 @@ impl<'a> App<'a> {
                 PickerAction::Quit => self.quitting = true,
                 PickerAction::Start => {
                     let chosen: Vec<PickerRow> = p.state.chosen().into_iter().cloned().collect();
+                    self.last_selection = p.state.selection_keys();
                     self.settings = p.state.settings.clone();
                     if let Err(e) = self.settings.save() {
                         tracing::warn!("could not save settings: {e}");
@@ -515,7 +532,12 @@ impl<'a> App<'a> {
             }
         };
         self.screen = Screen::Picker(Box::new(PickerScreen {
-            state: PickerState::new(self.settings.clone(), paired, self.handoff_available),
+            state: PickerState::with_selection(
+                self.settings.clone(),
+                paired,
+                self.handoff_available,
+                self.last_selection.clone(),
+            ),
             browse,
         }));
     }
@@ -762,36 +784,42 @@ mod tests {
     }
 
     #[test]
-    fn the_app_stays_on_connecting_when_everything_failed() {
-        // The user needs to read why before being moved anywhere.
+    fn everything_failing_returns_to_the_picker_with_the_reason() {
+        // Sitting on a connecting screen with nothing left to connect to would
+        // be a dead end, so the app goes back on its own and says why.
         let started = std::sync::Mutex::new(Vec::new());
         let mut app = test_app(&started);
         app.start_stream(targets_from(&[row("192.168.1.51:7000", None)]));
 
         publish(&mut app, ReceiverState::Failed, Some("connection refused"));
-        assert_eq!(app.screen().name(), "connecting");
+
+        assert_eq!(app.screen().name(), "picker");
+        let Screen::Picker(p) = &app.screen else {
+            panic!("expected the picker");
+        };
+        assert!(
+            p.state.banner().unwrap().contains("refused"),
+            "got: {:?}",
+            p.state.banner()
+        );
     }
 
     #[test]
-    fn cancelling_a_failed_connect_returns_to_the_picker_with_the_reason() {
+    fn a_failed_connect_keeps_the_selection_for_a_retry() {
+        // Making the user re-pick the same receivers after a failure is the
+        // kind of small insult that makes a tool tiring.
         let started = std::sync::Mutex::new(Vec::new());
         let mut app = test_app(&started);
-        app.start_stream(targets_from(&[row("192.168.1.51:7000", None)]));
+        app.last_selection = vec!["AA:BB".to_string()];
+        app.start_stream(targets_from(&[row("192.168.1.51:7000", Some("AA:BB"))]));
+
         publish(&mut app, ReceiverState::Failed, Some("connection refused"));
 
-        let Screen::Connecting(c) = &mut app.screen else {
-            panic!("expected connecting");
-        };
-        assert_eq!(c.state.on_key(KeyCode::Esc), ConnectAction::Cancel);
-        let banner = c.state.failure_summary();
-        c.running.stop();
-        app.open_picker();
-        if let Screen::Picker(p) = &mut app.screen {
-            p.state.set_banner(banner);
-            assert!(p.state.banner().unwrap().contains("refused"));
-        } else {
+        let Screen::Picker(p) = &mut app.screen else {
             panic!("expected the picker");
-        }
+        };
+        p.state.insert(test_device("192.168.1.51"));
+        assert_eq!(p.state.chosen().len(), 1, "still selected when it reappears");
     }
 
     /// Publish one receiver in `state` and let the app react.

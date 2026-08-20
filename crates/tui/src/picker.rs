@@ -70,10 +70,24 @@ pub struct PickerState {
 
 impl PickerState {
     pub fn new(settings: Settings, paired: Vec<String>, handoff_available: bool) -> Self {
+        Self::with_selection(settings, paired, handoff_available, Vec::new())
+    }
+
+    /// Build with `selection` (device keys) already chosen.
+    ///
+    /// Used when the user is sent back here after a failure: the devices have
+    /// not been rediscovered yet, but a key that reappears will come back
+    /// selected, so a retry is one keystroke rather than a re-pick.
+    pub fn with_selection(
+        settings: Settings,
+        paired: Vec<String>,
+        handoff_available: bool,
+        selection: Vec<String>,
+    ) -> Self {
         let mut state = Self {
             seen: DeviceSet::new(),
             rows: Vec::new(),
-            selected: HashSet::new(),
+            selected: selection.into_iter().collect(),
             cursor: 0,
             settings,
             paired: paired.into_iter().collect(),
@@ -187,6 +201,15 @@ impl PickerState {
     /// The devices the user chose, in display order.
     pub fn chosen(&self) -> Vec<&PickerRow> {
         self.rows.iter().filter(|r| r.selected).collect()
+    }
+
+    /// The selected device keys, including any not currently on screen.
+    ///
+    /// Deliberately not `chosen()`: a device that has gone quiet is still
+    /// selected, and losing that on the way back to the picker is the bug this
+    /// exists to prevent.
+    pub fn selection_keys(&self) -> Vec<String> {
+        self.selected.iter().cloned().collect()
     }
 
     pub fn on_key(&mut self, key: KeyCode) -> PickerAction {
@@ -478,6 +501,46 @@ mod tests {
             other => panic!("expected a hint, got {other:?}"),
         }
         assert!(!p.settings.handoff);
+    }
+
+    #[test]
+    fn a_prior_selection_is_restored_as_devices_reappear() {
+        // After a failed connect the user is sent back here. The devices have
+        // not been rediscovered yet, so the selection has to survive as keys
+        // and reattach when they announce again.
+        let mut p = PickerState::with_selection(
+            Settings::default(),
+            Vec::new(),
+            true,
+            vec!["1".to_string()],
+        );
+        assert!(p.chosen().is_empty(), "nothing discovered yet");
+
+        p.insert(device("Pool Room", "192.168.1.51", "1", TRANSIENT));
+        assert_eq!(p.chosen().len(), 1);
+        assert_eq!(p.chosen()[0].name, "Pool Room");
+    }
+
+    #[test]
+    fn selection_keys_include_devices_not_currently_listed() {
+        let p = PickerState::with_selection(
+            Settings::default(),
+            Vec::new(),
+            true,
+            vec!["1".to_string(), "2".to_string()],
+        );
+        let mut keys = p.selection_keys();
+        keys.sort();
+        assert_eq!(keys, ["1", "2"]);
+    }
+
+    #[test]
+    fn the_banner_clears_on_the_next_keystroke() {
+        let mut p = picker();
+        p.set_banner("nothing connected");
+        assert!(p.banner().is_some());
+        p.on_key(KeyCode::Down);
+        assert!(p.banner().is_none(), "a stale explanation becomes furniture");
     }
 
     #[test]
