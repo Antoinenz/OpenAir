@@ -20,6 +20,7 @@
 //! rate, a stop flag) cross the boundary, and those are already `Send`. The
 //! `HandoffSession` guard and the WASAPI capture handle never move at all.
 
+use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -137,6 +138,9 @@ pub struct ConnectingScreen {
     pub state: ConnectingState,
     running: Running,
     last_sample: Instant,
+    /// Device id per receiver address, carried through so the dashboard can
+    /// retry one later.
+    device_ids: HashMap<SocketAddr, String>,
 }
 
 pub struct PickerScreen {
@@ -337,6 +341,9 @@ impl<'a> App<'a> {
             unreachable!("just matched");
         };
         let mut state = DashboardState::new(self.settings.graph, self.settings.latency_ms);
+        // A retry needs the device id, which `ReceiverStat` does not carry --
+        // it is what pairing keys off, so it has to come from the targets.
+        state.set_device_ids(c.device_ids.clone());
         // Seed from the reading the connecting screen already took, so the
         // first dashboard frame shows the group rather than an empty list.
         state.sample(&c.running.stats, Instant::now());
@@ -529,6 +536,10 @@ impl<'a> App<'a> {
     fn start_stream(&mut self, targets: Vec<GroupTarget>) {
         let stats = StreamStats::new(self.settings.latency_ms);
         let stop = Arc::new(AtomicBool::new(false));
+        let device_ids: HashMap<SocketAddr, String> = targets
+            .iter()
+            .map(|t| (t.addr, t.device_id.clone()))
+            .collect();
         let handle = (self.launch)(targets, Arc::clone(&stats), Arc::clone(&stop));
         self.screen = Screen::Connecting(Box::new(ConnectingScreen {
             state: ConnectingState::new(),
@@ -538,6 +549,7 @@ impl<'a> App<'a> {
                 handle: Some(handle),
             },
             last_sample: Instant::now(),
+            device_ids,
         }));
     }
 }

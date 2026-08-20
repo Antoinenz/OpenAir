@@ -11,7 +11,9 @@ use std::time::Instant;
 use std::net::SocketAddr;
 
 use crossterm::event::KeyCode;
-use openair_client::{ReceiverStat, StreamCommand, StreamStats, TRIM_MAX_DB, TRIM_MIN_DB};
+use openair_client::{
+    ReceiverStat, ReceiverState, StreamCommand, StreamStats, TRIM_MAX_DB, TRIM_MIN_DB,
+};
 use openair_core::metadata::NowPlaying;
 
 use crate::settings::GraphKind;
@@ -29,6 +31,9 @@ pub enum DashAction {
     /// Open the add-a-receiver overlay.
     OpenPicker,
 }
+
+/// Fallback device id, matching the CLI, for a receiver that advertised none.
+const DEFAULT_DEVICE_ID: &str = "AA:BB:CC:DD:EE:FF";
 
 /// Volume trim step per key press, in dB. One dB is the smallest step that is
 /// reliably audible, so a key press always does something.
@@ -71,6 +76,10 @@ pub struct DashboardState {
     /// overwrite the local one and the next press would recompute from stale
     /// state. An entry is dropped as soon as the stream reports the value back.
     pending: HashMap<SocketAddr, Pending>,
+    /// Device ids for receivers in this run, so a retry can rebuild the
+    /// session. `ReceiverStat` carries the address but not the id, and the
+    /// id is what pairing keys off.
+    device_ids: HashMap<SocketAddr, String>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -94,7 +103,13 @@ impl DashboardState {
             worst_lead_ms: None,
             selected: None,
             pending: HashMap::new(),
+            device_ids: HashMap::new(),
         }
+    }
+
+    /// Tell the dashboard which device id belongs to each address.
+    pub fn set_device_ids(&mut self, ids: HashMap<SocketAddr, String>) {
+        self.device_ids = ids;
     }
 
     /// Take one reading. Called once per render tick.
@@ -228,6 +243,7 @@ impl DashboardState {
             KeyCode::Char('>') | KeyCode::Char('.') => self.nudge_offset(OFFSET_STEP_MS),
             KeyCode::Char('<') | KeyCode::Char(',') => self.nudge_offset(-OFFSET_STEP_MS),
             KeyCode::Char('a') => DashAction::OpenPicker,
+            KeyCode::Char('r') => self.retry_selected(),
             KeyCode::Char('d') | KeyCode::Delete => match self.selected_receiver() {
                 Some(r) => DashAction::Command(StreamCommand::Remove { addr: r.addr }),
                 None => DashAction::None,
@@ -235,6 +251,30 @@ impl DashboardState {
             KeyCode::Char('q') | KeyCode::Esc => DashAction::Quit,
             _ => DashAction::None,
         }
+    }
+
+    /// Try a failed receiver again.
+    ///
+    /// Deliberately manual: a receiver that is asleep or on another network
+    /// fails identically ten seconds later, and silently retrying in the
+    /// background is the unsolicited-connection behaviour the picker exists
+    /// to avoid. Retrying a live receiver would tear down a working session
+    /// to rebuild it, so that is a no-op rather than a surprise.
+    fn retry_selected(&mut self) -> DashAction {
+        let Some(r) = self.selected_receiver() else {
+            return DashAction::None;
+        };
+        if r.state != ReceiverState::Failed && r.state != ReceiverState::Dead {
+            return DashAction::None;
+        }
+        DashAction::Command(StreamCommand::Add {
+            addr: r.addr,
+            device_id: self
+                .device_ids
+                .get(&r.addr)
+                .cloned()
+                .unwrap_or_else(|| DEFAULT_DEVICE_ID.to_string()),
+        })
     }
 
     fn nudge_trim(&mut self, delta: f32) -> DashAction {
@@ -682,6 +722,55 @@ mod tests {
             d.on_key(KeyCode::Char('d')),
             DashAction::Command(StreamCommand::Remove { addr: addr(52) })
         );
+    }
+
+    #[test]
+    fn r_retries_a_failed_receiver() {
+        let mut failed = receiver(51, "Pool");
+        failed.state = ReceiverState::Failed;
+        failed.error = Some("connection refused".into());
+        let (mut d, _) = dash_with(vec![failed]);
+        d.set_device_ids(HashMap::from([(addr(51), "AA:BB".to_string())]));
+
+        assert_eq!(
+            d.on_key(KeyCode::Char('r')),
+            DashAction::Command(StreamCommand::Add {
+                addr: addr(51),
+                device_id: "AA:BB".into()
+            })
+        );
+    }
+
+    #[test]
+    fn r_on_a_live_receiver_does_nothing() {
+        // Retrying a working session would tear it down to rebuild it.
+        let (mut d, _) = dash_with(vec![receiver(51, "Pool")]);
+        assert_eq!(d.on_key(KeyCode::Char('r')), DashAction::None);
+    }
+
+    #[test]
+    fn a_retry_without_a_known_device_id_falls_back_to_the_default() {
+        let mut failed = receiver(51, "Pool");
+        failed.state = ReceiverState::Failed;
+        let (mut d, _) = dash_with(vec![failed]);
+
+        assert_eq!(
+            d.on_key(KeyCode::Char('r')),
+            DashAction::Command(StreamCommand::Add {
+                addr: addr(51),
+                device_id: DEFAULT_DEVICE_ID.into()
+            })
+        );
+    }
+
+    #[test]
+    fn a_failed_row_is_reachable_with_the_arrows() {
+        let mut failed = receiver(52, "Living");
+        failed.state = ReceiverState::Failed;
+        let (mut d, _) = dash_with(vec![receiver(51, "Pool"), failed]);
+
+        d.on_key(KeyCode::Down);
+        assert_eq!(d.selected_receiver().unwrap().name, "Living");
     }
 
     #[test]

@@ -356,6 +356,15 @@ fn render_receivers(frame: &mut Frame, area: Rect, state: &DashboardState) {
                         },
                         row.fg(Color::Magenta),
                     ),
+                    // The reason matters more than the columns it displaces,
+                    // so it takes the rest of the row.
+                    Span::styled(
+                        match &r.error {
+                            Some(why) => format!("  {why}"),
+                            None => String::new(),
+                        },
+                        row.fg(Color::Red),
+                    ),
                 ])
             })
             .collect()
@@ -366,7 +375,7 @@ fn render_receivers(frame: &mut Frame, area: Rect, state: &DashboardState) {
             Block::default()
                 .borders(Borders::ALL)
                 .title(format!(
-                    " receivers ({})   [↑↓] select · [+/-] volume · [<>] offset · [a] add · [d] drop ",
+                    " receivers ({})   [↑↓] select · [+/-] vol · [<>] offset · [a] add · [r] retry · [d] drop ",
                     state.receivers.len()
                 )),
         ),
