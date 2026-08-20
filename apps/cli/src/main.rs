@@ -602,13 +602,6 @@ fn resolve_receivers(
     Some(out)
 }
 
-/// Placeholder receiver argument used when the picker chose the receivers.
-///
-/// The capture branch is reached by argument shape, and the picker's result is
-/// a list of resolved targets rather than a list of names — so it stands in for
-/// them and is never parsed.
-const PICKER_SELECTION: &str = "<picker>";
-
 /// Set up logging: always to the console, and additionally to a timestamped
 /// file under `logs/` when `--log` is given.
 ///
@@ -783,7 +776,7 @@ async fn main() -> Result<()> {
         handoff = settings.handoff;
         latency_ms = settings.latency_ms;
         volume_db = settings.volume_db;
-        args = vec!["capture".to_string(), PICKER_SELECTION.to_string()];
+        args = vec!["capture".to_string()];
     }
 
     // Only `capture` hands the terminal to the App; every other subcommand
@@ -919,13 +912,13 @@ async fn main() -> Result<()> {
     // live system audio (WASAPI loopback of the default output device) for
     // `seconds`, or indefinitely (until Ctrl+C) if omitted. Multiple
     // receivers = synchronized multi-room (buffered pipeline).
-    if args.len() >= 2 && args[0] == "capture" {
+    if args.first().map(String::as_str) == Some("capture") {
         let mut recv_args: Vec<String> = args[1..].to_vec();
         let seconds: Option<u32> = recv_args.last().and_then(|s| s.parse().ok());
         if seconds.is_some() {
             recv_args.pop();
         }
-        if recv_args.is_empty() {
+        if recv_args.is_empty() && !start_at_picker {
             println!("usage: openair capture <receiver>... [seconds]");
             return Ok(());
         }
