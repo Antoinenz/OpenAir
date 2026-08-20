@@ -256,14 +256,8 @@ impl PickerState {
         if chosen.is_empty() {
             return self.hint_action("select a receiver with space first");
         }
-        // Catch this here rather than letting the handshake fail with
-        // something opaque several seconds later.
-        if let Some(row) = chosen.iter().find(|r| r.needs_pairing) {
-            let name = row.name.clone();
-            return self.hint_action(&format!(
-                "{name} needs pairing first — run: openair pair \"{name}\""
-            ));
-        }
+        // Devices needing a PIN used to be refused here. Pairing now happens
+        // after this point, inside the flow, so there is nothing to refuse.
         PickerAction::Start
     }
 
@@ -420,16 +414,17 @@ mod tests {
     }
 
     #[test]
-    fn enter_on_an_unpaired_device_names_the_pair_command() {
+    fn an_unpaired_device_can_now_be_confirmed() {
+        // Pairing happens inside the flow, after this point, so the picker no
+        // longer refuses a device that needs a PIN.
         let mut p = picker();
         p.insert(device("Living Room", "192.168.1.106", "1", NEEDS_PAIRING));
         p.on_key(KeyCode::Char(' '));
-        match p.on_key(KeyCode::Enter) {
-            PickerAction::Hint(msg) => {
-                assert!(msg.contains(r#"openair pair "Living Room""#), "got: {msg}");
-            }
-            other => panic!("expected a hint, got {other:?}"),
-        }
+        assert_eq!(p.on_key(KeyCode::Enter), PickerAction::Start);
+        assert!(
+            p.chosen()[0].needs_pairing,
+            "still flagged, so the flow knows to pair it"
+        );
     }
 
     #[test]

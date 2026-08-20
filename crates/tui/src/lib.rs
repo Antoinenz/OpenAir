@@ -14,6 +14,8 @@ pub mod connecting;
 pub mod dashboard;
 pub mod dashboard_ui;
 pub mod logs;
+pub mod pairing;
+pub mod pairing_ui;
 pub mod picker;
 pub mod picker_ui;
 pub mod settings;

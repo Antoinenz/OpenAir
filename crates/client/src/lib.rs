@@ -508,6 +508,7 @@ pub fn stream_audio_buffered_with_latency(
 }
 
 /// One receiver in a buffered (possibly multi-room) stream.
+#[derive(Clone)]
 pub struct GroupTarget {
     pub addr: SocketAddr,
     pub device_id: String,

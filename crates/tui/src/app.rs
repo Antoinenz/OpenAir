@@ -21,6 +21,7 @@
 //! `HandoffSession` guard and the WASAPI capture handle never move at all.
 
 use std::io;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -34,6 +35,8 @@ use crate::connecting::{self, ConnectAction, ConnectOutcome, ConnectingState};
 use crate::dashboard::{DashAction, DashboardState};
 use crate::dashboard_ui::{self, Summary};
 use crate::logs::{self, LogBuffer};
+use crate::pairing::{PairAction, PairWorker, PairingState, PendingPair};
+use crate::pairing_ui;
 use crate::picker::{PickerAction, PickerRow, PickerState};
 use crate::picker_ui;
 use crate::settings::Settings;
@@ -87,6 +90,7 @@ impl StreamHandle {
 /// The current screen, and whatever state belongs only to it.
 pub enum Screen {
     Picker(Box<PickerScreen>),
+    Pairing(Box<PairingScreen>),
     Connecting(Box<ConnectingScreen>),
     Streaming(Box<StreamingScreen>),
 }
@@ -96,6 +100,7 @@ impl Screen {
     pub fn name(&self) -> &'static str {
         match self {
             Screen::Picker(_) => "picker",
+            Screen::Pairing(_) => "pairing",
             Screen::Connecting(_) => "connecting",
             Screen::Streaming(_) => "streaming",
         }
@@ -117,6 +122,15 @@ impl Running {
     fn stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
     }
+}
+
+pub struct PairingScreen {
+    pub state: PairingState,
+    /// The thread handling the current attempt, if one is in flight.
+    worker: Option<PairWorker>,
+    /// Receivers to stream to once pairing finishes — carried through so
+    /// the user does not have to choose again.
+    targets: Vec<GroupTarget>,
 }
 
 pub struct ConnectingScreen {
@@ -239,6 +253,12 @@ impl<'a> App<'a> {
                     }
                 }
             }
+            Screen::Pairing(p) => {
+                if let Some(result) = p.worker.as_ref().and_then(|w| w.poll()) {
+                    p.worker = None;
+                    p.state.on_result(result);
+                }
+            }
             Screen::Connecting(c) => {
                 let now = Instant::now();
                 if now.duration_since(c.last_sample) >= TICK {
@@ -257,7 +277,43 @@ impl<'a> App<'a> {
                 }
             }
         }
+        self.advance_from_pairing();
         self.advance_from_connecting();
+    }
+
+    /// Once every queued device has been dealt with, connect.
+    ///
+    /// A device that could not be paired is dropped from the target list
+    /// rather than blocking the rest: streaming to the speakers that did
+    /// pair is better than streaming to none.
+    fn advance_from_pairing(&mut self) {
+        let Screen::Pairing(p) = &self.screen else {
+            return;
+        };
+        let Some(outcome) = p.state.outcome() else {
+            return;
+        };
+        for (device, why) in &outcome.failed {
+            tracing::warn!(receiver = %device.name, "not paired: {why}");
+        }
+        let unpaired: Vec<SocketAddr> = outcome.failed.iter().map(|(d, _)| d.addr).collect();
+        let targets: Vec<GroupTarget> = p
+            .targets
+            .iter()
+            .filter(|t| !unpaired.contains(&t.addr))
+            .cloned()
+            .collect();
+
+        if targets.is_empty() {
+            // Nothing left to stream to; back to the picker rather than
+            // connecting to an empty group.
+            self.open_picker();
+            if let Screen::Picker(picker) = &mut self.screen {
+                picker.state.set_banner("no receivers were paired");
+            }
+            return;
+        }
+        self.start_stream(targets);
     }
 
     /// Move on once the group has settled.
@@ -295,6 +351,9 @@ impl<'a> App<'a> {
         match &self.screen {
             Screen::Picker(p) => {
                 terminal.draw(|frame| picker_ui::render(frame, &p.state))?;
+            }
+            Screen::Pairing(p) => {
+                terminal.draw(|frame| pairing_ui::render(frame, &p.state))?;
             }
             Screen::Connecting(c) => {
                 terminal.draw(|frame| connecting::render(frame, &c.state))?;
@@ -364,9 +423,31 @@ impl<'a> App<'a> {
                     if let Err(e) = self.settings.save() {
                         tracing::warn!("could not save settings: {e}");
                     }
-                    self.start_stream(targets_from(&chosen));
+                    self.begin(targets_from(&chosen), pending_pairs(&chosen));
                 }
                 PickerAction::None | PickerAction::Hint(_) => {}
+            },
+            Screen::Pairing(p) => match p.state.on_key(code) {
+                PairAction::Submit(pin) => {
+                    // The worker is created on first submit rather than on
+                    // entering the screen: it opens a socket and waits, and
+                    // holding one open while the user finds their remote is
+                    // how sessions get dropped.
+                    let worker = p.worker.get_or_insert_with(|| {
+                        let device = p.state.current().expect("submitting implies a device");
+                        PairWorker::spawn(device.addr, device.device_id.clone())
+                    });
+                    worker.submit(pin);
+                }
+                PairAction::Skip => {
+                    p.worker = None;
+                    p.state.skip_current();
+                }
+                PairAction::Cancel => {
+                    p.worker = None;
+                    self.open_picker();
+                }
+                PairAction::None => {}
             },
             Screen::Connecting(c) => {
                 if c.state.on_key(code) == ConnectAction::Cancel {
@@ -411,7 +492,7 @@ impl<'a> App<'a> {
                 c.running.stop();
                 self.quitting = true;
             }
-            Screen::Picker(_) => self.quitting = true,
+            Screen::Picker(_) | Screen::Pairing(_) => self.quitting = true,
         }
     }
 
@@ -429,6 +510,19 @@ impl<'a> App<'a> {
         self.screen = Screen::Picker(Box::new(PickerScreen {
             state: PickerState::new(self.settings.clone(), paired, self.handoff_available),
             browse,
+        }));
+    }
+
+    /// Start the run: pair anything that needs it first, then connect.
+    fn begin(&mut self, targets: Vec<GroupTarget>, needs_pairing: Vec<PendingPair>) {
+        if needs_pairing.is_empty() {
+            self.start_stream(targets);
+            return;
+        }
+        self.screen = Screen::Pairing(Box::new(PairingScreen {
+            state: PairingState::new(needs_pairing),
+            worker: None,
+            targets,
         }));
     }
 
@@ -456,6 +550,21 @@ impl<'a> App<'a> {
 fn poll_timeout(since_last_sample: Duration) -> Duration {
     TICK.saturating_sub(since_last_sample)
         .max(Duration::from_millis(1))
+}
+
+/// The chosen rows that must be paired before they can be streamed to.
+pub fn pending_pairs(rows: &[PickerRow]) -> Vec<PendingPair> {
+    rows.iter()
+        .filter(|r| r.needs_pairing)
+        .map(|r| PendingPair {
+            name: r.name.clone(),
+            addr: r.addr,
+            device_id: r
+                .device_id
+                .clone()
+                .unwrap_or_else(|| DEFAULT_DEVICE_ID.to_string()),
+        })
+        .collect()
 }
 
 /// Turn picker rows into stream targets.
@@ -688,6 +797,123 @@ mod tests {
         }]);
         c.state.sample(&c.running.stats);
         app.advance_from_connecting();
+    }
+
+    #[test]
+    fn a_device_needing_a_pin_routes_through_pairing_first() {
+        let started = std::sync::Mutex::new(Vec::new());
+        let mut app = test_app(&started);
+        let mut needs = row("192.168.1.51:7000", Some("AA:BB"));
+        needs.needs_pairing = true;
+
+        app.begin(
+            targets_from(std::slice::from_ref(&needs)),
+            pending_pairs(&[needs]),
+        );
+        assert_eq!(app.screen().name(), "pairing");
+        assert!(
+            started.lock().unwrap().is_empty(),
+            "nothing is streamed until pairing finishes"
+        );
+    }
+
+    #[test]
+    fn devices_already_paired_skip_straight_to_connecting() {
+        let started = std::sync::Mutex::new(Vec::new());
+        let mut app = test_app(&started);
+        let ready = row("192.168.1.51:7000", Some("AA:BB"));
+        app.begin(
+            targets_from(std::slice::from_ref(&ready)),
+            pending_pairs(&[ready]),
+        );
+        assert_eq!(app.screen().name(), "connecting");
+    }
+
+    #[test]
+    fn only_the_devices_that_need_it_are_queued_for_pairing() {
+        let mut needs = row("192.168.1.51:7000", Some("AA:BB"));
+        needs.needs_pairing = true;
+        let ready = row("192.168.1.52:7000", Some("CC:DD"));
+
+        let queued = pending_pairs(&[needs, ready]);
+        assert_eq!(queued.len(), 1);
+        assert_eq!(
+            queued[0].addr,
+            "192.168.1.51:7000".parse::<SocketAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn pairing_success_carries_the_selection_into_the_stream() {
+        // The user chose two receivers; one needed a PIN. Both must end up in
+        // the group -- making them re-pick the other would be absurd.
+        let started = std::sync::Mutex::new(Vec::new());
+        let mut app = test_app(&started);
+        let mut needs = row("192.168.1.51:7000", Some("AA:BB"));
+        needs.needs_pairing = true;
+        let ready = row("192.168.1.52:7000", Some("CC:DD"));
+        let rows = [needs, ready];
+
+        app.begin(targets_from(&rows), pending_pairs(&rows));
+        let Screen::Pairing(p) = &mut app.screen else {
+            panic!("expected pairing");
+        };
+        p.state.on_result(Ok(()));
+        app.advance_from_pairing();
+
+        assert_eq!(app.screen().name(), "connecting");
+        let calls = started.lock().unwrap();
+        assert_eq!(calls[0].len(), 2, "both receivers made it through");
+    }
+
+    #[test]
+    fn an_unpairable_device_is_dropped_but_the_others_still_play() {
+        let started = std::sync::Mutex::new(Vec::new());
+        let mut app = test_app(&started);
+        let mut needs = row("192.168.1.51:7000", Some("AA:BB"));
+        needs.needs_pairing = true;
+        let ready = row("192.168.1.52:7000", Some("CC:DD"));
+        let rows = [needs, ready];
+
+        app.begin(targets_from(&rows), pending_pairs(&rows));
+        let Screen::Pairing(p) = &mut app.screen else {
+            panic!("expected pairing");
+        };
+        p.state.skip_current();
+        app.advance_from_pairing();
+
+        assert_eq!(app.screen().name(), "connecting");
+        let calls = started.lock().unwrap();
+        assert_eq!(calls[0].len(), 1, "only the paired receiver");
+        assert_eq!(
+            calls[0][0].addr,
+            "192.168.1.52:7000".parse::<SocketAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn skipping_the_only_device_returns_to_the_picker() {
+        let started = std::sync::Mutex::new(Vec::new());
+        let mut app = test_app(&started);
+        let mut needs = row("192.168.1.51:7000", Some("AA:BB"));
+        needs.needs_pairing = true;
+
+        app.begin(
+            targets_from(std::slice::from_ref(&needs)),
+            pending_pairs(&[needs]),
+        );
+        let Screen::Pairing(p) = &mut app.screen else {
+            panic!("expected pairing");
+        };
+        p.state.skip_current();
+        app.advance_from_pairing();
+
+        assert_eq!(app.screen().name(), "picker");
+        assert!(started.lock().unwrap().is_empty(), "nothing to stream to");
+        let Screen::Picker(p) = &app.screen else {
+            panic!("expected the picker");
+        };
+        assert!(p.state.banner().unwrap().contains("no receivers"));
     }
 
     #[test]
