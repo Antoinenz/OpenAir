@@ -74,9 +74,15 @@ pub fn render_device_list(
     frame.render_stateful_widget(list, area, &mut list_state);
 }
 
+/// One device row.
+///
+/// Deliberately carries no pairing marker. Pairing now happens after the user
+/// confirms, so a mark that predicts it says nothing actionable — and nobody
+/// reads a tick as "credentials on disk". `paired` still orders the list, which
+/// is the useful half: your usual speakers stay at the top.
 fn row_item(row: &PickerRow) -> ListItem<'static> {
     let mark = if row.selected { "[x]" } else { "[ ]" };
-    let mut spans = vec![
+    let spans = vec![
         Span::styled(
             format!(" {mark} "),
             Style::default().fg(if row.selected {
@@ -92,14 +98,6 @@ fn row_item(row: &PickerRow) -> ListItem<'static> {
         ),
         Span::styled(row.addr.to_string(), Style::default().fg(Color::DarkGray)),
     ];
-    if row.needs_pairing {
-        spans.push(Span::styled(
-            "  ! needs pairing",
-            Style::default().fg(Color::Yellow),
-        ));
-    } else if row.paired {
-        spans.push(Span::styled("  ✓", Style::default().fg(Color::Green)));
-    }
     ListItem::new(Line::from(spans))
 }
 
@@ -132,6 +130,54 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::Settings;
+    use openair_discovery::{AirPlayDevice, AirPlayTxt};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use std::collections::HashMap;
+
+    /// Bit 48 set: Transient pairing, so nothing is needed before streaming.
+    const TRANSIENT: &str = "0x200,0x10000";
+    /// Bit 9 only: audio, but Normal pairing required.
+    const NEEDS_PAIRING: &str = "0x200,0x0";
+
+    fn device(name: &str, addr: &str, id: &str, features: &str) -> AirPlayDevice {
+        let mut raw: HashMap<String, String> = HashMap::new();
+        raw.insert("features".into(), features.into());
+        raw.insert("deviceid".into(), id.into());
+        raw.insert("model".into(), "AppleTV6,2".into());
+        AirPlayDevice::new(
+            format!("{name}._airplay._tcp.local."),
+            addr.parse().unwrap(),
+            7000,
+            AirPlayTxt::parse(&raw),
+        )
+    }
+
+    fn draw(width: u16, height: u16, state: &PickerState) -> Terminal<TestBackend> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| render(frame, state)).unwrap();
+        terminal
+    }
+
+    #[test]
+    fn no_pairing_marker_is_drawn() {
+        // Both halves of the old marker: a paired device drew a ✓ and an
+        // unpaired one drew "! needs pairing". Neither survives, and the flag
+        // that drove them still exists for sorting and for the pairing screen.
+        let mut state = PickerState::new(Settings::default(), vec!["2".into()], true);
+        state.insert(device("Living Room", "192.168.1.106", "1", NEEDS_PAIRING));
+        state.insert(device("Pool Room", "192.168.1.51", "2", TRANSIENT));
+
+        let screen = draw(100, 20, &state).backend().to_string();
+        assert!(!screen.contains('✓'), "no tick:\n{screen}");
+        assert!(!screen.contains("needs pairing"), "no warning:\n{screen}");
+        assert!(screen.contains("Living Room") && screen.contains("Pool Room"));
+        assert!(
+            state.rows().iter().any(|r| r.needs_pairing),
+            "the flag itself must survive — the pairing screen reads it"
+        );
+    }
 
     #[test]
     fn truncate_leaves_short_strings_alone() {
