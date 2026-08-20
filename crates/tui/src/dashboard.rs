@@ -58,6 +58,10 @@ pub struct DashboardState {
     last_bytes: Option<(u64, Instant)>,
     bandwidth_bps: Option<f64>,
     pub latency_ms: u64,
+    /// Whether to name every keybind in the panel titles. Copied from
+    /// `Settings` rather than held by reference: the dashboard outlives no
+    /// settings object and only ever reads this.
+    pub show_controls: bool,
     pub receivers: Vec<ReceiverStat>,
     pub now_playing: Option<NowPlaying>,
     pub log_scroll: usize,
@@ -97,6 +101,7 @@ impl DashboardState {
             last_bytes: None,
             bandwidth_bps: None,
             latency_ms,
+            show_controls: false,
             receivers: Vec::new(),
             now_playing: None,
             log_scroll: 0,

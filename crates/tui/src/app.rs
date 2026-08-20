@@ -362,6 +362,7 @@ impl<'a> App<'a> {
             unreachable!("just matched");
         };
         let mut state = DashboardState::new(self.settings.latency_ms);
+        state.show_controls = self.settings.show_controls;
         // A retry needs the device id, which `ReceiverStat` does not carry --
         // it is what pairing keys off, so it has to come from the targets.
         state.set_device_ids(c.device_ids.clone());

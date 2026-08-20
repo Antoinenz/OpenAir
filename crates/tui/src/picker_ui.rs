@@ -10,36 +10,58 @@ use ratatui::Frame;
 use crate::picker::{PickerRow, PickerState};
 
 pub fn render(frame: &mut Frame, state: &PickerState) {
-    let [list_area, status_area, keys_area] = Layout::vertical([
-        Constraint::Min(3),
-        Constraint::Length(1),
-        Constraint::Length(1),
-    ])
-    .areas(frame.area());
+    let [list_area, footer_area] =
+        Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(frame.area());
 
     render_device_list(frame, list_area, state, " OpenAir ");
     render_ready_button(frame, list_area, state);
+    frame.render_widget(Paragraph::new(footer(state)), footer_area);
+}
 
-    let status = Paragraph::new(status_line(state)).style(Style::default().fg(Color::DarkGray));
-    frame.render_widget(status, status_area);
-
-    // A banner explains why the user is back here and outranks the keybind
-    // line; a hint answers the key they just pressed and outranks both.
-    let keys = match (state.hint(), state.banner()) {
-        (Some(hint), _) => Paragraph::new(Line::from(Span::styled(
+/// The single footer line.
+///
+/// A banner explains why the user is back here and outranks the ordinary
+/// footer; a hint answers the key they just pressed and outranks both. Only one
+/// of the three is ever on screen, which is why they share a row rather than
+/// stacking.
+fn footer(state: &PickerState) -> Line<'static> {
+    if let Some(hint) = state.hint() {
+        return Line::from(Span::styled(
             format!("  {hint}"),
             Style::default().fg(Color::Yellow),
-        ))),
-        (None, Some(banner)) => Paragraph::new(Line::from(Span::styled(
+        ));
+    }
+    if let Some(banner) = state.banner() {
+        return Line::from(Span::styled(
             format!("  {banner}"),
             Style::default().fg(Color::Red),
-        ))),
-        (None, None) => Paragraph::new(Line::from(Span::styled(
-            "  ↑↓ move · space select · ⏎ start · h handoff · <> latency · q quit",
-            Style::default().fg(Color::DarkGray),
-        ))),
-    };
-    frame.render_widget(keys, keys_area);
+        ));
+    }
+
+    let grey = Style::default().fg(Color::DarkGray);
+    Line::from(vec![
+        // State reads as values, not instructions: what handoff and latency
+        // *are* is the question being answered here, and the keys that change
+        // them are named on the right.
+        Span::styled(format!("  {}", status_text(state)), grey),
+        Span::styled("   ", grey),
+        Span::styled(controls_text(state.settings.show_controls), grey),
+    ])
+}
+
+/// The keys worth naming.
+///
+/// With `show_controls` off this is only what is non-obvious or easy to forget.
+/// Arrow keys to move are neither — anyone will try them — and quitting answers
+/// to `q`, `Esc` and `Ctrl+C`, so a line advertising one of the three earns
+/// little. `⏎ start` is omitted too: the ready button already carries the glyph
+/// where the eye is.
+fn controls_text(show_all: bool) -> &'static str {
+    if show_all {
+        "↑↓ move · space select · ⏎ start · h handoff · <> latency · q quit"
+    } else {
+        "space select · h handoff · <> latency"
+    }
 }
 
 /// Width and height of the ready button, borders included.
@@ -48,7 +70,7 @@ const BUTTON: (u16, u16) = (12, 3);
 /// corner stays visible and the button reads as sitting *on* the frame.
 const BUTTON_PAD: u16 = 3;
 /// Below this width the button would cover the address column, so it is
-/// dropped: the `⏎ start` hint in the footer still says how to proceed.
+/// dropped. Enter still starts the stream; only the affordance goes.
 const BUTTON_MIN_WIDTH: u16 = 48;
 
 /// The bottom-right ready button.
@@ -151,21 +173,22 @@ fn row_item(row: &PickerRow) -> ListItem<'static> {
     ListItem::new(Line::from(spans))
 }
 
-fn status_line(state: &PickerState) -> Line<'static> {
+/// Current settings, phrased as values rather than as things to do.
+fn status_text(state: &PickerState) -> String {
     let handoff = if !state.handoff_available() {
-        "handoff unavailable".to_string()
+        "handoff unavailable"
     } else if state.settings.handoff {
-        "handoff ON".to_string()
+        "handoff on"
     } else {
-        "handoff off".to_string()
+        "handoff off"
     };
-    Line::from(format!(
-        "  {}   latency {} ms   volume {:.0} dB   selected {}",
+    format!(
+        "{} · {} ms · {:.0} dB · {} selected",
         handoff,
         state.settings.latency_ms,
         state.settings.volume_db,
         state.chosen().len()
-    ))
+    )
 }
 
 /// Trim to `max` display columns, marking the cut with an ellipsis.
@@ -275,7 +298,7 @@ mod tests {
             x: 0,
             y: 0,
             width: w,
-            height: h - 2, // the two footer rows
+            height: h - 1, // the footer row
         };
         let r = crate::rect::bottom_right(list_area, BUTTON.0, BUTTON.1, BUTTON_PAD);
         Some(terminal.backend().buffer()[(r.x, r.y)].fg)
@@ -304,6 +327,77 @@ mod tests {
                 draw(width, height, &state);
             }
         }
+    }
+
+    #[test]
+    fn the_discreet_footer_omits_the_guessable_keys() {
+        let mut state = PickerState::new(Settings::default(), Vec::new(), true);
+        state.insert(device("Pool Room", "192.168.1.51", "1", TRANSIENT));
+        assert!(!state.settings.show_controls, "off by default");
+
+        let screen = draw(120, 20, &state).backend().to_string();
+        assert!(screen.contains("space select"), "the non-obvious ones stay");
+        assert!(screen.contains("h handoff"));
+        assert!(screen.contains("<> latency"));
+        assert!(!screen.contains("move"), "arrows are guessable:
+{screen}");
+        assert!(!screen.contains("quit"), "q, esc and ctrl+c all work");
+    }
+
+    #[test]
+    fn show_controls_brings_the_full_list_back() {
+        let mut state = PickerState::new(
+            Settings {
+                show_controls: true,
+                ..Settings::default()
+            },
+            Vec::new(),
+            true,
+        );
+        state.insert(device("Pool Room", "192.168.1.51", "1", TRANSIENT));
+
+        let screen = draw(120, 20, &state).backend().to_string();
+        assert!(screen.contains("move") && screen.contains("quit"));
+        assert!(screen.contains("space select"), "and still the rest");
+    }
+
+    #[test]
+    fn state_reads_as_values_not_instructions() {
+        // "500 ms" answers what the latency is; "<> latency" says how to
+        // change it. Keeping those apart is the point of the merged line.
+        let mut state = PickerState::new(Settings::default(), Vec::new(), true);
+        state.insert(device("Pool Room", "192.168.1.51", "1", TRANSIENT));
+        state.on_key(crossterm::event::KeyCode::Char(' '));
+
+        let screen = draw(120, 20, &state).backend().to_string();
+        for expected in ["handoff on", "500 ms", "-8 dB", "1 selected"] {
+            assert!(screen.contains(expected), "missing {expected}:
+{screen}");
+        }
+    }
+
+    #[test]
+    fn the_footer_is_one_row_and_a_hint_takes_it_over() {
+        // Two stacked rows became one, so a hint now displaces the status
+        // line rather than sitting under it.
+        let mut state = PickerState::new(Settings::default(), Vec::new(), true);
+        state.insert(device("Pool Room", "192.168.1.51", "1", TRANSIENT));
+        state.on_key(crossterm::event::KeyCode::Enter); // nothing selected
+
+        let screen = draw(120, 20, &state).backend().to_string();
+        assert!(screen.contains("select a receiver with space first"));
+        assert!(!screen.contains("h handoff"), "the hint owns the row");
+    }
+
+    #[test]
+    fn a_banner_outranks_the_status_line_but_not_a_hint() {
+        let mut state = PickerState::new(Settings::default(), Vec::new(), true);
+        state.insert(device("Pool Room", "192.168.1.51", "1", TRANSIENT));
+        state.set_banner("nothing connected");
+        assert!(draw(120, 20, &state)
+            .backend()
+            .to_string()
+            .contains("nothing connected"));
     }
 
     #[test]

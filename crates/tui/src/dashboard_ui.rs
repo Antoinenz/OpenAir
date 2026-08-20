@@ -138,7 +138,11 @@ fn render_add_overlay(frame: &mut Frame, state: &PickerState) {
     let hint = match state.hint() {
         Some(h) => Span::styled(format!("  {h}"), Style::default().fg(Color::Yellow)),
         None => Span::styled(
-            "  ↑↓ move · space select · ⏎ add · esc cancel",
+            if state.settings.show_controls {
+                "  ↑↓ move · space select · ⏎ add · esc cancel"
+            } else {
+                "  space select · ⏎ add · esc cancel"
+            },
             Style::default().fg(Color::DarkGray),
         ),
     };
@@ -400,11 +404,25 @@ fn render_receivers(frame: &mut Frame, area: Rect, state: &DashboardState) {
 
     frame.render_widget(
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(format!(
-            " receivers ({})   [↑↓] select · [+/-] vol · [<>] offset · [a] add · [r] retry · [d] drop ",
-            state.receivers.len()
+            " receivers ({}){} ",
+            state.receivers.len(),
+            receiver_controls(state.show_controls)
         ))),
         area,
     );
+}
+
+/// Keys named in the receivers panel title.
+///
+/// `[↑↓] select` goes when `show_controls` is off: a highlighted row in a list
+/// is the one thing in this UI nobody needs told. The rest all change something
+/// and none of them are guessable.
+fn receiver_controls(show_all: bool) -> &'static str {
+    if show_all {
+        "   [↑↓] select · [+/-] vol · [<>] offset · [a] add · [r] retry · [d] drop"
+    } else {
+        "   [+/-] vol · [<>] offset · [a] add · [r] retry · [d] drop"
+    }
 }
 
 /// Trim to `max` display columns, marking the cut with an ellipsis.
@@ -417,9 +435,15 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 fn render_logs(frame: &mut Frame, area: Rect, buffer: &LogBuffer, state: &DashboardState) {
+    // `[b] graph` used to be advertised here; the toggle went when the graph
+    // became bandwidth-only, and the title outlived it.
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" logs   [PgUp/PgDn] scroll · [b] graph · [q] stop ");
+        .title(if state.show_controls {
+            " logs   [PgUp/PgDn] scroll · [q] stop "
+        } else {
+            " logs   [PgUp/PgDn] scroll "
+        });
     let rows = block.inner(area).height as usize;
 
     // `log_scroll` counts lines back from the newest.
@@ -594,6 +618,33 @@ mod tests {
             .draw(|frame| render_add_overlay(frame, &state))
             .unwrap();
         assert!(terminal.backend().to_string().contains("add a receiver"));
+    }
+
+    #[test]
+    fn the_logs_title_no_longer_advertises_a_removed_key() {
+        // `[b] graph` outlived the toggle it named when the graph became
+        // bandwidth-only. A keybind on screen that does nothing is worse than
+        // no keybind at all.
+        let state = DashboardState::new(500);
+        let screen = draw(100, 32, &state).backend().to_string();
+        assert!(screen.contains("PgUp/PgDn"), "the real one stays");
+        assert!(!screen.contains("[b] graph"), "the dead one is gone:
+{screen}");
+    }
+
+    #[test]
+    fn panel_titles_follow_show_controls() {
+        let mut state = DashboardState::new(500);
+
+        let discreet = draw(120, 32, &state).backend().to_string();
+        assert!(!discreet.contains("[↑↓] select"), "arrows are guessable");
+        assert!(!discreet.contains("[q] stop"), "so is quitting");
+        assert!(discreet.contains("[a] add"), "these are not");
+        assert!(discreet.contains("[<>] offset"));
+
+        state.show_controls = true;
+        let full = draw(120, 32, &state).backend().to_string();
+        assert!(full.contains("[↑↓] select") && full.contains("[q] stop"));
     }
 
     #[test]

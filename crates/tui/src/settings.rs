@@ -40,6 +40,14 @@ pub struct Settings {
     pub volume_db: f32,
     #[serde(default = "default_metadata")]
     pub metadata: bool,
+    /// Spell out every keybind, including the guessable ones.
+    ///
+    /// Off by default. Arrow keys to move and `q` to quit are things anyone
+    /// who has used a terminal will simply try, and a line that lists them
+    /// crowds out the ones nobody would guess. Turn it on to get the full
+    /// list back.
+    #[serde(default = "default_show_controls")]
+    pub show_controls: bool,
 }
 
 fn default_version() -> u32 {
@@ -57,6 +65,9 @@ fn default_volume() -> f32 {
 fn default_metadata() -> bool {
     true
 }
+fn default_show_controls() -> bool {
+    false
+}
 
 impl Default for Settings {
     fn default() -> Self {
@@ -66,6 +77,7 @@ impl Default for Settings {
             latency_ms: default_latency(),
             volume_db: default_volume(),
             metadata: default_metadata(),
+            show_controls: default_show_controls(),
         }
     }
 }
@@ -299,6 +311,37 @@ mod tests {
         assert_eq!(effective.latency_ms, 300, "flag wins over file");
         assert!(!effective.handoff, "file wins over built-in default");
         assert_eq!(effective.volume_db, default_volume(), "default where neither set");
+    }
+
+    #[test]
+    fn show_controls_defaults_off_and_round_trips() {
+        let path = temp_path("controls");
+        cleanup(&path);
+        assert!(!Settings::default().show_controls, "discreet by default");
+
+        let settings = Settings {
+            show_controls: true,
+            ..Settings::default()
+        };
+        settings.save_to(&path).unwrap();
+        assert!(Settings::load_from(&path).show_controls);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_file_predating_show_controls_still_loads() {
+        // The realistic case: anyone already running OpenAir has a settings
+        // file without this field, and it must not reset their other choices.
+        let path = temp_path("precontrols");
+        cleanup(&path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"version":2,"handoff":false,"latency_ms":750}"#).unwrap();
+
+        let loaded = Settings::load_from(&path);
+        assert!(!loaded.show_controls, "absent means the default");
+        assert!(!loaded.handoff, "and the rest survives");
+        assert_eq!(loaded.latency_ms, 750);
+        cleanup(&path);
     }
 
     #[test]
