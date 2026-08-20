@@ -29,10 +29,12 @@ pub fn bottom_right(area: Rect, width: u16, height: u16, pad: u16) -> Rect {
     let w = width.min(area.width);
     let h = height.min(area.height);
     // Saturating: on a terminal narrow enough that the padding does not fit,
-    // losing the inset is right and panicking is not.
-    let x = area.x + area.width.saturating_sub(w + pad).max(0);
+    // losing the inset is right and panicking is not. Once it saturates the
+    // rect is flush left at `area.x`, and `w` is already capped at the
+    // container width, so it still cannot overflow the right edge.
+    let x = area.x + area.width.saturating_sub(w + pad);
     Rect {
-        x: x.max(area.x),
+        x,
         y: area.y + area.height - h,
         width: w,
         height: h,
