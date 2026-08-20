@@ -602,6 +602,159 @@ fn resolve_receivers(
     Some(out)
 }
 
+/// The platform pieces a capture stream needs, created per launch rather than
+/// at program start.
+///
+/// This exists so `--handoff` engages when the user starts a stream, not when
+/// the program opens: routing at startup silenced the speakers while the picker
+/// was still on screen, and left the picker's own toggle unable to undo it.
+/// Rebuilding each launch also means a second run after returning to the picker
+/// picks up whatever the user changed.
+struct CaptureRig {
+    handoff_device: Option<String>,
+    no_metadata: bool,
+    seconds: Option<u32>,
+    buffered: bool,
+    /// Dropping this restores the user's default output device, so it must
+    /// outlive the stream that depends on it.
+    #[cfg(windows)]
+    handoff: Option<openair_capture::handoff::HandoffSession>,
+    #[cfg(windows)]
+    metadata: Option<openair_capture::nowplaying::MetadataWatcher>,
+    /// Keeps the WASAPI loopback running for the stream's lifetime.
+    capture: Option<openair_capture::SystemCapture>,
+}
+
+impl CaptureRig {
+    fn launch(
+        &mut self,
+        targets: Vec<openair_client::GroupTarget>,
+        settings: openair_tui::Settings,
+        stats: std::sync::Arc<openair_client::StreamStats>,
+        stop: Arc<AtomicBool>,
+    ) -> openair_tui::StreamHandle {
+        match self.prepare(&settings) {
+            Ok((ring, rate, volume_rx, metadata_rx)) => {
+                let blocking = self.buffered || targets.len() > 1;
+                let seconds = self.seconds;
+                openair_tui::StreamHandle::new(std::thread::spawn(move || {
+                    let mut source = openair_client::CaptureSource::new(
+                        ring,
+                        rate,
+                        seconds,
+                        Some(stop),
+                    );
+                    // Buffered pipelines send ahead of realtime; a live source
+                    // must rate-limit them by blocking for data rather than
+                    // padding silence, which sounds like chopped audio for the
+                    // first seconds.
+                    if blocking {
+                        source = source.with_blocking();
+                    }
+                    let result = openair_client::stream_audio_buffered_multi(
+                        &targets,
+                        &mut source,
+                        Some(settings.volume_db),
+                        settings.latency_ms,
+                        volume_rx,
+                        metadata_rx,
+                        Some(std::sync::Arc::clone(&stats)),
+                    )
+                    .map_err(|e| e.to_string());
+                    // Mark ended even on failure, or the UI would sit on a
+                    // frozen frame waiting for a stream that has already given
+                    // up.
+                    stats.mark_ended();
+                    result
+                }))
+            }
+            Err(why) => {
+                // Report through the same channel a stream failure uses, so
+                // the UI shows it rather than the terminal underneath.
+                tracing::error!("{why}");
+                openair_tui::StreamHandle::new(std::thread::spawn(move || {
+                    stats.mark_ended();
+                    Err(why)
+                }))
+            }
+        }
+    }
+
+    /// Route audio (if asked), start capture, and start the metadata watcher.
+    #[allow(clippy::type_complexity)]
+    fn prepare(
+        &mut self,
+        settings: &openair_tui::Settings,
+    ) -> Result<
+        (
+            std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<i16>>>,
+            u32,
+            Option<std::sync::mpsc::Receiver<f32>>,
+            Option<std::sync::mpsc::Receiver<openair_core::metadata::NowPlaying>>,
+        ),
+        String,
+    > {
+        // Tear down the previous run first: the device it routed to may not be
+        // the one this run wants, and two loopback captures on one endpoint is
+        // not something to leave to chance.
+        self.capture = None;
+        #[cfg(windows)]
+        {
+            self.handoff = None;
+            self.metadata = None;
+        }
+
+        #[cfg(windows)]
+        let (volume_rx, capture_device) = if settings.handoff {
+            let (session, rx) =
+                start_handoff(self.handoff_device.clone()).map_err(|e| e.to_string())?;
+            let name = session.device_name().to_string();
+            tracing::info!(device = %name, "system audio routed to virtual device");
+            self.handoff = Some(session);
+            (Some(rx), Some(name))
+        } else {
+            (None, None)
+        };
+        #[cfg(not(windows))]
+        let (volume_rx, capture_device): (Option<std::sync::mpsc::Receiver<f32>>, Option<String>) =
+            (None, None);
+
+        let cap = openair_capture::SystemCapture::start_on(capture_device.as_deref())
+            .map_err(|e| format!("could not start system audio capture: {e}"))?;
+        tracing::info!(
+            device = %cap.device_name,
+            rate = cap.device_rate,
+            "capturing system audio"
+        );
+        let (ring, rate) = (cap.ring.clone(), cap.device_rate);
+        self.capture = Some(cap);
+
+        #[cfg(windows)]
+        let metadata_rx = if self.no_metadata || !settings.metadata {
+            None
+        } else {
+            match openair_capture::nowplaying::MetadataWatcher::start() {
+                Ok((w, rx)) => {
+                    self.metadata = Some(w);
+                    Some(rx)
+                }
+                Err(e) => {
+                    // Never fatal: the stream matters, the screen does not.
+                    tracing::warn!("now-playing metadata unavailable: {e}");
+                    None
+                }
+            }
+        };
+        #[cfg(not(windows))]
+        let metadata_rx = {
+            let _ = self.no_metadata;
+            None
+        };
+
+        Ok((ring, rate, volume_rx, metadata_rx))
+    }
+}
+
 /// Set up logging: always to the console, and additionally to a timestamped
 /// file under `logs/` when `--log` is given.
 ///
@@ -969,126 +1122,42 @@ async fn main() -> Result<()> {
         #[cfg(not(windows))]
         let handoff_available = false;
 
-        // --handoff: route system audio to a virtual output device BEFORE
-        // starting capture, so we capture the cable rather than the speakers.
-        // `_handoff_session` must outlive the stream call — dropping it puts
-        // the user's default output device back.
-        #[cfg(windows)]
-        let (_handoff_session, volume_rx, capture_device) = if handoff {
-            match start_handoff(handoff_device.clone()) {
-                Ok((session, rx)) => {
-                    let name = session.device_name().to_string();
-                    tracing::info!(device = %name, "system audio routed to virtual device");
-                    say!("  🔀 system audio routed to \"{}\"", name);
-                    say!("     speakers are silent; the Windows volume now controls AirPlay");
-                    (Some(session), Some(rx), Some(name))
-                }
-                Err(e) => {
-                    println!("  ✗ --handoff failed: {}", e);
-                    return Ok(());
-                }
-            }
-        } else {
-            (None, None, None)
-        };
-        #[cfg(not(windows))]
-        let (volume_rx, capture_device): (Option<std::sync::mpsc::Receiver<f32>>, Option<String>) =
-            (None, None);
-
-        // Now-playing metadata (Windows): on by default, --no-metadata opts out.
-        // Failure here is never fatal — the stream matters, the screen doesn't.
-        #[cfg(windows)]
-        let (_metadata_watcher, metadata_rx) = if no_metadata {
-            (None, None)
-        } else {
-            match openair_capture::nowplaying::MetadataWatcher::start() {
-                Ok((w, rx)) => {
-                    say!("  ♪ sending now-playing metadata (--no-metadata to disable)");
-                    (Some(w), Some(rx))
-                }
-                Err(e) => {
-                    tracing::warn!("now-playing metadata unavailable: {e}");
-                    say!("  ⚠ now-playing metadata unavailable: {}", e);
-                    (None, None)
-                }
-            }
-        };
-        #[cfg(not(windows))]
-        let metadata_rx: Option<std::sync::mpsc::Receiver<openair_core::metadata::NowPlaying>> = {
-            let _ = no_metadata;
-            None
-        };
-
-        let cap = match openair_capture::SystemCapture::start_on(capture_device.as_deref()) {
-            Ok(c) => c,
-            Err(e) => {
-                println!("  ✗ failed to start system audio capture: {}", e);
-                println!("    (no default output device, or WASAPI loopback unavailable)");
-                return Ok(());
-            }
-        };
-        tracing::info!(device = %cap.device_name, rate = cap.device_rate, "capturing system audio");
-        say!("  capturing: {} @ {} Hz", cap.device_name, cap.device_rate);
-
-        // The TUI owns the main thread for the whole run, so the stream goes to
-        // a worker. Building the source *inside* that worker is what keeps
-        // `AudioSource` free of a `Send` bound: only the capture ring (an
-        // `Arc`), the sample rate and the stop flag cross the boundary.
+        // --- TUI path -------------------------------------------------
+        //
+        // Nothing is engaged until the user actually starts a stream. Routing
+        // system audio at program start meant the speakers went silent while
+        // the picker was still open, and the picker's own handoff toggle could
+        // not undo what had already happened — it only took effect next run.
+        //
+        // The rig owns the platform pieces and builds them per launch, so the
+        // settings the user leaves the picker with are the ones that apply.
         if use_tui {
-            let ring = cap.ring.clone();
-            let device_rate = cap.device_rate;
-            let blocking = buffered;
-            // `FnMut` may be called again (retry after a failure), but these
-            // receivers have a single consumer — hand each to the first stream
-            // that asks and `None` thereafter.
-            let mut volume_rx = volume_rx;
-            let mut metadata_rx = metadata_rx;
+            let mut rig = CaptureRig {
+                handoff_device: handoff_device.clone(),
+                no_metadata,
+                seconds,
+                buffered,
+                #[cfg(windows)]
+                handoff: None,
+                #[cfg(windows)]
+                metadata: None,
+                capture: None,
+            };
 
-            let launcher: openair_tui::StreamLauncher = Box::new(
-                move |targets, stats: Arc<openair_client::StreamStats>, stop| {
-                    let ring = ring.clone();
-                    let vrx = volume_rx.take();
-                    let mrx = metadata_rx.take();
-                    openair_tui::StreamHandle::new(std::thread::spawn(move || {
-                        let mut source = openair_client::CaptureSource::new(
-                            ring,
-                            device_rate,
-                            seconds,
-                            Some(stop),
-                        );
-                        // Buffered pipelines send ahead of realtime; a live
-                        // source must rate-limit them by blocking for data
-                        // rather than padding silence, which sounds like
-                        // chopped audio for the first seconds.
-                        if blocking || targets.len() > 1 {
-                            source = source.with_blocking();
-                        }
-                        let result = openair_client::stream_audio_buffered_multi(
-                            &targets,
-                            &mut source,
-                            Some(volume_db),
-                            latency_ms,
-                            vrx,
-                            mrx,
-                            Some(Arc::clone(&stats)),
-                        )
-                        .map_err(|e| e.to_string());
-                        // Mark ended even on failure, or the UI would sit on a
-                        // frozen frame forever waiting for a stream that has
-                        // already given up.
-                        stats.mark_ended();
-                        result
-                    }))
-                },
-            );
+            let launcher: openair_tui::StreamLauncher =
+                Box::new(move |targets, settings, stats, stop| rig.launch(targets, settings, stats, stop));
 
-            let settings = openair_tui::Settings::load();
-            let mut app = openair_tui::App::new(
-                settings,
-                log_panel.clone(),
-                handoff_available,
-                launcher,
-            );
+            // CLI flags stand in for the saved preferences on this run, so a
+            // named `--latency` still wins over settings.json without
+            // rewriting it.
+            let settings = openair_tui::Settings::load().with_overrides(&openair_tui::Overrides {
+                handoff: Some(handoff),
+                latency_ms: Some(latency_ms),
+                volume_db: Some(volume_db),
+                metadata: Some(!no_metadata),
+            });
+            let mut app =
+                openair_tui::App::new(settings, log_panel.clone(), handoff_available, launcher);
             let start = if receivers.is_empty() {
                 openair_tui::StartAt::Picker
             } else {
@@ -1107,6 +1176,66 @@ async fn main() -> Result<()> {
             }
             return Ok(());
         }
+
+        // --- plain path (--no-tui) --------------------------------------
+        //
+        // Eager, because there is no picker to change anything afterwards.
+
+        // --handoff: route system audio to a virtual output device BEFORE
+        // starting capture, so we capture the cable rather than the speakers.
+        // `_handoff_session` must outlive the stream call — dropping it puts
+        // the user's default output device back.
+        #[cfg(windows)]
+        let (_handoff_session, volume_rx, capture_device) = if handoff {
+            match start_handoff(handoff_device.clone()) {
+                Ok((session, rx)) => {
+                    let name = session.device_name().to_string();
+                    println!("  🔀 system audio routed to \"{}\"", name);
+                    println!("     speakers are silent; the Windows volume now controls AirPlay");
+                    (Some(session), Some(rx), Some(name))
+                }
+                Err(e) => {
+                    println!("  ✗ --handoff failed: {}", e);
+                    return Ok(());
+                }
+            }
+        } else {
+            (None, None, None)
+        };
+        #[cfg(not(windows))]
+        let (volume_rx, capture_device): (Option<std::sync::mpsc::Receiver<f32>>, Option<String>) =
+            (None, None);
+
+        #[cfg(windows)]
+        let (_metadata_watcher, metadata_rx) = if no_metadata {
+            (None, None)
+        } else {
+            match openair_capture::nowplaying::MetadataWatcher::start() {
+                Ok((w, rx)) => {
+                    println!("  ♪ sending now-playing metadata (--no-metadata to disable)");
+                    (Some(w), Some(rx))
+                }
+                Err(e) => {
+                    println!("  ⚠ now-playing metadata unavailable: {}", e);
+                    (None, None)
+                }
+            }
+        };
+        #[cfg(not(windows))]
+        let metadata_rx: Option<std::sync::mpsc::Receiver<openair_core::metadata::NowPlaying>> = {
+            let _ = no_metadata;
+            None
+        };
+
+        let cap = match openair_capture::SystemCapture::start_on(capture_device.as_deref()) {
+            Ok(c) => c,
+            Err(e) => {
+                println!("  ✗ failed to start system audio capture: {}", e);
+                println!("    (no default output device, or WASAPI loopback unavailable)");
+                return Ok(());
+            }
+        };
+        println!("  capturing: {} @ {} Hz", cap.device_name, cap.device_rate);
 
         let mut source = openair_client::CaptureSource::new(
             cap.ring.clone(),

@@ -65,10 +65,15 @@ pub enum StartAt {
 /// behind the `cfg` walls it already lives behind, and this crate never needs
 /// to depend on `openair-capture`.
 ///
+/// The `Settings` passed are the ones in force *now* — including anything the
+/// user changed in the picker — so handoff, latency and volume take effect on
+/// the run they were chosen for rather than the next one.
+///
 /// `FnMut` rather than `FnOnce`: returning to the picker after a failure and
 /// starting again is a supported path.
-pub type StreamLauncher<'a> =
-    Box<dyn FnMut(Vec<GroupTarget>, Arc<StreamStats>, Arc<AtomicBool>) -> StreamHandle + 'a>;
+pub type StreamLauncher<'a> = Box<
+    dyn FnMut(Vec<GroupTarget>, Settings, Arc<StreamStats>, Arc<AtomicBool>) -> StreamHandle + 'a,
+>;
 
 /// A running stream.
 pub struct StreamHandle {
@@ -562,7 +567,12 @@ impl<'a> App<'a> {
             .iter()
             .map(|t| (t.addr, t.device_id.clone()))
             .collect();
-        let handle = (self.launch)(targets, Arc::clone(&stats), Arc::clone(&stop));
+        let handle = (self.launch)(
+            targets,
+            self.settings.clone(),
+            Arc::clone(&stats),
+            Arc::clone(&stop),
+        );
         self.screen = Screen::Connecting(Box::new(ConnectingScreen {
             state: ConnectingState::new(),
             running: Running {
@@ -651,7 +661,7 @@ mod tests {
     /// An App whose launcher records what it was asked to stream and returns a
     /// thread that ends immediately.
     fn test_app(started: &std::sync::Mutex<Vec<Vec<GroupTarget>>>) -> App<'_> {
-        let launch: StreamLauncher<'_> = Box::new(move |targets, stats, _stop| {
+        let launch: StreamLauncher<'_> = Box::new(move |targets, _settings, stats, _stop| {
             started.lock().unwrap().push(targets);
             StreamHandle::new(std::thread::spawn(move || {
                 stats.mark_ended();
