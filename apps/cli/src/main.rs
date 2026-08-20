@@ -955,6 +955,20 @@ async fn main() -> Result<()> {
             ),
         }
 
+        // Probed before anything else touches COM. cpal initialises the main
+        // thread's apartment when capture starts, and asking afterwards used to
+        // fail with RPC_E_CHANGED_MODE — which is why the picker reported
+        // "handoff unavailable" in a process where `openair devices` could see
+        // the cable perfectly well. The ComGuard now tolerates that, but the
+        // answer belongs here regardless: it is a fact about the machine, not
+        // about how far through startup we are.
+        #[cfg(windows)]
+        let handoff_available = openair_capture::handoff::list_output_devices()
+            .map(|l| l.selected.is_some())
+            .unwrap_or(false);
+        #[cfg(not(windows))]
+        let handoff_available = false;
+
         // --handoff: route system audio to a virtual output device BEFORE
         // starting capture, so we capture the cable rather than the speakers.
         // `_handoff_session` must outlive the stream call — dropping it puts
@@ -1069,13 +1083,6 @@ async fn main() -> Result<()> {
             );
 
             let settings = openair_tui::Settings::load();
-            #[cfg(windows)]
-            let handoff_available = openair_capture::handoff::list_output_devices()
-                .map(|l| l.selected.is_some())
-                .unwrap_or(false);
-            #[cfg(not(windows))]
-            let handoff_available = false;
-
             let mut app = openair_tui::App::new(
                 settings,
                 log_panel.clone(),

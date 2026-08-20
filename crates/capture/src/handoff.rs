@@ -45,7 +45,7 @@ use tracing::{info, warn};
 #[allow(unused_imports)]
 use windows::core::{IUnknown, IUnknown_Vtbl, HRESULT, PCWSTR};
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
-use windows::Win32::Foundation::BOOL;
+use windows::Win32::Foundation::{BOOL, RPC_E_CHANGED_MODE};
 use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
 use windows::Win32::Media::Audio::{
     eConsole, eMultimedia, eRender, ERole, IMMDeviceEnumerator, MMDeviceEnumerator,
@@ -199,17 +199,48 @@ pub struct DeviceListing {
 /// List output devices and report which one `--handoff` would pick. Read-only
 /// — nothing is switched, so users can check detection before committing.
 pub fn list_output_devices() -> Result<DeviceListing, HandoffError> {
-    unsafe {
-        CoInitializeEx(None, COINIT_MULTITHREADED)
-            .ok()
-            .map_err(|e| HandoffError::ComInit(e.to_string()))?;
-    }
-    let result = enumerate_render_devices().map(|devices| {
+    let _com = ComGuard::new()?;
+    enumerate_render_devices().map(|devices| {
         let selected = select_device(&devices, None).ok().map(|d| d.id.clone());
         DeviceListing { devices, selected }
-    });
-    unsafe { CoUninitialize() };
-    result
+    })
+}
+
+/// Initialises COM for the current thread, and uninitialises on drop —
+/// but only if this guard is what initialised it.
+///
+/// `RPC_E_CHANGED_MODE` means COM is already up on this thread under a
+/// different apartment model. That is not a failure: cpal initialises the main
+/// thread as an STA before we ever get here, and the calls in this module work
+/// fine in either apartment. Treating it as an error is what made `--handoff`
+/// report "unavailable" in a process that had already started audio capture,
+/// while `openair devices` — a fresh process — saw the cable perfectly well.
+///
+/// Uninitialising a thread we did not initialise would be worse still: it
+/// would tear COM out from under cpal.
+struct ComGuard {
+    owned: bool,
+}
+
+impl ComGuard {
+    fn new() -> Result<Self, HandoffError> {
+        let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        if hr.is_ok() {
+            return Ok(Self { owned: true });
+        }
+        if hr == RPC_E_CHANGED_MODE {
+            return Ok(Self { owned: false });
+        }
+        Err(HandoffError::ComInit(format!("{hr:?}")))
+    }
+}
+
+impl Drop for ComGuard {
+    fn drop(&mut self) {
+        if self.owned {
+            unsafe { CoUninitialize() };
+        }
+    }
 }
 
 /// Index of the first (most-preferred) pattern this device name matches, or
@@ -390,11 +421,7 @@ pub fn pending_restore() -> Option<String> {
 /// Returns the friendly name of the device restored to.
 pub fn restore_now() -> Result<String, HandoffError> {
     let id = pending_restore().ok_or(HandoffError::NoVirtualDevice)?;
-    unsafe {
-        CoInitializeEx(None, COINIT_MULTITHREADED)
-            .ok()
-            .map_err(|e| HandoffError::ComInit(e.to_string()))?;
-    }
+    let _com = ComGuard::new()?;
     let result = (|| {
         set_default_endpoint(&id)?;
         let name = enumerate_render_devices()?
@@ -492,12 +519,13 @@ fn run(
     ready_tx: Sender<Result<Started, HandoffError>>,
     event_tx: Sender<VolumeEvent>,
 ) {
-    unsafe {
-        if let Err(e) = CoInitializeEx(None, COINIT_MULTITHREADED).ok() {
-            let _ = ready_tx.send(Err(HandoffError::ComInit(e.to_string())));
+    let _com = match ComGuard::new() {
+        Ok(guard) => guard,
+        Err(e) => {
+            let _ = ready_tx.send(Err(e));
             return;
         }
-    }
+    };
 
     let setup = (|| -> Result<(String, String, IAudioEndpointVolume), HandoffError> {
         let devices = enumerate_render_devices()?;
