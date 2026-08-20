@@ -453,11 +453,12 @@ fn render_receivers(frame: &mut Frame, area: Rect, state: &DashboardState) {
             .iter()
             .enumerate()
             .map(|(i, r)| {
-                let (colour, label) = match r.state {
-                    ReceiverState::Connected => (Color::Green, r.state.label()),
-                    ReceiverState::Reconnecting => (Color::Yellow, r.state.label()),
-                    ReceiverState::Dead => (Color::Red, r.state.label()),
+                let colour = match r.state {
+                    ReceiverState::Connected => Color::Green,
+                    ReceiverState::Connecting | ReceiverState::Reconnecting => Color::Yellow,
+                    ReceiverState::Failed | ReceiverState::Dead => Color::Red,
                 };
+                let label = r.state.label();
                 let selected = cursor == Some(i);
                 let row = Style::default();
                 let row = if selected {
@@ -566,6 +567,7 @@ mod tests {
             state: ReceiverState::Connected,
             offset_ms: 80,
             trim_db: 0.0,
+            error: None,
         }]);
         state.sample(&stats, Instant::now());
 
@@ -600,6 +602,7 @@ mod tests {
             state: ReceiverState::Connected,
             offset_ms: 80,
             trim_db: -6.0,
+            error: None,
         }]);
         state.sample(&stats, Instant::now());
 

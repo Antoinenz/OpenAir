@@ -1009,6 +1009,7 @@ fn receiver_stats(
     group: &[BufferedReceiver],
     handles: &[ReconnectHandle],
     reconnect: bool,
+    failed: &[ReceiverStat],
 ) -> Vec<ReceiverStat> {
     let mut out: Vec<ReceiverStat> = group
         .iter()
@@ -1018,6 +1019,7 @@ fn receiver_stats(
             state: ReceiverState::Connected,
             offset_ms: r.offset_ns / 1_000_000,
             trim_db: r.trim_db,
+            error: None,
         })
         .collect();
 
@@ -1034,7 +1036,23 @@ fn receiver_stats(
             state,
             offset_ms: h.offset_ns / 1_000_000,
             trim_db: h.trim_db,
+            error: None,
         });
+    }
+
+    // Failures are carried forward explicitly. This function rebuilds from the
+    // live group, which by definition never contained a receiver that failed to
+    // connect — without merging them back a failed receiver would vanish from
+    // the UI on the very next snapshot, which is exactly when the user is
+    // looking for it.
+    //
+    // A later success for the same address wins: a retried receiver is in
+    // `group` now, and showing it as both connected and failed would be worse
+    // than either.
+    for f in failed {
+        if !out.iter().any(|r| r.addr == f.addr) {
+            out.push(f.clone());
+        }
     }
     out
 }
@@ -1092,6 +1110,24 @@ pub fn stream_audio_buffered_multi(
     let ptp = PtpMaster::start_multi(&group_ips)?;
 
     // --- Per-receiver RTSP negotiation ---
+    // Every target starts as `Connecting` so the UI can show the whole group
+    // immediately, rather than receivers popping into the list one at a time as
+    // each handshake finishes.
+    let mut progress: Vec<ReceiverStat> = targets
+        .iter()
+        .map(|t| ReceiverStat {
+            name: format!("{}", t.addr),
+            addr: t.addr,
+            state: ReceiverState::Connecting,
+            offset_ms: t.offset_ms,
+            trim_db: 0.0,
+            error: None,
+        })
+        .collect();
+    if let Some(s) = &stats {
+        s.set_receivers(progress.clone());
+    }
+
     let mut group: Vec<BufferedReceiver> = Vec::new();
     for target in targets {
         let name = format!("{}", target.addr);
@@ -1122,18 +1158,42 @@ pub fn stream_audio_buffered_multi(
             })
         })();
         match setup {
-            Ok(r) => group.push(r),
+            Ok(r) => {
+                if let Some(p) = progress.iter_mut().find(|p| p.addr == target.addr) {
+                    p.state = ReceiverState::Connected;
+                }
+                group.push(r);
+            }
             Err(e) => {
                 warn!(receiver = %name, "setup failed — skipping: {e}");
                 // A half-open connection reset by the receiver usually means we
                 // sourced it from the wrong interface; say so rather than
                 // leaving a bare OS error code.
-                if let Some(hint) = openair_core::net::connection_hint(target.addr.ip()) {
+                let hint = openair_core::net::connection_hint(target.addr.ip());
+                if let Some(hint) = &hint {
                     warn!(receiver = %name, "{hint}");
+                }
+                if let Some(p) = progress.iter_mut().find(|p| p.addr == target.addr) {
+                    p.state = ReceiverState::Failed;
+                    // Prefer the actionable hint over the raw error: "10054"
+                    // tells the user nothing, "try --bind <ip>" tells them what
+                    // to do. The raw error is already in the log above.
+                    p.error = Some(hint.unwrap_or_else(|| e.to_string()));
                 }
             }
         }
+        if let Some(s) = &stats {
+            s.set_receivers(progress.clone());
+        }
     }
+
+    // Carried for the rest of the run so a receiver that never connected stays
+    // visible instead of silently disappearing.
+    let failed: Vec<ReceiverStat> = progress
+        .iter()
+        .filter(|p| p.state == ReceiverState::Failed)
+        .cloned()
+        .collect();
     if group.is_empty() {
         return Err("no receiver could be set up".into());
     }
@@ -1436,7 +1496,7 @@ pub fn stream_audio_buffered_multi(
                 // Rebuilt here rather than inside `reap_dead` and the reconnect
                 // path: this is the one place that sees the group after every
                 // change, so the view cannot drift out of step with reality.
-                s.set_receivers(receiver_stats(&group, &handles, reconnect));
+                s.set_receivers(receiver_stats(&group, &handles, reconnect, &failed));
             }
 
             // Auto-latency: how much headroom does the just-queued frame have
@@ -1542,6 +1602,68 @@ fn rand_seq() -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn failed_stat(addr: &str, why: &str) -> ReceiverStat {
+        ReceiverStat {
+            name: addr.to_string(),
+            addr: addr.parse().unwrap(),
+            state: ReceiverState::Failed,
+            offset_ms: 0,
+            trim_db: 0.0,
+            error: Some(why.to_string()),
+        }
+    }
+
+    #[test]
+    fn failed_receivers_survive_a_snapshot_rebuild() {
+        // receiver_stats rebuilds from the live group, which by definition
+        // never held a receiver that failed to connect. Without the merge a
+        // failure would vanish on the next packet — precisely when the user is
+        // reading the list to find out what went wrong.
+        let failed = vec![failed_stat("192.168.1.51:7000", "try --bind 192.168.1.10")];
+        let out = receiver_stats(&[], &[], true, &failed);
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].state, ReceiverState::Failed);
+        assert_eq!(out[0].error.as_deref(), Some("try --bind 192.168.1.10"));
+    }
+
+    #[test]
+    fn a_reconnecting_receiver_is_not_duplicated_by_a_stale_failure() {
+        // After a retry the receiver is pending again, so the failed entry for
+        // the same address must not also be listed.
+        let addr: SocketAddr = "192.168.1.51:7000".parse().unwrap();
+        let handles = vec![ReconnectHandle {
+            name: "Pool Room".into(),
+            trim_db: 0.0,
+            addr,
+            offset_ns: 0,
+            rx: std::sync::mpsc::channel().1,
+        }];
+        let failed = vec![failed_stat("192.168.1.51:7000", "connection refused")];
+
+        let out = receiver_stats(&[], &handles, true, &failed);
+        assert_eq!(out.len(), 1, "one row per receiver, not one per state");
+        assert_eq!(out[0].state, ReceiverState::Reconnecting);
+    }
+
+    #[test]
+    fn failures_for_other_addresses_are_kept_alongside() {
+        let addr: SocketAddr = "192.168.1.51:7000".parse().unwrap();
+        let handles = vec![ReconnectHandle {
+            name: "Pool Room".into(),
+            trim_db: 0.0,
+            addr,
+            offset_ns: 0,
+            rx: std::sync::mpsc::channel().1,
+        }];
+        let failed = vec![failed_stat("192.168.1.88:7000", "no route to host")];
+
+        let out = receiver_stats(&[], &handles, true, &failed);
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().any(|r| r.state == ReceiverState::Failed));
+        assert!(out.iter().any(|r| r.state == ReceiverState::Reconnecting));
+    }
 
     #[test]
     fn drain_latest_volume_coalesces_to_newest() {

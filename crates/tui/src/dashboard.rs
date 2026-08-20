@@ -508,6 +508,7 @@ mod tests {
             state: openair_client::ReceiverState::Connected,
             offset_ms: 0,
             trim_db: 0.0,
+            error: None,
         }
     }
 
@@ -729,6 +730,7 @@ mod tests {
             state: openair_client::ReceiverState::Connected,
             offset_ms: 0,
             trim_db: 0.0,
+            error: None,
         }]);
         d.sample(&stats, Instant::now());
         assert_eq!(d.latency_ms, 750);

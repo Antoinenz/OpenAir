@@ -24,9 +24,13 @@ const NO_SAMPLE: i64 = i64::MAX;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReceiverState {
+    /// Session setup is in flight; this receiver has never played yet.
+    Connecting,
     Connected,
     /// Dropped, with a background reconnect in flight.
     Reconnecting,
+    /// Never connected, or gave up. See `ReceiverStat::error` for why.
+    Failed,
     /// Gone and not coming back (file playback, or reconnect disabled).
     Dead,
 }
@@ -34,10 +38,18 @@ pub enum ReceiverState {
 impl ReceiverState {
     pub fn label(self) -> &'static str {
         match self {
+            ReceiverState::Connecting => "connecting…",
             ReceiverState::Connected => "connected",
             ReceiverState::Reconnecting => "reconnecting…",
+            ReceiverState::Failed => "failed",
             ReceiverState::Dead => "dead",
         }
+    }
+
+    /// Whether this receiver is still being waited on. The connecting screen
+    /// uses this to decide when the group has settled.
+    pub fn is_pending(self) -> bool {
+        matches!(self, ReceiverState::Connecting)
     }
 }
 
@@ -49,6 +61,13 @@ pub struct ReceiverStat {
     pub offset_ms: i64,
     /// Per-receiver volume trim in dB, relative to the group's master level.
     pub trim_db: f32,
+    /// Why this receiver failed, phrased for a person. `None` unless the
+    /// state is `Failed`.
+    ///
+    /// Where the connect path can turn an OS error into something actionable
+    /// (the `--bind` hint for a wrong source interface), that hint belongs
+    /// here; the raw error code belongs in the log panel.
+    pub error: Option<String>,
 }
 
 /// A request from an observer into a running stream.
@@ -270,6 +289,7 @@ mod tests {
             state: ReceiverState::Reconnecting,
             offset_ms: 80,
             trim_db: 0.0,
+            error: None,
         }]);
         let got = stats.receivers();
         assert_eq!(got.len(), 1);
@@ -303,6 +323,49 @@ mod tests {
     #[test]
     fn a_deep_trim_mutes_rather_than_wrapping() {
         assert_eq!(effective_volume_db(-140.0, -30.0), -144.0);
+    }
+
+    #[test]
+    fn every_state_has_a_label() {
+        for state in [
+            ReceiverState::Connecting,
+            ReceiverState::Connected,
+            ReceiverState::Reconnecting,
+            ReceiverState::Failed,
+            ReceiverState::Dead,
+        ] {
+            assert!(!state.label().is_empty(), "{state:?} needs a label");
+        }
+    }
+
+    #[test]
+    fn only_connecting_counts_as_pending() {
+        // The connecting screen waits on this: treating Failed as pending
+        // would hang forever on an unreachable receiver.
+        assert!(ReceiverState::Connecting.is_pending());
+        for state in [
+            ReceiverState::Connected,
+            ReceiverState::Reconnecting,
+            ReceiverState::Failed,
+            ReceiverState::Dead,
+        ] {
+            assert!(!state.is_pending(), "{state:?} must not block the group");
+        }
+    }
+
+    #[test]
+    fn a_failed_receiver_carries_its_reason() {
+        let stats = StreamStats::new(500);
+        stats.set_receivers(vec![ReceiverStat {
+            name: "Pool Room".into(),
+            addr: "192.168.1.51:7000".parse().unwrap(),
+            state: ReceiverState::Failed,
+            offset_ms: 0,
+            trim_db: 0.0,
+            error: Some("connection refused".into()),
+        }]);
+        let got = stats.receivers();
+        assert_eq!(got[0].error.as_deref(), Some("connection refused"));
     }
 
     #[test]
