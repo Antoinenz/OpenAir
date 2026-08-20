@@ -157,6 +157,10 @@ fn centred(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
+/// Height below which the graph is dropped so the receiver list and logs keep
+/// enough room to be readable.
+const GRAPH_MIN_HEIGHT: u16 = 26;
+
 pub fn render(frame: &mut Frame, state: &DashboardState, buffer: &LogBuffer) {
     let area = frame.area();
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
@@ -164,18 +168,42 @@ pub fn render(frame: &mut Frame, state: &DashboardState, buffer: &LogBuffer) {
         return;
     }
 
-    let [top, graph, receivers, log_area] = Layout::vertical([
-        Constraint::Length(4),
-        Constraint::Length(5),
-        Constraint::Min(3),
-        Constraint::Length(8),
-    ])
-    .areas(area);
+    // Drop order as the window shrinks: the per-receiver bar first (its
+    // information is also in the numbers), then the graph, then the offset
+    // column. The receiver list and the log panel are never dropped — they are
+    // what the screen is for.
+    //
+    // Chosen as whole layouts rather than by squeezing widgets, so a narrow
+    // terminal looks deliberate instead of crushed.
+    let logs_height = if area.height >= 30 { 8 } else { 5 };
+    let show_graph = area.height >= GRAPH_MIN_HEIGHT;
 
-    render_top(frame, top, state);
-    render_graph(frame, graph, state);
-    render_receivers(frame, receivers, state);
-    render_logs(frame, log_area, buffer, state);
+    let constraints: Vec<Constraint> = if show_graph {
+        vec![
+            Constraint::Length(4),
+            Constraint::Length(5),
+            Constraint::Min(3),
+            Constraint::Length(logs_height),
+        ]
+    } else {
+        vec![
+            Constraint::Length(4),
+            Constraint::Min(3),
+            Constraint::Length(logs_height),
+        ]
+    };
+    let chunks = Layout::vertical(constraints).split(area);
+
+    if show_graph {
+        render_top(frame, chunks[0], state);
+        render_graph(frame, chunks[1], state);
+        render_receivers(frame, chunks[2], state);
+        render_logs(frame, chunks[3], buffer, state);
+    } else {
+        render_top(frame, chunks[0], state);
+        render_receivers(frame, chunks[1], state);
+        render_logs(frame, chunks[2], buffer, state);
+    }
 }
 
 fn render_too_small(frame: &mut Frame, area: Rect) {
@@ -190,9 +218,12 @@ fn render_too_small(frame: &mut Frame, area: Rect) {
 }
 
 fn render_top(frame: &mut Frame, area: Rect, state: &DashboardState) {
+    // Proportional rather than fixed, so the row spans the window instead of
+    // leaving a ragged gap on a wide terminal. Now-playing takes the remainder
+    // because it is the only one whose content is open-ended.
     let [latency, bandwidth, playing] = Layout::horizontal([
-        Constraint::Length(16),
-        Constraint::Length(20),
+        Constraint::Percentage(20),
+        Constraint::Percentage(25),
         Constraint::Min(20),
     ])
     .areas(area);
@@ -232,12 +263,16 @@ fn render_top(frame: &mut Frame, area: Rect, state: &DashboardState) {
             if np.art.is_some() {
                 second.push_str("  [art]");
             }
+            let width = playing.width.saturating_sub(4) as usize;
             vec![
                 Line::from(Span::styled(
-                    format!("{} — {}", np.title, np.artist),
+                    truncate(&format!("{} — {}", np.title, np.artist), width),
                     Style::default().add_modifier(Modifier::BOLD),
                 )),
-                Line::from(Span::styled(second, Style::default().fg(Color::DarkGray))),
+                Line::from(Span::styled(
+                    truncate(&second, width),
+                    Style::default().fg(Color::DarkGray),
+                )),
             ]
         }
         None => vec![Line::from(Span::styled(
@@ -260,7 +295,11 @@ fn render_graph(frame: &mut Frame, area: Rect, state: &DashboardState) {
     let [chart, footer] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
 
-    let block = Block::default().borders(Borders::ALL).title(" bandwidth ");
+    // Distinct from the "bandwidth" stat box above: one is the current
+    // rate, this is its history.
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" bandwidth over time ");
     let inner = block.inner(chart);
     frame.render_widget(block, chart);
 
@@ -464,6 +503,66 @@ mod tests {
     }
 
     #[test]
+    fn renders_at_a_range_of_widths_without_panicking() {
+        // Each of these picks a different layout; a bad constraint set panics
+        // ratatui rather than degrading, so breadth matters more than depth.
+        let mut state = DashboardState::new(500);
+        let stats = StreamStats::new(500);
+        stats.set_receivers(vec![openair_client::ReceiverStat {
+            name: "Living Room".into(),
+            addr: "192.168.1.51:7000".parse().unwrap(),
+            state: ReceiverState::Connected,
+            offset_ms: 80,
+            trim_db: -6.0,
+            lead_ms: Some(400),
+            health: 0.8,
+            error: None,
+        }]);
+        state.sample(&stats, Instant::now());
+
+        for (w, h) in [(60, 20), (60, 40), (90, 30), (140, 40), (200, 60)] {
+            draw(w, h, &state);
+        }
+    }
+
+    #[test]
+    fn the_buffer_bar_gives_way_on_a_narrow_terminal() {
+        let mut state = DashboardState::new(500);
+        let stats = StreamStats::new(500);
+        stats.set_receivers(vec![openair_client::ReceiverStat {
+            name: "Living Room".into(),
+            addr: "192.168.1.51:7000".parse().unwrap(),
+            state: ReceiverState::Connected,
+            offset_ms: 0,
+            trim_db: 0.0,
+            lead_ms: Some(500),
+            health: 1.0,
+            error: None,
+        }]);
+        state.sample(&stats, Instant::now());
+
+        let wide = draw(140, 40, &state).backend().to_string();
+        let narrow = draw(60, 40, &state).backend().to_string();
+        assert!(wide.contains('█'), "wide terminals show the bar");
+        assert!(!narrow.contains('█'), "narrow ones drop it for the numbers");
+        assert!(
+            narrow.contains("Living Room"),
+            "the receiver list is never dropped"
+        );
+    }
+
+    #[test]
+    fn the_graph_gives_way_on_a_short_terminal() {
+        let state = DashboardState::new(500);
+        let tall = draw(100, 40, &state).backend().to_string();
+        let short = draw(100, 22, &state).backend().to_string();
+        assert!(tall.contains("over time"));
+        assert!(!short.contains("over time"));
+        assert!(short.contains("receivers"), "the list survives");
+        assert!(short.contains("logs"), "the log panel survives");
+    }
+
+    #[test]
     fn renders_the_too_small_message_instead_of_a_jumble() {
         let state = DashboardState::new(500);
         let terminal = draw(40, 10, &state);
@@ -528,7 +627,7 @@ mod tests {
     fn the_graph_shows_bandwidth() {
         let state = DashboardState::new(500);
         let terminal = draw(100, 32, &state);
-        assert!(terminal.backend().to_string().contains("bandwidth"));
+        assert!(terminal.backend().to_string().contains("bandwidth over time"));
     }
 
     #[test]
