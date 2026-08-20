@@ -843,6 +843,8 @@ mod tests {
             state,
             offset_ms: 0,
             trim_db: 0.0,
+            lead_ms: None,
+            health: 0.0,
             error: error.map(str::to_string),
         }]);
         c.state.sample(&c.running.stats);

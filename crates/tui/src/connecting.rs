@@ -143,6 +143,8 @@ mod tests {
             state,
             offset_ms: 0,
             trim_db: 0.0,
+            lead_ms: None,
+            health: 0.0,
             error: error.map(str::to_string),
         }
     }
@@ -389,6 +391,8 @@ mod render_tests {
             state: ReceiverState::Connecting,
             offset_ms: 0,
             trim_db: 0.0,
+            lead_ms: None,
+            health: 0.0,
             error: None,
         }]);
         let mut state = ConnectingState::new();
@@ -412,6 +416,8 @@ mod render_tests {
                 state: ReceiverState::Failed,
                 offset_ms: 0,
                 trim_db: 0.0,
+                lead_ms: None,
+                health: 0.0,
                 error: Some("connection refused".into()),
             },
             ReceiverStat {
@@ -420,6 +426,8 @@ mod render_tests {
                 state: ReceiverState::Connecting,
                 offset_ms: 0,
                 trim_db: 0.0,
+                lead_ms: None,
+                health: 0.0,
                 error: None,
             },
         ]);

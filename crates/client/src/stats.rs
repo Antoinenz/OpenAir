@@ -61,6 +61,17 @@ pub struct ReceiverStat {
     pub offset_ms: i64,
     /// Per-receiver volume trim in dB, relative to the group's master level.
     pub trim_db: f32,
+    /// Milliseconds of headroom before this receiver's play deadline.
+    /// `None` until a packet has been sent to it.
+    ///
+    /// Per-receiver rather than group-wide: the anchor line is shared, but each
+    /// receiver has its own offset, so their deadlines differ. The group-wide
+    /// minimum drives auto-latency; this is what tells you *which room* is
+    /// about to drop out.
+    pub lead_ms: Option<i64>,
+    /// `lead_ms` as a 0.0–1.0 fraction of the current anchor latency, for a
+    /// bar. Full means comfortably buffered; empty means about to cut.
+    pub health: f32,
     /// Why this receiver failed, phrased for a person. `None` unless the
     /// state is `Failed`.
     ///
@@ -95,6 +106,20 @@ pub enum StreamCommand {
 /// narrow enough that a held key can't silence a receiver by accident.
 pub const TRIM_MIN_DB: f32 = -30.0;
 pub const TRIM_MAX_DB: f32 = 10.0;
+
+/// Buffer health as a 0.0–1.0 fraction of the anchor latency.
+///
+/// Normalised against the *current* latency rather than a constant, because
+/// auto-latency moves the target: a fixed denominator would make every bar jump
+/// when the latency steps up, implying a change in health that did not happen.
+/// (The bars still shift together on a step, which is correct — the target
+/// really did move — and the auto-latency log line explains it.)
+pub fn buffer_health(lead_ms: i64, latency_ms: u64) -> f32 {
+    if latency_ms == 0 {
+        return 0.0;
+    }
+    (lead_ms as f32 / latency_ms as f32).clamp(0.0, 1.0)
+}
 
 /// A receiver's effective volume: the group master plus its own trim, clamped
 /// to the protocol's usable range (`-144` is AirPlay's "muted" sentinel).
@@ -289,6 +314,8 @@ mod tests {
             state: ReceiverState::Reconnecting,
             offset_ms: 80,
             trim_db: 0.0,
+            lead_ms: None,
+            health: 0.0,
             error: None,
         }]);
         let got = stats.receivers();
@@ -362,10 +389,32 @@ mod tests {
             state: ReceiverState::Failed,
             offset_ms: 0,
             trim_db: 0.0,
+            lead_ms: None,
+            health: 0.0,
             error: Some("connection refused".into()),
         }]);
         let got = stats.receivers();
         assert_eq!(got[0].error.as_deref(), Some("connection refused"));
+    }
+
+    #[test]
+    fn health_is_full_at_the_anchor_lead_and_empty_at_zero() {
+        assert_eq!(buffer_health(500, 500), 1.0);
+        assert_eq!(buffer_health(0, 500), 0.0);
+        assert!((buffer_health(250, 500) - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn health_clamps_outside_the_window() {
+        // A late packet is negative headroom; a receiver ahead of the anchor
+        // (just after a re-anchor) can exceed it. Neither should escape 0..=1.
+        assert_eq!(buffer_health(-200, 500), 0.0);
+        assert_eq!(buffer_health(900, 500), 1.0);
+    }
+
+    #[test]
+    fn health_with_no_latency_is_empty_rather_than_infinite() {
+        assert_eq!(buffer_health(100, 0), 0.0);
     }
 
     #[test]

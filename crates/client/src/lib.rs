@@ -26,7 +26,8 @@ mod stats;
 pub use pairings::PairingStore;
 pub use source::{CaptureSource, SineSource, WavSource};
 pub use stats::{
-    ReceiverStat, ReceiverState, StreamCommand, StreamStats, TRIM_MAX_DB, TRIM_MIN_DB,
+    buffer_health, ReceiverStat, ReceiverState, StreamCommand, StreamStats, TRIM_MAX_DB,
+    TRIM_MIN_DB,
 };
 
 pub(crate) const SAMPLE_RATE: u32 = 44100;
@@ -528,6 +529,8 @@ struct BufferedReceiver {
     cipher: AudioCipher,
     /// Per-receiver anchor offset in ns (from `GroupTarget::offset_ms`).
     offset_ns: i64,
+    /// Milliseconds of headroom at the last packet sent to this receiver.
+    lead_ms: Option<i64>,
     /// Per-receiver volume trim in dB, applied on top of the group's master
     /// level. A *trim* rather than an absolute level because `--handoff`
     /// mirrors the Windows master onto every receiver — an absolute
@@ -698,6 +701,7 @@ fn finish_reconnect(
         session: prep.session,
         cipher: prep.cipher,
         offset_ns: prep.offset_ns,
+        lead_ms: None,
         trim_db: prep.trim_db,
         tx: None,
         writer: None,
@@ -1011,6 +1015,7 @@ fn receiver_stats(
     handles: &[ReconnectHandle],
     reconnect: bool,
     failed: &[ReceiverStat],
+    latency_ms: u64,
 ) -> Vec<ReceiverStat> {
     let mut out: Vec<ReceiverStat> = group
         .iter()
@@ -1020,6 +1025,11 @@ fn receiver_stats(
             state: ReceiverState::Connected,
             offset_ms: r.offset_ns / 1_000_000,
             trim_db: r.trim_db,
+            lead_ms: r.lead_ms,
+            health: r
+                .lead_ms
+                .map(|ms| stats::buffer_health(ms, latency_ms))
+                .unwrap_or(0.0),
             error: None,
         })
         .collect();
@@ -1037,6 +1047,8 @@ fn receiver_stats(
             state,
             offset_ms: h.offset_ns / 1_000_000,
             trim_db: h.trim_db,
+            lead_ms: None,
+            health: 0.0,
             error: None,
         });
     }
@@ -1122,6 +1134,8 @@ pub fn stream_audio_buffered_multi(
             state: ReceiverState::Connecting,
             offset_ms: t.offset_ms,
             trim_db: 0.0,
+            lead_ms: None,
+            health: 0.0,
             error: None,
         })
         .collect();
@@ -1150,6 +1164,7 @@ pub fn stream_audio_buffered_multi(
                 session,
                 cipher,
                 offset_ns: target.offset_ms * 1_000_000,
+                lead_ms: None,
                 trim_db: 0.0,
                 tx: None,
                 writer: None,
@@ -1497,16 +1512,32 @@ pub fn stream_audio_buffered_multi(
                 // Rebuilt here rather than inside `reap_dead` and the reconnect
                 // path: this is the one place that sees the group after every
                 // change, so the view cannot drift out of step with reality.
-                s.set_receivers(receiver_stats(&group, &handles, reconnect, &failed));
+                s.set_receivers(receiver_stats(
+                    &group,
+                    &handles,
+                    reconnect,
+                    &failed,
+                    current_latency,
+                ));
             }
 
             // Auto-latency: how much headroom does the just-queued frame have
             // before its play deadline? Track the window minimum.
-            let lead = play_deadline_ns(anchor_t_local, anchor_rtptime, rtptime) as i64
-                - ptp_now_ns() as i64;
+            let deadline = play_deadline_ns(anchor_t_local, anchor_rtptime, rtptime) as i64;
+            let now = ptp_now_ns() as i64;
+            let lead = deadline - now;
             min_lead_ns = min_lead_ns.min(lead);
             if let Some(s) = &stats {
                 s.record_lead_ms(lead / 1_000_000);
+            }
+            // The group shares one anchor line, but each receiver plays at its
+            // own offset, so their deadlines differ. Recorded per receiver so a
+            // UI can show which room is running dry rather than only that the
+            // group is.
+            for r in &mut group {
+                if r.alive {
+                    r.lead_ms = Some((lead + r.offset_ns) / 1_000_000);
+                }
             }
 
             if window_start.elapsed() >= AUTO_LATENCY_WINDOW {
@@ -1611,6 +1642,8 @@ mod tests {
             state: ReceiverState::Failed,
             offset_ms: 0,
             trim_db: 0.0,
+            lead_ms: None,
+            health: 0.0,
             error: Some(why.to_string()),
         }
     }
@@ -1622,7 +1655,7 @@ mod tests {
         // failure would vanish on the next packet — precisely when the user is
         // reading the list to find out what went wrong.
         let failed = vec![failed_stat("192.168.1.51:7000", "try --bind 192.168.1.10")];
-        let out = receiver_stats(&[], &[], true, &failed);
+        let out = receiver_stats(&[], &[], true, &failed, 500);
 
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].state, ReceiverState::Failed);
@@ -1643,7 +1676,7 @@ mod tests {
         }];
         let failed = vec![failed_stat("192.168.1.51:7000", "connection refused")];
 
-        let out = receiver_stats(&[], &handles, true, &failed);
+        let out = receiver_stats(&[], &handles, true, &failed, 500);
         assert_eq!(out.len(), 1, "one row per receiver, not one per state");
         assert_eq!(out[0].state, ReceiverState::Reconnecting);
     }
@@ -1660,7 +1693,7 @@ mod tests {
         }];
         let failed = vec![failed_stat("192.168.1.88:7000", "no route to host")];
 
-        let out = receiver_stats(&[], &handles, true, &failed);
+        let out = receiver_stats(&[], &handles, true, &failed, 500);
         assert_eq!(out.len(), 2);
         assert!(out.iter().any(|r| r.state == ReceiverState::Failed));
         assert!(out.iter().any(|r| r.state == ReceiverState::Reconnecting));

@@ -445,6 +445,8 @@ mod tests {
             state: ReceiverState::Connected,
             offset_ms: 80,
             trim_db: 0.0,
+            lead_ms: None,
+            health: 0.0,
             error: None,
         }]);
         state.sample(&stats, Instant::now());
@@ -480,6 +482,8 @@ mod tests {
             state: ReceiverState::Connected,
             offset_ms: 80,
             trim_db: -6.0,
+            lead_ms: None,
+            health: 0.0,
             error: None,
         }]);
         state.sample(&stats, Instant::now());
