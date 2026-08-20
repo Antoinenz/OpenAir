@@ -10,6 +10,36 @@ use util::{extract_flag, extract_volume};
 const DEFAULT_DEVICE_ID: &str = "AA:BB:CC:DD:EE:FF";
 const DEFAULT_VOLUME_DB: f32 = -8.0;
 
+/// Set once we know this run will hand the terminal to the TUI.
+///
+/// Narration printed before the alternate screen opens is not merely
+/// redundant — it comes *back* when the alternate screen is left, so a clean
+/// TUI session would end in a screenful of stale setup chatter. Under the TUI
+/// the log panel carries this information instead, and the run ends with a
+/// single summary.
+static QUIET: AtomicBool = AtomicBool::new(false);
+
+fn set_quiet(quiet: bool) {
+    QUIET.store(quiet, Ordering::Relaxed);
+}
+
+fn quiet() -> bool {
+    QUIET.load(Ordering::Relaxed)
+}
+
+/// `println!` for narration: silent once the TUI owns the screen.
+///
+/// Genuine errors on paths that abort *before* the TUI starts keep using
+/// `println!` directly — there is no panel to carry them, so they must reach
+/// the terminal.
+macro_rules! say {
+    ($($arg:tt)*) => {
+        if !crate::quiet() {
+            println!($($arg)*);
+        }
+    };
+}
+
 /// Pure helpers factored out for unit testing (no network/audio access).
 mod util {
     /// Extracts an optional `--volume <db>` flag from anywhere in `args`,
@@ -422,6 +452,17 @@ mod util {
         }
 
         #[test]
+        fn quiet_defaults_off_and_toggles() {
+            // Narration must reach the terminal unless the TUI has taken it
+            // over, so the default has to be "speak".
+            assert!(!crate::quiet());
+            crate::set_quiet(true);
+            assert!(crate::quiet());
+            crate::set_quiet(false);
+            assert!(!crate::quiet());
+        }
+
+        #[test]
         fn extract_flag_removes_no_tui() {
             let args = vec!["capture".into(), "--no-tui".into(), "Pool".into()];
             let (rest, found) = extract_flag(&args, "--no-tui");
@@ -692,9 +733,6 @@ async fn main() -> Result<()> {
     // *before* it opened, including setup and pairing.
     let log_panel = openair_tui::LogBuffer::default();
     let log_path = init_logging(debug_level, want_log, log_panel.clone())?;
-    if let Some(p) = &log_path {
-        println!("📝 logging this run to {}", p.display());
-    }
 
     let (raw_args, volume_db) = extract_volume(&raw_args, DEFAULT_VOLUME_DB);
     let (raw_args, latency_ms) = util::extract_latency(&raw_args, 500);
@@ -706,7 +744,7 @@ async fn main() -> Result<()> {
         match spec.parse::<std::net::IpAddr>() {
             Ok(ip) => {
                 openair_core::net::set_source_override(ip);
-                println!("Binding receiver connections to {}", ip);
+                say!("Binding receiver connections to {}", ip);
             }
             Err(_) => {
                 println!("--bind expects an IP address, got '{}'", spec);
@@ -748,6 +786,16 @@ async fn main() -> Result<()> {
         args = vec!["capture".to_string(), PICKER_SELECTION.to_string()];
     }
 
+    // Only `capture` hands the terminal to the App; every other subcommand
+    // narrates normally. `start_at_picker` has already rewritten args to
+    // `capture`, so this covers bare `openair` too.
+    let tui_run = use_tui && args.first().map(String::as_str) == Some("capture");
+    set_quiet(tui_run);
+
+    if let Some(p) = &log_path {
+        say!("📝 logging this run to {}", p.display());
+    }
+
     // --handoff mirrors live volume, which only the buffered pipeline applies,
     // so enabling it implies --buffered. Picked receivers always stream
     // buffered — it is the pipeline with selectable latency.
@@ -779,7 +827,7 @@ async fn main() -> Result<()> {
     >,
                           stats: Option<Arc<openair_client::StreamStats>>| {
         if targets.len() > 1 && !buffered {
-            println!("  (multi-room uses the buffered pipeline — enabling --buffered)");
+            say!("  (multi-room uses the buffered pipeline — enabling --buffered)");
         }
         if buffered || targets.len() > 1 {
             openair_client::stream_audio_buffered_multi(
@@ -907,8 +955,8 @@ async fn main() -> Result<()> {
             .collect::<Vec<_>>()
             .join(", ");
         match seconds {
-            Some(s) => println!("OpenAir — capturing {}s of system audio to {}\n", s, dest),
-            None => println!(
+            Some(s) => say!("OpenAir — capturing {}s of system audio to {}\n", s, dest),
+            None => say!(
                 "OpenAir — capturing until Ctrl+C… (streaming system audio to {})\n",
                 dest
             ),
@@ -923,8 +971,9 @@ async fn main() -> Result<()> {
             match start_handoff(handoff_device.clone()) {
                 Ok((session, rx)) => {
                     let name = session.device_name().to_string();
-                    println!("  🔀 system audio routed to \"{}\"", name);
-                    println!("     speakers are silent; the Windows volume now controls AirPlay");
+                    tracing::info!(device = %name, "system audio routed to virtual device");
+                    say!("  🔀 system audio routed to \"{}\"", name);
+                    say!("     speakers are silent; the Windows volume now controls AirPlay");
                     (Some(session), Some(rx), Some(name))
                 }
                 Err(e) => {
@@ -947,11 +996,12 @@ async fn main() -> Result<()> {
         } else {
             match openair_capture::nowplaying::MetadataWatcher::start() {
                 Ok((w, rx)) => {
-                    println!("  ♪ sending now-playing metadata (--no-metadata to disable)");
+                    say!("  ♪ sending now-playing metadata (--no-metadata to disable)");
                     (Some(w), Some(rx))
                 }
                 Err(e) => {
-                    println!("  ⚠ now-playing metadata unavailable: {}", e);
+                    tracing::warn!("now-playing metadata unavailable: {e}");
+                    say!("  ⚠ now-playing metadata unavailable: {}", e);
                     (None, None)
                 }
             }
@@ -970,7 +1020,8 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
         };
-        println!("  capturing: {} @ {} Hz", cap.device_name, cap.device_rate);
+        tracing::info!(device = %cap.device_name, rate = cap.device_rate, "capturing system audio");
+        say!("  capturing: {} @ {} Hz", cap.device_name, cap.device_rate);
 
         // The TUI owns the main thread for the whole run, so the stream goes to
         // a worker. Building the source *inside* that worker is what keeps
@@ -1043,10 +1094,16 @@ async fn main() -> Result<()> {
             } else {
                 openair_tui::StartAt::Receivers(receivers)
             };
-            match app.run(start) {
+            let outcome = app.run(start);
+            // Printed after the terminal is restored, so it lands in normal
+            // scrollback and the run leaves exactly one trace.
+            match outcome {
                 Ok(Some(summary)) => println!("{summary}"),
                 Ok(None) => {}
                 Err(e) => println!("  ⚠ interface error: {e}"),
+            }
+            if let Some(p) = &log_path {
+                println!("  log saved to {}", p.display());
             }
             return Ok(());
         }
