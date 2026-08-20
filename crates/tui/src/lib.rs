@@ -9,6 +9,7 @@
 //! concerns (`--handoff`, Windows now-playing) stay behind the CLI's `cfg`
 //! boundaries and reach the TUI as plain data.
 
+pub mod app;
 pub mod dashboard;
 pub mod dashboard_ui;
 pub mod logs;
@@ -17,9 +18,9 @@ pub mod picker_ui;
 pub mod settings;
 pub mod term;
 
-pub use dashboard_ui::{spawn_dashboard, DashboardHandle, Summary};
+pub use app::{App, Screen, StartAt, StreamHandle, StreamLauncher};
+pub use dashboard_ui::Summary;
 pub use logs::{LogBuffer, LogLayer, LogLine};
 pub use picker::{PickerAction, PickerRow, PickerState};
-pub use picker_ui::{run_picker, PickerOutcome};
 pub use term::is_interactive;
 pub use settings::{GraphKind, Overrides, Settings};

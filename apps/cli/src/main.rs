@@ -568,46 +568,6 @@ fn resolve_receivers(
 /// them and is never parsed.
 const PICKER_SELECTION: &str = "<picker>";
 
-/// Run the TUI device picker, returning the chosen receivers and the settings
-/// the user left it in. `Ok(None)` means they quit.
-fn run_picker() -> Result<Option<(Vec<openair_client::GroupTarget>, openair_tui::Settings)>> {
-    // "Paired" and "a cable is available" both come from local state — the
-    // picker touches the network only for mDNS.
-    let paired = openair_client::PairingStore::load()
-        .map(|s| s.peer_ids())
-        .unwrap_or_default();
-
-    #[cfg(windows)]
-    let handoff_available = openair_capture::handoff::list_output_devices()
-        .map(|l| l.selected.is_some())
-        .unwrap_or(false);
-    #[cfg(not(windows))]
-    let handoff_available = false;
-
-    let settings = openair_tui::Settings::load();
-    let Some(outcome) = openair_tui::run_picker(settings, paired, handoff_available)? else {
-        return Ok(None);
-    };
-
-    let targets: Vec<openair_client::GroupTarget> = outcome
-        .receivers
-        .iter()
-        .map(|r| openair_client::GroupTarget {
-            addr: r.addr,
-            device_id: r
-                .device_id
-                .clone()
-                .unwrap_or_else(|| DEFAULT_DEVICE_ID.to_string()),
-            offset_ms: 0,
-        })
-        .collect();
-
-    let names: Vec<&str> = outcome.receivers.iter().map(|r| r.name.as_str()).collect();
-    println!("OpenAir — streaming to {}\n", names.join(", "));
-
-    Ok(Some((targets, outcome.settings)))
-}
-
 /// Set up logging: always to the console, and additionally to a timestamped
 /// file under `logs/` when `--log` is given.
 ///
@@ -768,34 +728,30 @@ async fn main() -> Result<()> {
     // `--no-tui` (or a non-terminal stdout, e.g. a pipe) keeps the old
     // behaviour.
     let use_tui = !no_tui && openair_tui::is_interactive();
+
+    // Bare `openair` under the TUI means "capture, but let me choose the
+    // receivers on screen". The App owns that transition now, so all this does
+    // is route into the capture branch with an empty receiver list; it does not
+    // touch the network.
+    let start_at_picker = args.is_empty() && use_tui;
     let mut args = args;
     let mut handoff = handoff;
     let mut latency_ms = latency_ms;
     let mut volume_db = volume_db;
-    let mut picked: Option<Vec<openair_client::GroupTarget>> = None;
-    // Which series the dashboard graph opens on; the dashboard writes the
-    // user's choice back when it exits.
-    let mut dashboard_graph = openair_tui::Settings::load().graph;
 
-    if args.is_empty() && use_tui {
-        match run_picker()? {
-            None => return Ok(()),
-            Some((targets, settings)) => {
-                picked = Some(targets);
-                // The picker's toggles stand in for the flags on this path.
-                handoff = settings.handoff;
-                latency_ms = settings.latency_ms;
-                volume_db = settings.volume_db;
-                dashboard_graph = settings.graph;
-                args = vec!["capture".to_string(), PICKER_SELECTION.to_string()];
-            }
-        }
+    if start_at_picker {
+        // The picker's saved toggles stand in for the flags on this path.
+        let settings = openair_tui::Settings::load();
+        handoff = settings.handoff;
+        latency_ms = settings.latency_ms;
+        volume_db = settings.volume_db;
+        args = vec!["capture".to_string(), PICKER_SELECTION.to_string()];
     }
 
     // --handoff mirrors live volume, which only the buffered pipeline applies,
     // so enabling it implies --buffered. Picked receivers always stream
     // buffered — it is the pipeline with selectable latency.
-    let buffered = buffered || handoff || picked.is_some();
+    let buffered = buffered || handoff || start_at_picker;
 
     // --handoff (mute local speakers + mirror Windows volume) is capture-only
     // and Windows-only. Reject early with a clear message otherwise.
@@ -925,14 +881,15 @@ async fn main() -> Result<()> {
             println!("usage: openair capture <receiver>... [seconds]");
             return Ok(());
         }
-        // The picker already resolved its choices; only the name-argument path
-        // needs a discovery round.
-        let receivers = match picked.take() {
-            Some(targets) => targets,
-            None => match resolve_receivers(&recv_args, &offsets) {
+        // Starting at the picker means the user has not chosen yet, so there is
+        // nothing to resolve and no reason to browse.
+        let receivers = if start_at_picker {
+            Vec::new()
+        } else {
+            match resolve_receivers(&recv_args, &offsets) {
                 Some(r) => r,
                 None => return Ok(()),
-            },
+            }
         };
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -1015,66 +972,103 @@ async fn main() -> Result<()> {
         };
         println!("  capturing: {} @ {} Hz", cap.device_name, cap.device_rate);
 
+        // The TUI owns the main thread for the whole run, so the stream goes to
+        // a worker. Building the source *inside* that worker is what keeps
+        // `AudioSource` free of a `Send` bound: only the capture ring (an
+        // `Arc`), the sample rate and the stop flag cross the boundary.
+        if use_tui {
+            let ring = cap.ring.clone();
+            let device_rate = cap.device_rate;
+            let blocking = buffered;
+            // `FnMut` may be called again (retry after a failure), but these
+            // receivers have a single consumer — hand each to the first stream
+            // that asks and `None` thereafter.
+            let mut volume_rx = volume_rx;
+            let mut metadata_rx = metadata_rx;
+
+            let launcher: openair_tui::StreamLauncher = Box::new(
+                move |targets, stats: Arc<openair_client::StreamStats>, stop| {
+                    let ring = ring.clone();
+                    let vrx = volume_rx.take();
+                    let mrx = metadata_rx.take();
+                    openair_tui::StreamHandle::new(std::thread::spawn(move || {
+                        let mut source = openair_client::CaptureSource::new(
+                            ring,
+                            device_rate,
+                            seconds,
+                            Some(stop),
+                        );
+                        // Buffered pipelines send ahead of realtime; a live
+                        // source must rate-limit them by blocking for data
+                        // rather than padding silence, which sounds like
+                        // chopped audio for the first seconds.
+                        if blocking || targets.len() > 1 {
+                            source = source.with_blocking();
+                        }
+                        let result = openair_client::stream_audio_buffered_multi(
+                            &targets,
+                            &mut source,
+                            Some(volume_db),
+                            latency_ms,
+                            vrx,
+                            mrx,
+                            Some(Arc::clone(&stats)),
+                        )
+                        .map_err(|e| e.to_string());
+                        // Mark ended even on failure, or the UI would sit on a
+                        // frozen frame forever waiting for a stream that has
+                        // already given up.
+                        stats.mark_ended();
+                        result
+                    }))
+                },
+            );
+
+            let settings = openair_tui::Settings::load();
+            #[cfg(windows)]
+            let handoff_available = openair_capture::handoff::list_output_devices()
+                .map(|l| l.selected.is_some())
+                .unwrap_or(false);
+            #[cfg(not(windows))]
+            let handoff_available = false;
+
+            let mut app = openair_tui::App::new(
+                settings,
+                log_panel.clone(),
+                handoff_available,
+                launcher,
+            );
+            let start = if receivers.is_empty() {
+                openair_tui::StartAt::Picker
+            } else {
+                openair_tui::StartAt::Receivers(receivers)
+            };
+            match app.run(start) {
+                Ok(Some(summary)) => println!("{summary}"),
+                Ok(None) => {}
+                Err(e) => println!("  ⚠ interface error: {e}"),
+            }
+            return Ok(());
+        }
+
         let mut source = openair_client::CaptureSource::new(
             cap.ring.clone(),
             cap.device_rate,
             seconds,
             Some(stop.clone()),
         );
-        // Buffered pipelines send ahead of realtime; a live source must
-        // rate-limit them by blocking for data instead of padding silence
-        // (which sounds like glitchy, chopped audio for the first seconds).
         if buffered || receivers.len() > 1 {
             source = source.with_blocking();
         }
 
-        // The dashboard renders on a worker thread while the stream keeps this
-        // one — that way nothing in the audio path has to become `Send`, and
-        // `q` simply sets the same `stop` flag Ctrl+C already used, so quitting
-        // takes the existing graceful path.
-        let (stats, dashboard) = if use_tui {
-            let stats = openair_client::StreamStats::new(latency_ms);
-            let handle = openair_tui::spawn_dashboard(
-                Arc::clone(&stats),
-                log_panel.clone(),
-                stop.clone(),
-                dashboard_graph,
-            );
-            (Some(stats), Some(handle))
-        } else {
-            (None, None)
-        };
-
-        let result = stream_fn(
+        match stream_fn(
             &receivers,
             &mut source,
             Some(volume_db),
             volume_rx,
             metadata_rx,
-            stats.clone(),
-        );
-
-        // Let the dashboard notice the stream is over even if it failed, or it
-        // would keep drawing a frozen frame forever.
-        if let Some(stats) = &stats {
-            stats.mark_ended();
-        }
-        if let Some(dashboard) = dashboard {
-            match dashboard.join() {
-                Ok(summary) => {
-                    println!("{summary}");
-                    // Remember which graph was left showing.
-                    let mut settings = openair_tui::Settings::load();
-                    if settings.graph != summary.graph {
-                        settings.graph = summary.graph;
-                        let _ = settings.save();
-                    }
-                }
-                Err(e) => println!("  ⚠ dashboard error: {e}"),
-            }
-        }
-
-        match result {
+            None,
+        ) {
             Ok(()) => println!("  ✓ capture streamed successfully"),
             Err(e) => println!("  ✗ {}", e),
         }

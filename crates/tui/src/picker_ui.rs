@@ -1,94 +1,15 @@
 //! Drawing and driving the picker. The decisions all live in
 //! [`crate::picker`]; this is the terminal half.
 
-use std::io;
-use std::time::Duration;
-
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
-use crate::picker::{PickerAction, PickerRow, PickerState};
-use crate::settings::Settings;
-use crate::term;
+use crate::picker::{PickerRow, PickerState};
 
-/// How long to wait for a key before redrawing. Also the rate at which newly
-/// discovered devices appear.
-const TICK: Duration = Duration::from_millis(100);
-
-pub struct PickerOutcome {
-    pub receivers: Vec<PickerRow>,
-    pub settings: Settings,
-}
-
-/// Run the interactive picker. `Ok(None)` means the user quit without
-/// choosing.
-///
-/// Discovery starts before the first frame and runs for as long as the picker
-/// is open, so the list keeps filling while the user reads it. Nothing is
-/// contacted: no pairing, no `GET /info`, until this returns.
-pub fn run_picker(
-    settings: Settings,
-    paired: Vec<String>,
-    handoff_available: bool,
-) -> io::Result<Option<PickerOutcome>> {
-    let mut state = PickerState::new(settings, paired, handoff_available);
-    let browse = openair_discovery::browse_live()
-        .map_err(|e| io::Error::other(format!("mDNS discovery failed: {e}")))?;
-
-    // Full screen, like the dashboard it leads into — the two screens are one
-    // flow, and having the first be an inline prompt that then jumps to an
-    // alternate screen made the transition jarring.
-    let (mut terminal, _guard) = term::enter_alt()?;
-
-    let outcome = loop {
-        while let Ok(device) = browse.devices.try_recv() {
-            state.insert(device);
-        }
-
-        terminal.draw(|frame| render(frame, &state))?;
-
-        if !event::poll(TICK)? {
-            continue;
-        }
-        let Event::Key(key) = event::read()? else {
-            continue;
-        };
-        // Windows reports both press and release; acting on both would toggle
-        // every selection twice.
-        if key.kind != KeyEventKind::Press {
-            continue;
-        }
-        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            break None;
-        }
-
-        match state.on_key(key.code) {
-            PickerAction::Quit => break None,
-            PickerAction::Start => {
-                break Some(PickerOutcome {
-                    receivers: state.chosen().into_iter().cloned().collect(),
-                    settings: state.settings.clone(),
-                })
-            }
-            PickerAction::None | PickerAction::Hint(_) => {}
-        }
-    };
-
-    // Only the picker's own toggles write the file, and only on a clean exit.
-    if let Some(outcome) = &outcome {
-        if let Err(e) = outcome.settings.save() {
-            tracing::warn!("could not save settings: {e}");
-        }
-    }
-
-    Ok(outcome)
-}
-
-fn render(frame: &mut Frame, state: &PickerState) {
+pub fn render(frame: &mut Frame, state: &PickerState) {
     let [list_area, status_area, keys_area] = Layout::vertical([
         Constraint::Min(3),
         Constraint::Length(1),

@@ -1,30 +1,23 @@
-//! Drawing and driving the streaming dashboard.
+//! Drawing the streaming dashboard, and the add-a-receiver overlay.
 //!
-//! The dashboard runs on its own thread while the stream keeps the main one.
-//! That direction matters: the audio path never had to become `Send`, and
-//! quitting is expressed through the same `stop` flag the Ctrl+C handler
-//! already used — so shutdown takes the existing graceful path (play out the
-//! queued audio, TEARDOWN each session, restore the Windows audio device).
+//! The event loop lives in [`crate::app`]; this module only renders and runs
+//! the modal overlay. Quitting is still expressed through the stream's `stop`
+//! flag so shutdown takes the graceful path — play out the queued audio,
+//! TEARDOWN each session, restore the Windows audio device.
 
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use openair_client::{ReceiverState, StreamCommand, StreamStats};
-use tracing::warn;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Sparkline};
 use ratatui::Frame;
 
-use crate::dashboard::{
-    format_bitrate, format_bytes, format_elapsed, DashAction, DashboardState,
-};
-use crate::logs::{self, LogBuffer};
+use crate::dashboard::{format_bitrate, format_bytes, format_elapsed, DashboardState};
+use crate::logs::LogBuffer;
 use crate::picker::{PickerAction, PickerState};
 use crate::settings::{GraphKind, Settings};
 use crate::term;
@@ -67,122 +60,6 @@ impl std::fmt::Display for Summary {
     }
 }
 
-pub struct DashboardHandle {
-    thread: JoinHandle<io::Result<Summary>>,
-}
-
-impl DashboardHandle {
-    /// Wait for the dashboard to finish and take its summary.
-    ///
-    /// Returns once the stream has been marked ended (or the user quit). The
-    /// terminal is restored before this returns.
-    pub fn join(self) -> io::Result<Summary> {
-        match self.thread.join() {
-            Ok(result) => result,
-            Err(_) => Err(io::Error::other("dashboard thread panicked")),
-        }
-    }
-}
-
-/// Start the dashboard on a background thread.
-///
-/// `stop` is the caller's existing shutdown flag: pressing `q` sets it, which
-/// ends the stream through the path it already had.
-pub fn spawn_dashboard(
-    stats: Arc<StreamStats>,
-    buffer: LogBuffer,
-    stop: Arc<AtomicBool>,
-    graph: GraphKind,
-) -> DashboardHandle {
-    let thread = std::thread::spawn(move || run_dashboard(stats, buffer, stop, graph));
-    DashboardHandle { thread }
-}
-
-fn run_dashboard(
-    stats: Arc<StreamStats>,
-    buffer: LogBuffer,
-    stop: Arc<AtomicBool>,
-    graph: GraphKind,
-) -> io::Result<Summary> {
-    let mut state = DashboardState::new(graph, stats.latency_ms());
-
-    logs::set_console_quiet(true);
-    let (mut terminal, guard) = match term::enter_alt() {
-        Ok(t) => t,
-        Err(e) => {
-            logs::set_console_quiet(false);
-            return Err(e);
-        }
-    };
-
-    // Sampling runs on a clock, not on loop iterations. `event::poll` returns
-    // early when a key arrives, so tying `sample()` to the loop made the graph
-    // scroll and the bandwidth figure jump around whenever a key was held —
-    // each reading would cover a shorter window than the one before it.
-    // Drawing still happens every iteration, so a key press is reflected
-    // immediately.
-    let mut last_sample = Instant::now();
-    state.sample(&stats, last_sample);
-
-    loop {
-        let now = Instant::now();
-        if now.duration_since(last_sample) >= TICK {
-            state.sample(&stats, now);
-            last_sample = now;
-        }
-        terminal.draw(|frame| render(frame, &state, &buffer))?;
-
-        if stats.ended() {
-            break;
-        }
-
-        // Wait out the remainder of the tick rather than a fresh full one, or
-        // a burst of keys would postpone the next sample indefinitely.
-        if event::poll(poll_timeout(last_sample.elapsed()))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-                if key.code == KeyCode::Char('c')
-                    && key.modifiers.contains(KeyModifiers::CONTROL)
-                {
-                    stop.store(true, Ordering::SeqCst);
-                    continue;
-                }
-                match state.on_key(key.code) {
-                    DashAction::Quit => {
-                        // Hand shutdown to the stream rather than doing it
-                        // here: it still has queued audio to play out and
-                        // sessions to tear down.
-                        stop.store(true, Ordering::SeqCst);
-                    }
-                    DashAction::Command(cmd) => {
-                        if !stats.send(cmd) {
-                            warn!("could not queue command — stream mailbox unavailable");
-                        }
-                    }
-                    DashAction::OpenPicker => {
-                        add_receiver(&mut terminal, &stats)?;
-                    }
-                    DashAction::None => {}
-                }
-            }
-        }
-    }
-
-    drop(guard);
-    logs::set_console_quiet(false);
-
-    Ok(Summary {
-        elapsed: stats.elapsed(),
-        receivers: state.receivers.len(),
-        latency_ms: state.latency_ms,
-        worst_lead_ms: state.worst_lead_ms,
-        bytes_sent: stats.bytes_sent(),
-        graph: state.graph,
-    })
-}
-
 /// Modal overlay: browse for receivers and add the chosen ones to the live
 /// group.
 ///
@@ -190,7 +67,7 @@ fn run_dashboard(
 /// the sort order, de-duplication and "needs pairing" rules are the ones the
 /// startup picker already got right, and having two implementations of them
 /// would mean fixing every such bug twice.
-fn add_receiver(terminal: &mut term::Tui, stats: &StreamStats) -> io::Result<()> {
+pub fn add_receiver(terminal: &mut term::Tui, stats: &StreamStats) -> io::Result<()> {
     let paired = openair_client::PairingStore::load()
         .map(|s| s.peer_ids())
         .unwrap_or_default();
@@ -282,16 +159,7 @@ fn centred(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
-/// How long to wait for a key, given how long ago the last sample was taken.
-///
-/// Never longer than what remains of the tick (or keys would delay sampling),
-/// and never zero (which would spin the CPU when rendering overruns a tick).
-fn poll_timeout(since_last_sample: Duration) -> Duration {
-    TICK.saturating_sub(since_last_sample)
-        .max(Duration::from_millis(1))
-}
-
-fn render(frame: &mut Frame, state: &DashboardState, buffer: &LogBuffer) {
+pub fn render(frame: &mut Frame, state: &DashboardState, buffer: &LogBuffer) {
     let area = frame.area();
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
         render_too_small(frame, area);
@@ -540,6 +408,7 @@ fn render_logs(frame: &mut Frame, area: Rect, buffer: &LogBuffer, state: &Dashbo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -619,21 +488,6 @@ mod tests {
             .draw(|frame| render_add_overlay(frame, &state))
             .unwrap();
         assert!(terminal.backend().to_string().contains("add a receiver"));
-    }
-
-    #[test]
-    fn poll_timeout_waits_only_the_rest_of_the_tick() {
-        // The bug this guards: keys arriving mid-tick used to restart a full
-        // wait each time, so holding a key sampled far more often than 10 Hz
-        // and the graph and bandwidth readings jumped around.
-        assert_eq!(poll_timeout(Duration::ZERO), TICK);
-        assert_eq!(poll_timeout(TICK / 4), TICK - TICK / 4);
-    }
-
-    #[test]
-    fn poll_timeout_is_never_zero() {
-        // A zero timeout spins the CPU when a render overruns the tick.
-        assert!(poll_timeout(TICK * 2) > Duration::ZERO);
     }
 
     #[test]
