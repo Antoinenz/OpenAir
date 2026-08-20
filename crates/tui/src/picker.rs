@@ -62,6 +62,10 @@ pub struct PickerState {
     /// handoff toggle cannot be turned on.
     handoff_available: bool,
     hint: Option<String>,
+    /// Why the user was sent back here, if they were. Shown until the next
+    /// keystroke, like a hint — an explanation that outlives the moment it
+    /// explains just becomes furniture.
+    banner: Option<String>,
 }
 
 impl PickerState {
@@ -75,6 +79,7 @@ impl PickerState {
             paired: paired.into_iter().collect(),
             handoff_available,
             hint: None,
+            banner: None,
         };
         // A remembered preference cannot switch handoff on where there is no
         // cable to route through: the preference is remembered, the outcome is
@@ -166,6 +171,15 @@ impl PickerState {
         self.hint.as_deref()
     }
 
+    pub fn banner(&self) -> Option<&str> {
+        self.banner.as_deref()
+    }
+
+    /// Explain why the user is back here, e.g. after nothing connected.
+    pub fn set_banner(&mut self, msg: impl Into<String>) {
+        self.banner = Some(msg.into());
+    }
+
     pub fn handoff_available(&self) -> bool {
         self.handoff_available
     }
@@ -179,6 +193,7 @@ impl PickerState {
         // Any keystroke clears the previous hint; a stale explanation is worse
         // than none.
         self.hint = None;
+        self.banner = None;
 
         match key {
             KeyCode::Up => {

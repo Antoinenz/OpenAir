@@ -30,6 +30,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use openair_client::{GroupTarget, StreamStats};
 use openair_discovery::BrowseHandle;
 
+use crate::connecting::{self, ConnectAction, ConnectOutcome, ConnectingState};
 use crate::dashboard::{DashAction, DashboardState};
 use crate::dashboard_ui::{self, Summary};
 use crate::logs::{self, LogBuffer};
@@ -86,6 +87,7 @@ impl StreamHandle {
 /// The current screen, and whatever state belongs only to it.
 pub enum Screen {
     Picker(Box<PickerScreen>),
+    Connecting(Box<ConnectingScreen>),
     Streaming(Box<StreamingScreen>),
 }
 
@@ -94,9 +96,33 @@ impl Screen {
     pub fn name(&self) -> &'static str {
         match self {
             Screen::Picker(_) => "picker",
+            Screen::Connecting(_) => "connecting",
             Screen::Streaming(_) => "streaming",
         }
     }
+}
+
+/// Everything a running stream needs to be observed and stopped.
+///
+/// Kept as one struct because it moves intact from the connecting screen to
+/// the streaming screen: the stream is the same one throughout, and splitting
+/// these apart invited handing over two of the three.
+struct Running {
+    stats: Arc<StreamStats>,
+    stop: Arc<AtomicBool>,
+    handle: Option<StreamHandle>,
+}
+
+impl Running {
+    fn stop(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+    }
+}
+
+pub struct ConnectingScreen {
+    pub state: ConnectingState,
+    running: Running,
+    last_sample: Instant,
 }
 
 pub struct PickerScreen {
@@ -108,9 +134,7 @@ pub struct PickerScreen {
 
 pub struct StreamingScreen {
     pub state: DashboardState,
-    stats: Arc<StreamStats>,
-    stop: Arc<AtomicBool>,
-    handle: Option<StreamHandle>,
+    running: Running,
     last_sample: Instant,
 }
 
@@ -215,23 +239,65 @@ impl<'a> App<'a> {
                     }
                 }
             }
+            Screen::Connecting(c) => {
+                let now = Instant::now();
+                if now.duration_since(c.last_sample) >= TICK {
+                    c.state.sample(&c.running.stats);
+                    c.last_sample = now;
+                }
+            }
             Screen::Streaming(s) => {
                 // Sampling runs on a clock, not on loop iterations: `event::poll`
                 // returns early when a key arrives, so tying it to the loop made
                 // a held key shrink every measurement window.
                 let now = Instant::now();
                 if now.duration_since(s.last_sample) >= TICK {
-                    s.state.sample(&s.stats, now);
+                    s.state.sample(&s.running.stats, now);
                     s.last_sample = now;
                 }
             }
         }
+        self.advance_from_connecting();
+    }
+
+    /// Move on once the group has settled.
+    ///
+    /// `Ready` goes to the dashboard; `AllFailed` stays put so the user can
+    /// read why before pressing esc. Waiting does nothing — deliberately
+    /// including the case where nothing has been published yet, since the
+    /// stream thread may not have reached its setup loop.
+    fn advance_from_connecting(&mut self) {
+        let Screen::Connecting(c) = &self.screen else {
+            return;
+        };
+        if c.state.outcome() != ConnectOutcome::Ready {
+            return;
+        }
+        let placeholder = Screen::Picker(Box::new(PickerScreen {
+            state: PickerState::new(self.settings.clone(), Vec::new(), self.handoff_available),
+            browse: None,
+        }));
+        let Screen::Connecting(c) = std::mem::replace(&mut self.screen, placeholder) else {
+            unreachable!("just matched");
+        };
+        let mut state = DashboardState::new(self.settings.graph, self.settings.latency_ms);
+        // Seed from the reading the connecting screen already took, so the
+        // first dashboard frame shows the group rather than an empty list.
+        state.sample(&c.running.stats, Instant::now());
+        self.screen = Screen::Streaming(Box::new(StreamingScreen {
+            state,
+            running: c.running,
+            last_sample: Instant::now(),
+        }));
     }
 
     fn draw(&mut self, terminal: &mut term::Tui) -> io::Result<()> {
         match &self.screen {
             Screen::Picker(p) => {
                 terminal.draw(|frame| picker_ui::render(frame, &p.state))?;
+            }
+            Screen::Connecting(c) => {
+                terminal.draw(|frame| connecting::render(frame, &c.state))?;
             }
             Screen::Streaming(s) => {
                 let logs = &self.logs;
@@ -244,6 +310,7 @@ impl<'a> App<'a> {
     /// How long to wait for a key before the next iteration.
     fn poll_timeout(&self) -> Duration {
         match &self.screen {
+            Screen::Connecting(c) => poll_timeout(c.last_sample.elapsed()),
             Screen::Streaming(s) => poll_timeout(s.last_sample.elapsed()),
             _ => TICK,
         }
@@ -254,18 +321,18 @@ impl<'a> App<'a> {
         let Screen::Streaming(s) = &mut self.screen else {
             return None;
         };
-        if !s.stats.ended() {
+        if !s.running.stats.ended() {
             return None;
         }
         let summary = Summary {
-            elapsed: s.stats.elapsed(),
+            elapsed: s.running.stats.elapsed(),
             receivers: s.state.receivers.len(),
             latency_ms: s.state.latency_ms,
             worst_lead_ms: s.state.worst_lead_ms,
-            bytes_sent: s.stats.bytes_sent(),
+            bytes_sent: s.running.stats.bytes_sent(),
             graph: s.state.graph,
         };
-        if let Some(handle) = s.handle.take() {
+        if let Some(handle) = s.running.handle.take() {
             // The stream has already marked itself ended, so this returns
             // promptly; joining collects any error it wants to report.
             if let Err(e) = handle.join() {
@@ -301,15 +368,30 @@ impl<'a> App<'a> {
                 }
                 PickerAction::None | PickerAction::Hint(_) => {}
             },
+            Screen::Connecting(c) => {
+                if c.state.on_key(code) == ConnectAction::Cancel {
+                    // Tear the half-built group down before going back, or
+                    // its sessions would linger on the receivers.
+                    c.running.stop();
+                    let banner = match c.state.outcome() {
+                        ConnectOutcome::AllFailed => Some(c.state.failure_summary()),
+                        _ => None,
+                    };
+                    self.open_picker();
+                    if let (Screen::Picker(p), Some(banner)) = (&mut self.screen, banner) {
+                        p.state.set_banner(banner);
+                    }
+                }
+            }
             Screen::Streaming(s) => match s.state.on_key(code) {
                 DashAction::Quit => self.request_exit(),
                 DashAction::Command(cmd) => {
-                    if !s.stats.send(cmd) {
+                    if !s.running.stats.send(cmd) {
                         tracing::warn!("could not queue command — stream mailbox unavailable");
                     }
                 }
                 DashAction::OpenPicker => {
-                    dashboard_ui::add_receiver(terminal, &s.stats)?;
+                    dashboard_ui::add_receiver(terminal, &s.running.stats)?;
                 }
                 DashAction::None => {}
             },
@@ -322,8 +404,14 @@ impl<'a> App<'a> {
     /// down — and the loop leaves once it reports `ended`.
     fn request_exit(&mut self) {
         match &self.screen {
-            Screen::Streaming(s) => s.stop.store(true, Ordering::SeqCst),
-            _ => self.quitting = true,
+            Screen::Streaming(s) => s.running.stop(),
+            // Nothing is playing yet, so there is nothing to drain: stop
+            // the half-built group and leave.
+            Screen::Connecting(c) => {
+                c.running.stop();
+                self.quitting = true;
+            }
+            Screen::Picker(_) => self.quitting = true,
         }
     }
 
@@ -348,11 +436,13 @@ impl<'a> App<'a> {
         let stats = StreamStats::new(self.settings.latency_ms);
         let stop = Arc::new(AtomicBool::new(false));
         let handle = (self.launch)(targets, Arc::clone(&stats), Arc::clone(&stop));
-        self.screen = Screen::Streaming(Box::new(StreamingScreen {
-            state: DashboardState::new(self.settings.graph, self.settings.latency_ms),
-            stats,
-            stop,
-            handle: Some(handle),
+        self.screen = Screen::Connecting(Box::new(ConnectingScreen {
+            state: ConnectingState::new(),
+            running: Running {
+                stats,
+                stop,
+                handle: Some(handle),
+            },
             last_sample: Instant::now(),
         }));
     }
@@ -385,6 +475,7 @@ pub fn targets_from(rows: &[PickerRow]) -> Vec<GroupTarget> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openair_client::ReceiverState;
     use std::net::SocketAddr;
 
     fn row(addr: &str, device_id: Option<&str>) -> PickerRow {
@@ -449,7 +540,7 @@ mod tests {
         let chosen: Vec<PickerRow> = p.state.chosen().into_iter().cloned().collect();
         app.start_stream(targets_from(&chosen));
 
-        assert_eq!(app.screen().name(), "streaming");
+        assert_eq!(app.screen().name(), "connecting");
         let calls = started.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].len(), 1);
@@ -466,13 +557,33 @@ mod tests {
         let started = std::sync::Mutex::new(Vec::new());
         let mut app = test_app(&started);
         app.start_stream(targets_from(&[row("192.168.1.51:7000", None)]));
+        publish(&mut app, ReceiverState::Connected, None);
 
         app.request_exit();
         assert!(!app.quitting, "the app waits for the stream to finish");
         let Screen::Streaming(s) = &app.screen else {
             panic!("expected streaming");
         };
-        assert!(s.stop.load(Ordering::SeqCst), "the stream was asked to stop");
+        assert!(
+            s.running.stop.load(Ordering::SeqCst),
+            "the stream was asked to stop"
+        );
+    }
+
+    #[test]
+    fn quitting_while_connecting_leaves_immediately() {
+        // Nothing is playing yet, so there is nothing to drain — but the
+        // half-built group still has to be told to stop.
+        let started = std::sync::Mutex::new(Vec::new());
+        let mut app = test_app(&started);
+        app.start_stream(targets_from(&[row("192.168.1.51:7000", None)]));
+
+        app.request_exit();
+        assert!(app.quitting);
+        let Screen::Connecting(c) = &app.screen else {
+            panic!("expected connecting");
+        };
+        assert!(c.running.stop.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -500,6 +611,86 @@ mod tests {
     }
 
     #[test]
+    fn starting_a_stream_opens_the_connecting_screen_first() {
+        // Not the dashboard: sessions take seconds to establish, and the
+        // dashboard has nothing truthful to show until they have.
+        let started = std::sync::Mutex::new(Vec::new());
+        let mut app = test_app(&started);
+        app.start_stream(targets_from(&[row("192.168.1.51:7000", None)]));
+        assert_eq!(app.screen().name(), "connecting");
+    }
+
+    #[test]
+    fn the_app_advances_to_streaming_once_a_receiver_connects() {
+        let started = std::sync::Mutex::new(Vec::new());
+        let mut app = test_app(&started);
+        app.start_stream(targets_from(&[row("192.168.1.51:7000", None)]));
+
+        publish(&mut app, ReceiverState::Connected, None);
+        assert_eq!(app.screen().name(), "streaming");
+    }
+
+    #[test]
+    fn the_app_stays_on_connecting_while_a_receiver_is_pending() {
+        let started = std::sync::Mutex::new(Vec::new());
+        let mut app = test_app(&started);
+        app.start_stream(targets_from(&[row("192.168.1.51:7000", None)]));
+
+        publish(&mut app, ReceiverState::Connecting, None);
+        assert_eq!(app.screen().name(), "connecting");
+    }
+
+    #[test]
+    fn the_app_stays_on_connecting_when_everything_failed() {
+        // The user needs to read why before being moved anywhere.
+        let started = std::sync::Mutex::new(Vec::new());
+        let mut app = test_app(&started);
+        app.start_stream(targets_from(&[row("192.168.1.51:7000", None)]));
+
+        publish(&mut app, ReceiverState::Failed, Some("connection refused"));
+        assert_eq!(app.screen().name(), "connecting");
+    }
+
+    #[test]
+    fn cancelling_a_failed_connect_returns_to_the_picker_with_the_reason() {
+        let started = std::sync::Mutex::new(Vec::new());
+        let mut app = test_app(&started);
+        app.start_stream(targets_from(&[row("192.168.1.51:7000", None)]));
+        publish(&mut app, ReceiverState::Failed, Some("connection refused"));
+
+        let Screen::Connecting(c) = &mut app.screen else {
+            panic!("expected connecting");
+        };
+        assert_eq!(c.state.on_key(KeyCode::Esc), ConnectAction::Cancel);
+        let banner = c.state.failure_summary();
+        c.running.stop();
+        app.open_picker();
+        if let Screen::Picker(p) = &mut app.screen {
+            p.state.set_banner(banner);
+            assert!(p.state.banner().unwrap().contains("refused"));
+        } else {
+            panic!("expected the picker");
+        }
+    }
+
+    /// Publish one receiver in `state` and let the app react.
+    fn publish(app: &mut App<'_>, state: ReceiverState, error: Option<&str>) {
+        let Screen::Connecting(c) = &mut app.screen else {
+            panic!("expected connecting");
+        };
+        c.running.stats.set_receivers(vec![openair_client::ReceiverStat {
+            name: "Pool Room".into(),
+            addr: "192.168.1.51:7000".parse().unwrap(),
+            state,
+            offset_ms: 0,
+            trim_db: 0.0,
+            error: error.map(str::to_string),
+        }]);
+        c.state.sample(&c.running.stats);
+        app.advance_from_connecting();
+    }
+
+    #[test]
     fn a_receiver_without_a_device_id_gets_the_default() {
         let targets = targets_from(&[row("192.168.1.51:7000", None)]);
         assert_eq!(targets[0].device_id, DEFAULT_DEVICE_ID);
@@ -520,7 +711,7 @@ mod tests {
             device_id: "AA:BB".into(),
             offset_ms: 0,
         }]);
-        assert_eq!(app.screen().name(), "streaming");
+        assert_eq!(app.screen().name(), "connecting");
     }
 
     #[test]
@@ -528,6 +719,7 @@ mod tests {
         let started = std::sync::Mutex::new(Vec::new());
         let mut app = test_app(&started);
         app.start_stream(targets_from(&[row("192.168.1.51:7000", None)]));
+        publish(&mut app, ReceiverState::Connected, None);
 
         // The test launcher marks the stream ended on its own thread; wait for
         // it rather than racing it.

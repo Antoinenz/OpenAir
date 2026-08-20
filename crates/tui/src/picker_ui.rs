@@ -22,12 +22,18 @@ pub fn render(frame: &mut Frame, state: &PickerState) {
     let status = Paragraph::new(status_line(state)).style(Style::default().fg(Color::DarkGray));
     frame.render_widget(status, status_area);
 
-    let keys = match state.hint() {
-        Some(hint) => Paragraph::new(Line::from(Span::styled(
+    // A banner explains why the user is back here and outranks the keybind
+    // line; a hint answers the key they just pressed and outranks both.
+    let keys = match (state.hint(), state.banner()) {
+        (Some(hint), _) => Paragraph::new(Line::from(Span::styled(
             format!("  {hint}"),
             Style::default().fg(Color::Yellow),
         ))),
-        None => Paragraph::new(Line::from(Span::styled(
+        (None, Some(banner)) => Paragraph::new(Line::from(Span::styled(
+            format!("  {banner}"),
+            Style::default().fg(Color::Red),
+        ))),
+        (None, None) => Paragraph::new(Line::from(Span::styled(
             "  ↑↓ move · space select · ⏎ start · h handoff · <> latency · q quit",
             Style::default().fg(Color::DarkGray),
         ))),

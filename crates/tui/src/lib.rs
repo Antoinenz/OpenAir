@@ -10,6 +10,7 @@
 //! boundaries and reach the TUI as plain data.
 
 pub mod app;
+pub mod connecting;
 pub mod dashboard;
 pub mod dashboard_ui;
 pub mod logs;
