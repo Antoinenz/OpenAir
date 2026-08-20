@@ -48,6 +48,16 @@ impl AirPlayDevice {
         self.txt.features.supports_transient_pairing()
     }
 
+    /// A readable model name, e.g. `AppleTV6,2` -> "Apple TV 4K".
+    ///
+    /// Falls back to the raw identifier when it is not recognised.
+    pub fn pretty_model(&self) -> &str {
+        match self.txt.model.as_deref() {
+            Some(model) => crate::model::pretty_model(model),
+            None => "unknown",
+        }
+    }
+
     /// The receiver's name without mDNS decoration.
     ///
     /// `name` is the raw fullname, which is not what anyone calls their

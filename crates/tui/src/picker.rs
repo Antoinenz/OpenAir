@@ -139,7 +139,7 @@ impl PickerState {
                     name: d.display_name().to_string(),
                     addr: SocketAddr::new(d.addr, d.port),
                     device_id: d.txt.device_id.clone(),
-                    model: d.txt.model.clone().unwrap_or_else(|| "unknown".into()),
+                    model: d.pretty_model().to_string(),
                 }
             })
             .collect();
