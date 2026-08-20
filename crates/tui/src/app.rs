@@ -361,7 +361,7 @@ impl<'a> App<'a> {
         let Screen::Connecting(c) = std::mem::replace(&mut self.screen, placeholder) else {
             unreachable!("just matched");
         };
-        let mut state = DashboardState::new(self.settings.graph, self.settings.latency_ms);
+        let mut state = DashboardState::new(self.settings.latency_ms);
         // A retry needs the device id, which `ReceiverStat` does not carry --
         // it is what pairing keys off, so it has to come from the targets.
         state.set_device_ids(c.device_ids.clone());
@@ -417,7 +417,6 @@ impl<'a> App<'a> {
             latency_ms: s.state.latency_ms,
             worst_lead_ms: s.state.worst_lead_ms,
             bytes_sent: s.running.stats.bytes_sent(),
-            graph: s.state.graph,
         };
         if let Some(handle) = s.running.handle.take() {
             // The stream has already marked itself ended, so this returns

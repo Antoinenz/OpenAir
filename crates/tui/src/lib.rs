@@ -26,4 +26,4 @@ pub use dashboard_ui::Summary;
 pub use logs::{LogBuffer, LogLayer, LogLine};
 pub use picker::{PickerAction, PickerRow, PickerState};
 pub use term::is_interactive;
-pub use settings::{GraphKind, Overrides, Settings};
+pub use settings::{Overrides, Settings};

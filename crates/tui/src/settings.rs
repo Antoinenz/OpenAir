@@ -17,41 +17,16 @@ use tracing::warn;
 /// Bumped only when a change would confuse an older build. A file carrying a
 /// version we do not know is ignored in favour of defaults rather than being
 /// guessed at.
-const CURRENT_VERSION: u32 = 1;
+/// Bumped to 2 when the `graph` preference was removed. An older file still
+/// loads — unknown fields are ignored — so this is not a migration, only a
+/// record of when the shape changed.
+const CURRENT_VERSION: u32 = 2;
 
 const FILE_NAME: &str = "settings.json";
 
 pub const LATENCY_MIN_MS: u64 = 100;
 pub const LATENCY_MAX_MS: u64 = 2000;
 pub const LATENCY_STEP_MS: u64 = 50;
-
-/// Which series the dashboard's graph panel is showing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum GraphKind {
-    /// Milliseconds of headroom before the play deadline — the number that
-    /// actually predicts a dropout.
-    #[default]
-    Buffer,
-    /// Encoded bytes per second.
-    Bandwidth,
-}
-
-impl GraphKind {
-    pub fn toggled(self) -> Self {
-        match self {
-            GraphKind::Buffer => GraphKind::Bandwidth,
-            GraphKind::Bandwidth => GraphKind::Buffer,
-        }
-    }
-
-    pub fn title(self) -> &'static str {
-        match self {
-            GraphKind::Buffer => "buffer health (ms ahead)",
-            GraphKind::Bandwidth => "bandwidth",
-        }
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
@@ -65,8 +40,6 @@ pub struct Settings {
     pub volume_db: f32,
     #[serde(default = "default_metadata")]
     pub metadata: bool,
-    #[serde(default)]
-    pub graph: GraphKind,
 }
 
 fn default_version() -> u32 {
@@ -93,7 +66,6 @@ impl Default for Settings {
             latency_ms: default_latency(),
             volume_db: default_volume(),
             metadata: default_metadata(),
-            graph: GraphKind::default(),
         }
     }
 }
@@ -243,7 +215,6 @@ mod tests {
             latency_ms: 750,
             volume_db: -14.0,
             metadata: false,
-            graph: GraphKind::Bandwidth,
             ..Settings::default()
         };
 
@@ -348,11 +319,4 @@ mod tests {
         assert_eq!(s.latency_ms, 500 + LATENCY_STEP_MS);
     }
 
-    #[test]
-    fn graph_kind_toggles_and_round_trips() {
-        assert_eq!(GraphKind::Buffer.toggled(), GraphKind::Bandwidth);
-        assert_eq!(GraphKind::Bandwidth.toggled(), GraphKind::Buffer);
-        let json = serde_json::to_string(&GraphKind::Bandwidth).unwrap();
-        assert_eq!(json, r#""bandwidth""#);
-    }
 }

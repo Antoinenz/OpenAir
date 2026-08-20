@@ -19,7 +19,7 @@ use ratatui::Frame;
 use crate::dashboard::{format_bitrate, format_bytes, format_elapsed, DashboardState};
 use crate::logs::LogBuffer;
 use crate::picker::{PickerAction, PickerState};
-use crate::settings::{GraphKind, Settings};
+use crate::settings::Settings;
 use crate::term;
 
 /// Render rate. Fast enough to feel live, slow enough to be invisible next to
@@ -39,8 +39,6 @@ pub struct Summary {
     pub latency_ms: u64,
     pub worst_lead_ms: Option<i64>,
     pub bytes_sent: u64,
-    /// Which graph the user left showing, so the choice can be persisted.
-    pub graph: GraphKind,
 }
 
 impl std::fmt::Display for Summary {
@@ -259,18 +257,16 @@ fn boxed<'a>(title: &'a str, lines: Vec<Line<'a>>) -> Paragraph<'a> {
 }
 
 fn render_graph(frame: &mut Frame, area: Rect, state: &DashboardState) {
-    let series = state.graph_series();
-    let title = format!(" {}   [b] switch ", state.graph.title());
-
     let [chart, footer] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
 
-    let block = Block::default().borders(Borders::ALL).title(title);
+    let block = Block::default().borders(Borders::ALL).title(" bandwidth ");
     let inner = block.inner(chart);
     frame.render_widget(block, chart);
 
     // ratatui draws a sparkline oldest-first from the left; show only as many
     // samples as there are columns so the newest is always at the right edge.
+    let series = state.graph_series();
     let visible = series
         .iter()
         .rev()
@@ -285,30 +281,40 @@ fn render_graph(frame: &mut Frame, area: Rect, state: &DashboardState) {
         inner,
     );
 
-    let footer_text = match state.graph {
-        GraphKind::Buffer => {
-            let worst = state
-                .worst_lead_ms
-                .map(|v| format!("{v} ms"))
-                .unwrap_or_else(|| "—".into());
-            let now = state
-                .latest_lead_ms()
-                .map(|v| format!("{v} ms"))
-                .unwrap_or_else(|| "—".into());
-            format!("  lowest {worst}     now {now}")
-        }
-        GraphKind::Bandwidth => format!("  now {}", format_bitrate(state.bandwidth_bps())),
-    };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            footer_text,
+            format!("  now {}", format_bitrate(state.bandwidth_bps())),
             Style::default().fg(Color::DarkGray),
         ))),
         footer,
     );
 }
 
+/// A ten-cell bar for a 0..1 health fraction.
+///
+/// No history, deliberately: this answers "is this room about to cut out right
+/// now", and a trend line would need a row of its own per receiver to say the
+/// same thing less directly.
+fn health_bar(health: f32) -> (String, Color) {
+    const CELLS: usize = 10;
+    let filled = (health * CELLS as f32).round().clamp(0.0, CELLS as f32) as usize;
+    let bar: String = "█".repeat(filled) + &"░".repeat(CELLS - filled);
+    // Thresholds are about the shape of the failure: below a fifth of the
+    // anchor lead there is very little left to absorb a hiccup.
+    let colour = if health > 0.5 {
+        Color::Green
+    } else if health > 0.2 {
+        Color::Yellow
+    } else {
+        Color::Red
+    };
+    (bar, colour)
+}
+
 fn render_receivers(frame: &mut Frame, area: Rect, state: &DashboardState) {
+    let show_bar = area.width >= 72;
+    let show_offset = area.width >= 60;
+
     let lines: Vec<Line> = if state.receivers.is_empty() {
         vec![Line::from(Span::styled(
             "  connecting…",
@@ -326,61 +332,61 @@ fn render_receivers(frame: &mut Frame, area: Rect, state: &DashboardState) {
                     ReceiverState::Connecting | ReceiverState::Reconnecting => Color::Yellow,
                     ReceiverState::Failed | ReceiverState::Dead => Color::Red,
                 };
-                let label = r.state.label();
                 let selected = cursor == Some(i);
-                let row = Style::default();
                 let row = if selected {
-                    row.add_modifier(Modifier::REVERSED)
+                    Style::default().add_modifier(Modifier::REVERSED)
                 } else {
-                    row
+                    Style::default()
                 };
-                Line::from(vec![
+
+                let mut spans = vec![
                     Span::styled(if selected { " ▸ " } else { "   " }, row),
-                    Span::styled(format!("{:<22}", r.name), row),
-                    Span::styled(format!("{label:<15}"), row.fg(colour)),
-                    // Only show a trim or offset that has been set — zeroes
-                    // for every receiver would be noise.
-                    Span::styled(
-                        if r.trim_db == 0.0 {
-                            format!("{:<9}", "")
-                        } else {
-                            format!("{:<+9.0} dB", r.trim_db)
-                        },
-                        row.fg(Color::Cyan),
-                    ),
-                    Span::styled(
-                        if r.offset_ms == 0 {
-                            String::new()
-                        } else {
-                            format!("{:+} ms", r.offset_ms)
-                        },
+                    Span::styled(format!("{:<22}", truncate(&r.name, 22)), row),
+                    // Always shown, including ±0: a column that appears and
+                    // disappears makes the row jump, and a zero is information
+                    // — it says this receiver is at the group level.
+                    Span::styled(format!("{:>+5.0} dB ", r.trim_db), row.fg(Color::Cyan)),
+                ];
+                if show_offset {
+                    spans.push(Span::styled(
+                        format!("{:>+5} ms ", r.offset_ms),
                         row.fg(Color::Magenta),
-                    ),
-                    // The reason matters more than the columns it displaces,
-                    // so it takes the rest of the row.
-                    Span::styled(
-                        match &r.error {
-                            Some(why) => format!("  {why}"),
-                            None => String::new(),
-                        },
-                        row.fg(Color::Red),
-                    ),
-                ])
+                    ));
+                }
+                if show_bar {
+                    let (bar, bar_colour) = health_bar(r.health);
+                    let style = if r.state == ReceiverState::Connected {
+                        row.fg(bar_colour)
+                    } else {
+                        row.fg(Color::DarkGray)
+                    };
+                    spans.push(Span::styled(format!(" {bar} "), style));
+                }
+                spans.push(Span::styled(format!(" {}", r.state.label()), row.fg(colour)));
+                if let Some(why) = &r.error {
+                    spans.push(Span::styled(format!("  {why}"), row.fg(Color::Red)));
+                }
+                Line::from(spans)
             })
             .collect()
     };
 
     frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!(
-                    " receivers ({})   [↑↓] select · [+/-] vol · [<>] offset · [a] add · [r] retry · [d] drop ",
-                    state.receivers.len()
-                )),
-        ),
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(format!(
+            " receivers ({})   [↑↓] select · [+/-] vol · [<>] offset · [a] add · [r] retry · [d] drop ",
+            state.receivers.len()
+        ))),
         area,
     );
+}
+
+/// Trim to `max` display columns, marking the cut with an ellipsis.
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let kept: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{kept}…")
 }
 
 fn render_logs(frame: &mut Frame, area: Rect, buffer: &LogBuffer, state: &DashboardState) {
@@ -435,7 +441,7 @@ mod tests {
         // A layout panic would take the whole stream down, so this is the one
         // rendering test worth having. Deliberately not a golden-frame
         // snapshot: those break on every cosmetic tweak and teach nothing.
-        let mut state = DashboardState::new(GraphKind::Buffer, 500);
+        let mut state = DashboardState::new(500);
         let stats = StreamStats::new(500);
         stats.record_lead_ms(320);
         stats.add_bytes(4096);
@@ -459,7 +465,7 @@ mod tests {
 
     #[test]
     fn renders_the_too_small_message_instead_of_a_jumble() {
-        let state = DashboardState::new(GraphKind::Buffer, 500);
+        let state = DashboardState::new(500);
         let terminal = draw(40, 10, &state);
         assert!(terminal.backend().to_string().contains("too small"));
     }
@@ -467,14 +473,14 @@ mod tests {
     #[test]
     fn renders_at_exactly_the_minimum_size() {
         // The boundary the layout constraints have to survive.
-        let state = DashboardState::new(GraphKind::Buffer, 500);
+        let state = DashboardState::new(500);
         let terminal = draw(MIN_WIDTH, MIN_HEIGHT, &state);
         assert!(!terminal.backend().to_string().contains("too small"));
     }
 
     #[test]
     fn renders_trim_and_offset_for_a_receiver_that_has_them() {
-        let mut state = DashboardState::new(GraphKind::Buffer, 500);
+        let mut state = DashboardState::new(500);
         let stats = StreamStats::new(500);
         stats.set_receivers(vec![openair_client::ReceiverStat {
             name: "Pool Room".into(),
@@ -519,10 +525,58 @@ mod tests {
     }
 
     #[test]
-    fn renders_the_bandwidth_graph_too() {
-        let state = DashboardState::new(GraphKind::Bandwidth, 500);
+    fn the_graph_shows_bandwidth() {
+        let state = DashboardState::new(500);
         let terminal = draw(100, 32, &state);
         assert!(terminal.backend().to_string().contains("bandwidth"));
+    }
+
+    #[test]
+    fn renders_zero_trim_and_offset_rather_than_blank_columns() {
+        // A column that appears only when non-zero makes the row jump as
+        // values change, and a zero says "this receiver is at the group
+        // level", which is worth stating.
+        let mut state = DashboardState::new(500);
+        let stats = StreamStats::new(500);
+        stats.set_receivers(vec![openair_client::ReceiverStat {
+            name: "Pool Room".into(),
+            addr: "192.168.1.51:7000".parse().unwrap(),
+            state: ReceiverState::Connected,
+            offset_ms: 0,
+            trim_db: 0.0,
+            lead_ms: Some(500),
+            health: 1.0,
+            error: None,
+        }]);
+        state.sample(&stats, Instant::now());
+
+        let out = draw(120, 32, &state).backend().to_string();
+        assert!(out.contains("+0 dB"), "{out}");
+        assert!(out.contains("+0 ms"), "{out}");
+    }
+
+    #[test]
+    fn a_healthy_receiver_gets_a_full_bar_and_a_starved_one_an_empty_bar() {
+        let (full, _) = health_bar(1.0);
+        let (empty, _) = health_bar(0.0);
+        assert_eq!(full.matches('█').count(), 10);
+        assert_eq!(empty.matches('░').count(), 10);
+    }
+
+    #[test]
+    fn health_bar_colour_warns_before_it_empties() {
+        // Red must arrive with headroom left, not at the moment audio cuts.
+        assert_eq!(health_bar(1.0).1, Color::Green);
+        assert_eq!(health_bar(0.3).1, Color::Yellow);
+        assert_eq!(health_bar(0.1).1, Color::Red);
+    }
+
+    #[test]
+    fn health_bar_never_overflows_its_width() {
+        for h in [-1.0, 0.0, 0.5, 1.0, 2.0, f32::NAN] {
+            let (bar, _) = health_bar(h);
+            assert_eq!(bar.chars().count(), 10, "health {h} produced {bar:?}");
+        }
     }
 
     #[test]
@@ -533,7 +587,6 @@ mod tests {
             latency_ms: 750,
             worst_lead_ms: Some(180),
             bytes_sent: 3 * 1024 * 1024,
-            graph: GraphKind::Buffer,
         };
         let text = s.to_string();
         assert!(text.contains("2:05"));

@@ -16,10 +16,8 @@ use openair_client::{
 };
 use openair_core::metadata::NowPlaying;
 
-use crate::settings::GraphKind;
-
-/// Samples kept for the graph. At the 10 Hz render rate that is ~12 seconds —
-/// long enough to see a dip develop, short enough to stay legible in one row.
+/// Samples kept for the bandwidth graph. At the 10 Hz render rate that is
+/// ~12 seconds — long enough to see a trend, short enough to stay legible.
 pub const HISTORY: usize = 120;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -49,21 +47,25 @@ pub const OFFSET_MIN_MS: i64 = -500;
 pub const OFFSET_MAX_MS: i64 = 500;
 
 pub struct DashboardState {
-    /// Milliseconds of headroom, oldest first.
-    buffer_history: VecDeque<i64>,
     /// Bytes per second, oldest first.
+    ///
+    /// Bandwidth is the only series worth a history here. Buffer health is
+    /// per-receiver and belongs on the receiver's own row, where it can say
+    /// *which* room is running dry — a single line could only ever show the
+    /// group minimum.
     bandwidth_history: VecDeque<f64>,
     /// `(bytes_sent, when)` from the previous sample, for the rate difference.
     last_bytes: Option<(u64, Instant)>,
     bandwidth_bps: Option<f64>,
-    pub graph: GraphKind,
     pub latency_ms: u64,
     pub receivers: Vec<ReceiverStat>,
     pub now_playing: Option<NowPlaying>,
     pub log_scroll: usize,
-    /// Lowest headroom seen for the whole run — the number worth remembering
-    /// after a dropout, since the graph will have scrolled past it.
+    /// Lowest group headroom seen for the whole run, for the closing
+    /// summary. Nothing on screen keeps this once a dip has passed.
     pub worst_lead_ms: Option<i64>,
+    /// Group headroom at the last sample, for the latency box.
+    lead_ms: Option<i64>,
     /// The highlighted receiver, tracked by address rather than row index.
     /// The group's membership changes underneath the cursor as receivers drop,
     /// reconnect and get added — an index would quietly come to mean a
@@ -89,18 +91,17 @@ struct Pending {
 }
 
 impl DashboardState {
-    pub fn new(graph: GraphKind, latency_ms: u64) -> Self {
+    pub fn new(latency_ms: u64) -> Self {
         Self {
-            buffer_history: VecDeque::with_capacity(HISTORY),
             bandwidth_history: VecDeque::with_capacity(HISTORY),
             last_bytes: None,
             bandwidth_bps: None,
-            graph,
             latency_ms,
             receivers: Vec::new(),
             now_playing: None,
             log_scroll: 0,
             worst_lead_ms: None,
+            lead_ms: None,
             selected: None,
             pending: HashMap::new(),
             device_ids: HashMap::new(),
@@ -115,11 +116,11 @@ impl DashboardState {
     /// Take one reading. Called once per render tick.
     pub fn sample(&mut self, stats: &StreamStats, now: Instant) {
         if let Some(lead) = stats.take_min_lead_ms() {
-            push_bounded(&mut self.buffer_history, lead);
             self.worst_lead_ms = Some(match self.worst_lead_ms {
                 Some(worst) => worst.min(lead),
                 None => lead,
             });
+            self.lead_ms = Some(lead);
         }
 
         let bytes = stats.bytes_sent();
@@ -216,10 +217,6 @@ impl DashboardState {
 
     pub fn on_key(&mut self, key: KeyCode) -> DashAction {
         match key {
-            KeyCode::Char('b') => {
-                self.graph = self.graph.toggled();
-                DashAction::None
-            }
             KeyCode::Up => {
                 self.move_cursor(-1);
                 DashAction::None
@@ -310,34 +307,20 @@ impl DashboardState {
         self.bandwidth_bps
     }
 
-    pub fn buffer_history(&self) -> &VecDeque<i64> {
-        &self.buffer_history
-    }
-
     pub fn bandwidth_history(&self) -> &VecDeque<f64> {
         &self.bandwidth_history
     }
 
-    /// The series the graph is currently showing, as `u64` for ratatui's
-    /// sparkline. Negative headroom clamps to zero — the bar bottoming out is
-    /// the signal, and the exact depth below zero is in the logs.
+    /// The bandwidth series, as `u64` for ratatui's sparkline.
     pub fn graph_series(&self) -> Vec<u64> {
-        match self.graph {
-            GraphKind::Buffer => self
-                .buffer_history
-                .iter()
-                .map(|&v| v.max(0) as u64)
-                .collect(),
-            GraphKind::Bandwidth => self
-                .bandwidth_history
-                .iter()
-                .map(|&v| v.max(0.0) as u64)
-                .collect(),
-        }
+        self.bandwidth_history
+            .iter()
+            .map(|&v| v.max(0.0) as u64)
+            .collect()
     }
 
     pub fn latest_lead_ms(&self) -> Option<i64> {
-        self.buffer_history.back().copied()
+        self.lead_ms
     }
 
     /// Total bytes sent as of the last sample.
@@ -399,7 +382,7 @@ mod tests {
     use std::time::Duration;
 
     fn dash() -> DashboardState {
-        DashboardState::new(GraphKind::Buffer, 500)
+        DashboardState::new(500)
     }
 
     #[test]
@@ -459,34 +442,7 @@ mod tests {
     }
 
     #[test]
-    fn buffer_history_is_bounded() {
-        let mut d = dash();
-        let stats = StreamStats::new(500);
-        let mut t = Instant::now();
-        for i in 0..(HISTORY + 50) {
-            stats.record_lead_ms(i as i64);
-            t += Duration::from_millis(100);
-            d.sample(&stats, t);
-        }
-        assert_eq!(d.buffer_history().len(), HISTORY);
-        assert_eq!(
-            *d.buffer_history().front().unwrap(),
-            50,
-            "oldest samples dropped"
-        );
-    }
-
-    #[test]
-    fn a_window_with_no_packets_adds_no_sample() {
-        // Paused streams must not draw a flat line at zero.
-        let mut d = dash();
-        let stats = StreamStats::new(500);
-        d.sample(&stats, Instant::now());
-        assert!(d.buffer_history().is_empty());
-    }
-
-    #[test]
-    fn worst_lead_survives_the_graph_scrolling_past_it() {
+    fn worst_lead_is_remembered_for_the_summary() {
         let mut d = dash();
         let stats = StreamStats::new(500);
         let mut t = Instant::now();
@@ -498,34 +454,6 @@ mod tests {
             d.sample(&stats, t);
         }
         assert_eq!(d.worst_lead_ms, Some(20));
-    }
-
-    #[test]
-    fn negative_headroom_clamps_to_zero_in_the_series() {
-        let mut d = dash();
-        let stats = StreamStats::new(500);
-        stats.record_lead_ms(-40);
-        d.sample(&stats, Instant::now());
-        assert_eq!(d.graph_series(), vec![0]);
-        assert_eq!(d.latest_lead_ms(), Some(-40), "the real value is still there");
-    }
-
-    #[test]
-    fn b_toggles_the_graph_and_the_series_follows() {
-        let mut d = dash();
-        let stats = StreamStats::new(500);
-        let t0 = Instant::now();
-        stats.record_lead_ms(300);
-        d.sample(&stats, t0);
-        stats.add_bytes(8000);
-        stats.record_lead_ms(300);
-        d.sample(&stats, t0 + Duration::from_secs(1));
-
-        assert_eq!(d.graph, GraphKind::Buffer);
-        assert_eq!(d.graph_series(), vec![300, 300]);
-        d.on_key(KeyCode::Char('b'));
-        assert_eq!(d.graph, GraphKind::Bandwidth);
-        assert_eq!(d.graph_series(), vec![8000]);
     }
 
     #[test]
