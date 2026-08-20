@@ -18,6 +18,7 @@ pub mod pairing;
 pub mod pairing_ui;
 pub mod picker;
 pub mod picker_ui;
+pub mod rect;
 pub mod settings;
 pub mod term;
 

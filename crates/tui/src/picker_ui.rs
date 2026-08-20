@@ -18,6 +18,7 @@ pub fn render(frame: &mut Frame, state: &PickerState) {
     .areas(frame.area());
 
     render_device_list(frame, list_area, state, " OpenAir ");
+    render_ready_button(frame, list_area, state);
 
     let status = Paragraph::new(status_line(state)).style(Style::default().fg(Color::DarkGray));
     frame.render_widget(status, status_area);
@@ -39,6 +40,55 @@ pub fn render(frame: &mut Frame, state: &PickerState) {
         ))),
     };
     frame.render_widget(keys, keys_area);
+}
+
+/// Width and height of the ready button, borders included.
+const BUTTON: (u16, u16) = (12, 3);
+/// Columns between the button and the list's right border, so the frame's
+/// corner stays visible and the button reads as sitting *on* the frame.
+const BUTTON_PAD: u16 = 3;
+/// Below this width the button would cover the address column, so it is
+/// dropped: the `⏎ start` hint in the footer still says how to proceed.
+const BUTTON_MIN_WIDTH: u16 = 48;
+
+/// The bottom-right ready button.
+///
+/// Green once a receiver is chosen, so "am I able to start?" is answerable at a
+/// glance rather than by counting `[x]` marks. The `⏎` shows how to press it
+/// without spending a footer line on a sentence.
+///
+/// Pressing Enter with nothing selected turns it yellow alongside the footer
+/// hint. That colour rides the hint's lifetime — it clears on the next
+/// keystroke — rather than a timer, because a timed flash on a screen that only
+/// redraws on input or discovery would sometimes never be un-drawn.
+fn render_ready_button(frame: &mut Frame, list_area: ratatui::layout::Rect, state: &PickerState) {
+    if list_area.width < BUTTON_MIN_WIDTH || list_area.height < BUTTON.1 {
+        return;
+    }
+
+    let ready = !state.chosen().is_empty();
+    let colour = match (ready, state.hint().is_some()) {
+        (true, _) => Color::Green,
+        (false, true) => Color::Yellow,
+        (false, false) => Color::DarkGray,
+    };
+
+    let area = crate::rect::bottom_right(list_area, BUTTON.0, BUTTON.1, BUTTON_PAD);
+    // The list's border and rows run underneath; without clearing, they show
+    // through the button's interior.
+    frame.render_widget(ratatui::widgets::Clear, area);
+
+    let style = Style::default().fg(colour);
+    let label = Paragraph::new(Line::from(Span::styled(
+        "  ⏎ READY ",
+        if ready {
+            style.add_modifier(Modifier::BOLD)
+        } else {
+            style
+        },
+    )))
+    .block(Block::default().borders(Borders::ALL).style(style));
+    frame.render_widget(label, area);
 }
 
 /// Draw the device list. Shared with the dashboard's add-a-receiver overlay so
@@ -177,6 +227,83 @@ mod tests {
             state.rows().iter().any(|r| r.needs_pairing),
             "the flag itself must survive — the pairing screen reads it"
         );
+    }
+
+    #[test]
+    fn the_ready_button_is_drawn_in_both_states() {
+        let mut state = PickerState::new(Settings::default(), Vec::new(), true);
+        state.insert(device("Pool Room", "192.168.1.51", "1", TRANSIENT));
+
+        let idle = draw(100, 20, &state).backend().to_string();
+        assert!(idle.contains("READY"), "drawn before anything is selected");
+
+        state.on_key(crossterm::event::KeyCode::Char(' '));
+        let armed = draw(100, 20, &state).backend().to_string();
+        assert!(armed.contains("READY"));
+    }
+
+    #[test]
+    fn the_ready_button_turns_green_only_when_a_receiver_is_chosen() {
+        // The colour is the whole point of the button, so assert on the cell
+        // style rather than on the text being present.
+        let mut state = PickerState::new(Settings::default(), Vec::new(), true);
+        state.insert(device("Pool Room", "192.168.1.51", "1", TRANSIENT));
+
+        assert_eq!(button_colour(&state), Some(Color::DarkGray));
+        state.on_key(crossterm::event::KeyCode::Char(' '));
+        assert_eq!(button_colour(&state), Some(Color::Green));
+    }
+
+    #[test]
+    fn the_ready_button_flags_a_refused_enter() {
+        let mut state = PickerState::new(Settings::default(), Vec::new(), true);
+        state.insert(device("Pool Room", "192.168.1.51", "1", TRANSIENT));
+        state.on_key(crossterm::event::KeyCode::Enter); // nothing selected
+        assert_eq!(button_colour(&state), Some(Color::Yellow));
+
+        // And it goes quiet again with the hint, rather than staying lit.
+        state.on_key(crossterm::event::KeyCode::Down);
+        assert_eq!(button_colour(&state), Some(Color::DarkGray));
+    }
+
+    /// Colour of the button's top-left border cell, located the same way the
+    /// renderer places it.
+    fn button_colour(state: &PickerState) -> Option<Color> {
+        let (w, h) = (100u16, 20u16);
+        let terminal = draw(w, h, state);
+        let list_area = ratatui::layout::Rect {
+            x: 0,
+            y: 0,
+            width: w,
+            height: h - 2, // the two footer rows
+        };
+        let r = crate::rect::bottom_right(list_area, BUTTON.0, BUTTON.1, BUTTON_PAD);
+        Some(terminal.backend().buffer()[(r.x, r.y)].fg)
+    }
+
+    #[test]
+    fn a_narrow_picker_drops_the_button_rather_than_covering_the_list() {
+        let mut state = PickerState::new(Settings::default(), Vec::new(), true);
+        state.insert(device("Pool Room", "192.168.1.51", "1", TRANSIENT));
+        state.on_key(crossterm::event::KeyCode::Char(' '));
+
+        let narrow = draw(40, 12, &state).backend().to_string();
+        assert!(!narrow.contains("READY"), "dropped when it would not fit");
+        assert!(narrow.contains("Pool Room"), "the list still renders");
+    }
+
+    #[test]
+    fn rendering_survives_a_sweep_of_terminal_sizes() {
+        // The button overlaps the list border, so it is exactly the kind of
+        // widget that panics on a small terminal. Cheap insurance.
+        let mut state = PickerState::new(Settings::default(), Vec::new(), true);
+        state.insert(device("Pool Room", "192.168.1.51", "1", TRANSIENT));
+        state.on_key(crossterm::event::KeyCode::Char(' '));
+        for width in [20u16, 40, 47, 48, 60, 80, 200] {
+            for height in [3u16, 5, 8, 20, 50] {
+                draw(width, height, &state);
+            }
+        }
     }
 
     #[test]

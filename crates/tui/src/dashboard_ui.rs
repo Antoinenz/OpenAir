@@ -125,7 +125,7 @@ pub fn add_receiver(terminal: &mut term::Tui, stats: &StreamStats) -> io::Result
 const DEFAULT_DEVICE_ID: &str = "AA:BB:CC:DD:EE:FF";
 
 fn render_add_overlay(frame: &mut Frame, state: &PickerState) {
-    let area = centred(frame.area(), 70, 14);
+    let area = crate::rect::centred(frame.area(), 70, 14);
     // Clear first: this is drawn over a live dashboard frame, and without it
     // the panel underneath shows through the gaps.
     frame.render_widget(ratatui::widgets::Clear, area);
@@ -143,18 +143,6 @@ fn render_add_overlay(frame: &mut Frame, state: &PickerState) {
         ),
     };
     frame.render_widget(Paragraph::new(Line::from(hint)), hint_area);
-}
-
-/// A rectangle of at most `width`×`height`, centred in `area`.
-fn centred(area: Rect, width: u16, height: u16) -> Rect {
-    let w = width.min(area.width);
-    let h = height.min(area.height);
-    Rect {
-        x: area.x + (area.width - w) / 2,
-        y: area.y + (area.height - h) / 2,
-        width: w,
-        height: h,
-    }
 }
 
 /// Height below which the graph is dropped so the receiver list and logs keep
@@ -606,21 +594,6 @@ mod tests {
             .draw(|frame| render_add_overlay(frame, &state))
             .unwrap();
         assert!(terminal.backend().to_string().contains("add a receiver"));
-    }
-
-    #[test]
-    fn centred_never_exceeds_its_container() {
-        // A popup wider than the terminal would panic ratatui on render.
-        let small = Rect {
-            x: 0,
-            y: 0,
-            width: 20,
-            height: 6,
-        };
-        let r = centred(small, 70, 14);
-        assert!(r.width <= small.width && r.height <= small.height);
-        assert!(r.x + r.width <= small.x + small.width);
-        assert!(r.y + r.height <= small.y + small.height);
     }
 
     #[test]
