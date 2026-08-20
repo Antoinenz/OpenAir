@@ -111,18 +111,25 @@ streaming, it never hands the screen back to a shell.
 Running it with no arguments opens the **picker**:
 
 ```
-┌ OpenAir — 4 found ──────────────────────────────────────────┐
-│  [x] Living Room       AppleTV6,2      192.168.1.106:7000 ✓ │
-│  [ ] Pool Room         ShairportSync   192.168.1.51:7000    │
-│> [x] Kitchen           AudioAccessory  192.168.1.88:7000    │
-└─────────────────────────────────────────────────────────────┘
-  handoff ON   latency 500 ms   volume -8 dB   selected 2
-  ↑↓ move · space select · ⏎ start · h handoff · <> latency · q quit
+┌ OpenAir (4 found) ─────────────────────────────────────────────────────────┐
+│ [x] Living Room         Apple TV 4K     192.168.1.106:7000                 │
+│ [ ] Pool Room           Shairport Sync  192.168.1.51:7000                  │
+│>[x] Kitchen             HomePod mini    192.168.1.88:7000                  │
+│                                                              ┌──────────┐  │
+│                                                              │  ⏎ READY │  │
+└──────────────────────────────────────────────────────────────└──────────┘──┘
+  handoff on · 500 ms · -8 dB · 2 selected   space select · h handoff · <> latency
 ```
 
 Receivers appear as they answer — there's no fixed wait — and **nothing is
 contacted until you press Enter**: names, models and capabilities all come from
-the mDNS record, and the ✓ comes from your local pairings file.
+the mDNS record. Model identifiers are shown as marketing names where we can
+name one with confidence, and left as the raw identifier where we can't, since
+inventing a wrong name is worse than showing none.
+
+The button turns green once you've chosen at least one receiver, so "can I
+start?" is answerable at a glance. Press Enter with nothing selected and it
+turns yellow while the footer explains why.
 
 Press Enter and the flow continues in place:
 
@@ -133,11 +140,40 @@ Press Enter and the flow continues in place:
    If some connect and some don't, streaming starts with the ones that worked;
    if none do, you're returned to the picker with the reason and your selection
    still made, so a retry is one keystroke.
-3. **The dashboard**: latency, bandwidth and now-playing across the top, a
-   rolling **buffer-health** graph (`b` for bandwidth), the live state of each
-   receiver, and a log panel. Buffer health is the number that predicts a
-   dropout — it's what auto-latency watches to decide when to step up — so you
-   can usually see trouble coming.
+3. **The dashboard**:
+
+```
+┌ latency ────────┐┌ bandwidth ───────────┐┌ now playing ─────────────────────┐
+│500 ms           ││1.4 Mbps              ││Talk Talk — It's My Life          │
+│420 ms ahead     ││391 MB                ││                                  │
+└─────────────────┘└──────────────────────┘└──────────────────────────────────┘
+┌ bandwidth over time ───────────────────────────────────────────────────────┐
+│      ▂▃▄▅▆▇█▇▆▅▄▃▂▃▄▅▆▇█▇▆▅▄▃▂▃▄▅▆▇█▇▆▅▄▃▂▃▄▅▆▇█▇▆▅▄▃▂▃▄▅▆▇█▇▆▅▄▃▂▃▄▅▆▇█   │
+└────────────────────────────────────────────────────────────────────────────┘
+  now 1.4 Mbps
+┌ receivers (2)   [+/-] vol · [<>] offset · [a] add · [r] retry · [d] drop ──┐
+│ ▸ Living Room              -6 dB   +80 ms  █████████░  connected           │
+│   Pool Room                +0 dB    +0 ms  ███░░░░░░░  connected           │
+└────────────────────────────────────────────────────────────────────────────┘
+┌ logs   [PgUp/PgDn] scroll ─────────────────────────────────────────────────┐
+│ 14:02:19  INFO  latency stepped up to 550 ms                               │
+└────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Buffer headroom is per receiver**, drawn as the bar on each row: how much of
+the target latency that receiver still has in hand before it runs dry. It's the
+number that predicts a dropout — it's what auto-latency watches to decide when
+to step up — so you can usually see trouble coming, and see *which room* is in
+trouble. The bars move together when auto-latency steps, because headroom is
+measured against the latency currently in force.
+
+The bar is deliberately not a graph. Group headroom has one history but many
+receivers, so a single line could only ever show the group minimum — it could
+never tell you which room was about to cut out. The graph shows bandwidth,
+where one line does say something.
+
+On a narrower terminal the buffer bar goes first, then the graph, then the
+offset column. The receiver list and the log panel are never dropped.
 
 In the dashboard, `↑↓` selects a receiver and:
 
@@ -148,7 +184,6 @@ In the dashboard, `↑↓` selects a receiver and:
 | `a` | add another receiver mid-stream |
 | `r` | retry one that failed |
 | `d` | drop it |
-| `b` | switch the graph between buffer health and bandwidth |
 | `PgUp` / `PgDn` | scroll the log panel |
 | `q` / Ctrl+C | stop |
 
@@ -160,10 +195,14 @@ one summary line — duration, data sent, final latency, and where the log went 
 you passed `--log`. Nothing else is printed during a TUI run; the log panel
 carries the narration instead.
 
-Preferences — handoff, latency, volume, graph choice — persist in
-`settings.json` beside `pairings.json`. Command-line flags override the file for
-that run without rewriting it. Chosen receivers are deliberately *not*
-remembered between runs.
+Preferences — handoff, latency, volume, metadata — persist in `settings.json`
+beside `pairings.json`. Command-line flags override the file for that run
+without rewriting it. Chosen receivers are deliberately *not* remembered
+between runs.
+
+Keybind lines list only what you wouldn't guess. Arrow keys and `q` aren't on
+them, because anyone will try those anyway and naming them crowds out the keys
+that matter. Set `"show_controls": true` in `settings.json` for the full list.
 
 > `--no-tui` gives the plain scrolling output, and is selected automatically
 > when stdout isn't a terminal.

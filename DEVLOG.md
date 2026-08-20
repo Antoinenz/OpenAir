@@ -4,6 +4,108 @@
 
 ---
 
+## 2026-08-21 — Session 17: the dashboard reads per receiver (projects E + C)
+
+**Goal.** Two presentation projects. E reworked the dashboard layout; C made the
+device list read like a finished product.
+
+### The buffer graph was answering the wrong question
+
+The dashboard led with a rolling buffer-health graph. It was the most
+prominent thing on screen and it could not do its job.
+
+Buffer headroom is computed from a **shared anchor line** — one instant every
+receiver's timeline is anchored to — so there is exactly one group-wide
+`min_lead_ms`. A single line could therefore only ever plot the group minimum.
+When two rooms are streaming and one is about to cut out, the graph shows the
+dip but not *which room*, and the room is the only part you can act on.
+
+Headroom moved onto the receiver rows as a ten-cell bar, computed per receiver
+by adding that receiver's `offset_ns` to the group lead. The graph stayed, but
+now plots bandwidth, where one line genuinely does say something.
+
+Health is normalised against the **current** latency rather than a constant.
+Auto-latency moves the target, so a fixed denominator would make every bar jump
+on a step-up and imply a change that had not happened. The visible consequence
+is that the bars do all move together when auto-latency steps — correct, and
+worth knowing before it looks like a bug.
+
+### Trim and offset always show, including `+0`
+
+A column that appears only when non-zero makes the row jump as you adjust it,
+and `+0 dB` states something real: this receiver is at the group level.
+
+### Narrowing drops whole features, not widths
+
+Drop order is buffer bar → graph → offset column; the receiver list and log
+panel are never dropped. Implemented as alternative layouts rather than squeezed
+widgets, so a small terminal looks deliberate instead of broken.
+
+### A test complained about naming and was right
+
+`the_graph_gives_way_on_a_short_terminal` asserted the graph was gone by
+searching for "bandwidth" — which also appeared in the stat box above it. The
+instinct is to make the assertion more specific. The better fix was to rename
+the graph "bandwidth over time", because two panels on one screen sharing a
+title is a real problem for the reader too, not only for the test.
+
+---
+
+### C: the device list
+
+**Pairing markers are gone.** The `✓` and `! needs pairing` marks predicted
+something that, since project B, happens *after* the user confirms. Nobody
+reads a tick as "credentials on disk" anyway. `PickerRow::paired` stays and
+still drives the sort — your usual speakers at the top is the useful half of
+that information — it just stops being drawn.
+
+**A ready button** sits in the bottom-right of the list, overlapping the border.
+Green when a receiver is chosen, so "can I start?" is answerable at a glance
+rather than by counting `[x]`. Pressing Enter with nothing selected turns it
+yellow alongside the footer hint. That colour rides the *hint's* lifetime rather
+than a timer: this screen only redraws on input or discovery, so a timed flash
+would sometimes never be un-drawn.
+
+**Keybind lines list only what you would not guess.** `show_controls` (default
+false) gates the full list. Arrow keys and `q` are not on the short version:
+anyone who has used a terminal will try them, quitting also answers to `Esc` and
+`Ctrl+C`, and naming them crowds out `h handoff` and `<> latency`, which nobody
+would guess. The picker's two footer rows merged into one, with state reading as
+values and keys named separately.
+
+Doing this surfaced a live defect: the logs panel still advertised `[b] graph`,
+a key whose handler project E had deleted. A keybind on screen that does nothing
+is worse than no keybind at all.
+
+### The row cap has one trap, and it is in `chosen()`
+
+Rendering is capped at ~50 rows, extending as the cursor approaches the end.
+**A rendering cap, not a discovery cap** — `DeviceSet` still keeps everything it
+hears, because limiting discovery would mean missing a device that announces
+late, which on a busy network is precisely the receiver someone is waiting for.
+
+The window is therefore a *view* (`rows()`) over full storage (`all_rows`), not
+the storage itself. `chosen()` reads the full list. Had it read the window, a
+receiver selected before more devices arrived would have been silently dropped
+from the stream — the worst failure available here, because nothing on screen
+would say so.
+
+Writing the test for that took three attempts, and the first two failures were
+both the fixture rather than the code:
+
+1. `"Pool Room"` sorts before `"dev-000"` (`P` < `d`), so it never left the
+   window.
+2. Renaming it to sort last still failed — the cursor *anchors to the device it
+   was pointing at* and the window extends to reach the cursor. Correct
+   behaviour, and it meant the selected device was always revealed.
+
+The staging that actually strands a selection is the real one: return from a
+failed connect with the selection remembered as a key, then let a busy network
+fill the list in ahead of it. The cursor never travels, so nothing extends the
+window.
+
+---
+
 ## 2026-08-20 — Session 16: one continuous TUI (project B)
 
 **Goal.** The TUI was two islands with the command line in between: a picker,

@@ -36,7 +36,7 @@
 | `ptp-helper` | ⬜ Stub | — | Privileged binary, IPC to main (Linux ports 319/320; not needed on Windows) |
 | `client` | ✅ Done (v1) | Yes | realtime + buffered pipelines, pairing store + auto-dispatch (pair-verify vs transient), event channel, `StreamStats` snapshot for observers |
 | `apps/cli` | ✅ Done (v1) | Yes | scan, `pair` (PIN), tone/play/capture, devices, restore-audio; name resolution, --volume, --buffered, --latency <ms>, --offset <name=ms>, --handoff[-device] (Windows), --bind <ip>, --no-metadata, --log, --debug [0-2], --no-tui, Ctrl+C |
-| `tui` | ✅ Done (unified flow) | Yes | Library, not a binary — `openair` drives it. One App owns the terminal for the whole run: picker → pairing (in-TUI PIN) → connecting → dashboard, never dropping to a shell. Per-receiver volume/offset, add/remove/retry mid-stream, settings persistence, log panel, panic-safe restore; 141 tests |
+| `tui` | ✅ Done (unified flow) | Yes | Library, not a binary — `openair` drives it. One App owns the terminal for the whole run: picker → pairing (in-TUI PIN) → connecting → dashboard, never dropping to a shell. Per-receiver volume/offset/buffer bar, add/remove/retry mid-stream, ready button, responsive layout, row cap on large networks, settings persistence, log panel, panic-safe restore; 168 tests |
 
 ---
 
@@ -227,6 +227,10 @@ recovers by restarting the receiver, so a clean session is the precondition.
 
 ## Next Steps
 
+0. **Project A — audio quality.** `crates/client/src/source.rs` resamples by
+   linear interpolation. Windows defaults to 48 kHz and 48 → 44.1 is exactly
+   where that damages high frequencies. Test first: set the Windows output to
+   44.1 kHz and listen. If that is it, the fix is `rubato`.
 1. **#22 media controls** — the receiver's pause/play buttons are answered but
    not obeyed; a few toggles reset the session. Log the event message body first.
 2. **Step 9** — hardening (DSCP EF, thread priority, retransmit tuning)
