@@ -623,6 +623,14 @@ struct CaptureRig {
     metadata: Option<openair_capture::nowplaying::MetadataWatcher>,
     /// Keeps the WASAPI loopback running for the stream's lifetime.
     capture: Option<openair_capture::SystemCapture>,
+    /// The ring the running stream's source reads from, and the rate it
+    /// believes the producer is capturing at.
+    ///
+    /// Shared so the capture device can be swapped underneath a live stream:
+    /// the consumer keeps one `Arc` for the whole session and never learns its
+    /// producer was replaced.
+    ring: Option<std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<i16>>>>,
+    rate: Option<std::sync::Arc<std::sync::atomic::AtomicU32>>,
 }
 
 impl CaptureRig {
@@ -638,7 +646,7 @@ impl CaptureRig {
                 let blocking = self.buffered || targets.len() > 1;
                 let seconds = self.seconds;
                 openair_tui::StreamHandle::new(std::thread::spawn(move || {
-                    let mut source = openair_client::CaptureSource::new(
+                    let mut source = openair_client::CaptureSource::new_with_rate(
                         ring,
                         rate,
                         seconds,
@@ -680,6 +688,88 @@ impl CaptureRig {
         }
     }
 
+    /// Apply a settings change that needs platform work.
+    ///
+    /// Only handoff qualifies: latency, volume and metadata reach the stream
+    /// through `StreamCommand`, and `show_controls` is pure rendering.
+    fn apply(
+        &mut self,
+        previous: &openair_tui::Settings,
+        next: &openair_tui::Settings,
+    ) -> Result<(), String> {
+        if previous.handoff == next.handoff {
+            return Ok(());
+        }
+        // No stream running: handoff is a preference until one starts, exactly
+        // as it is when set on the command line. Engaging it here would silence
+        // the speakers while the user is still in the picker.
+        if self.capture.is_none() {
+            return Ok(());
+        }
+        self.swap_capture(next.handoff)
+    }
+
+    /// Switch the capture device without rebuilding the consumer.
+    ///
+    /// The order is about failure, not latency: the new capture is proven
+    /// before the old one is dropped, so a failure leaves a working stream and
+    /// an unchanged setting. The two captures are loopbacks on *different*
+    /// endpoints, which is what makes the overlap safe.
+    #[cfg(windows)]
+    fn swap_capture(&mut self, want_handoff: bool) -> Result<(), String> {
+        let (Some(ring), Some(rate)) = (self.ring.clone(), self.rate.clone()) else {
+            return Err("no capture is running".to_string());
+        };
+
+        // 1. Move the endpoint.
+        let (new_handoff, capture_device) = if want_handoff {
+            let (session, _volume_rx) =
+                start_handoff(self.handoff_device.clone()).map_err(|e| e.to_string())?;
+            let name = session.device_name().to_string();
+            (Some(session), Some(name))
+        } else {
+            // Dropping the session restores the user's previous default device.
+            self.handoff = None;
+            (None, None)
+        };
+
+        // 2. Start the new capture on the shared ring, with the old one still
+        //    running and still feeding it.
+        let cap = match openair_capture::SystemCapture::start_on_ring(
+            capture_device.as_deref(),
+            std::sync::Arc::clone(&ring),
+        ) {
+            Ok(cap) => cap,
+            Err(e) => {
+                // Undo the endpoint move. The old capture never stopped, so the
+                // stream is still fed and the setting simply does not change.
+                drop(new_handoff);
+                return Err(format!("could not start capture: {e}"));
+            }
+        };
+
+        // 3. Clear the ring, publish the new rate, then drop the old capture.
+        //    The rate goes *after* the clear so no block is ever resampled with
+        //    a ratio that does not match the samples in front of it.
+        if let Ok(mut g) = ring.lock() {
+            g.clear();
+        }
+        rate.store(cap.device_rate, std::sync::atomic::Ordering::Relaxed);
+        tracing::info!(
+            device = %cap.device_name,
+            rate = cap.device_rate,
+            "capture device swapped"
+        );
+        self.handoff = new_handoff;
+        self.capture = Some(cap);
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    fn swap_capture(&mut self, _want_handoff: bool) -> Result<(), String> {
+        Err("handoff is only available on Windows".to_string())
+    }
+
     /// Route audio (if asked), start capture, and start the metadata watcher.
     #[allow(clippy::type_complexity)]
     fn prepare(
@@ -688,7 +778,7 @@ impl CaptureRig {
     ) -> Result<
         (
             std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<i16>>>,
-            u32,
+            std::sync::Arc<std::sync::atomic::AtomicU32>,
             Option<std::sync::mpsc::Receiver<f32>>,
             Option<std::sync::mpsc::Receiver<openair_core::metadata::NowPlaying>>,
         ),
@@ -726,7 +816,12 @@ impl CaptureRig {
             rate = cap.device_rate,
             "capturing system audio"
         );
-        let (ring, rate) = (cap.ring.clone(), cap.device_rate);
+        let (ring, rate) = (
+            cap.ring.clone(),
+            std::sync::Arc::new(std::sync::atomic::AtomicU32::new(cap.device_rate)),
+        );
+        self.ring = Some(std::sync::Arc::clone(&ring));
+        self.rate = Some(std::sync::Arc::clone(&rate));
         self.capture = Some(cap);
 
         #[cfg(windows)]
@@ -1132,7 +1227,7 @@ async fn main() -> Result<()> {
         // The rig owns the platform pieces and builds them per launch, so the
         // settings the user leaves the picker with are the ones that apply.
         if use_tui {
-            let mut rig = CaptureRig {
+            let rig = CaptureRig {
                 handoff_device: handoff_device.clone(),
                 no_metadata,
                 seconds,
@@ -1142,10 +1237,24 @@ async fn main() -> Result<()> {
                 #[cfg(windows)]
                 metadata: None,
                 capture: None,
+                ring: None,
+                rate: None,
             };
 
+            // Rc/RefCell rather than Arc/Mutex because both closures stay on
+            // the main thread — the same `!Send` fact about `cpal::Stream` that
+            // lets the rig be rebuilt in place at all.
+            let rig = std::rc::Rc::new(std::cell::RefCell::new(rig));
+            let launch_rig = std::rc::Rc::clone(&rig);
             let launcher: openair_tui::StreamLauncher =
-                Box::new(move |targets, settings, stats, stop| rig.launch(targets, settings, stats, stop));
+                Box::new(move |targets, settings, stats, stop| {
+                    launch_rig
+                        .borrow_mut()
+                        .launch(targets, settings, stats, stop)
+                });
+            let apply_rig = std::rc::Rc::clone(&rig);
+            let applier: openair_tui::SettingsApplier =
+                Box::new(move |old, new| apply_rig.borrow_mut().apply(old, new));
 
             // CLI flags stand in for the saved preferences on this run, so a
             // named `--latency` still wins over settings.json without
@@ -1157,7 +1266,8 @@ async fn main() -> Result<()> {
                 metadata: Some(!no_metadata),
             });
             let mut app =
-                openair_tui::App::new(settings, log_panel.clone(), handoff_available, launcher);
+                openair_tui::App::new(settings, log_panel.clone(), handoff_available, launcher)
+                    .with_applier(applier);
             let start = if receivers.is_empty() {
                 openair_tui::StartAt::Picker
             } else {
