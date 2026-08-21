@@ -184,6 +184,7 @@ In the dashboard, `↑↓` selects a receiver and:
 | `a` | add another receiver mid-stream |
 | `r` | retry one that failed |
 | `d` | drop it |
+| `s` | settings |
 | `PgUp` / `PgDn` | scroll the log panel |
 | `q` / Ctrl+C | stop |
 
@@ -199,6 +200,25 @@ Preferences — handoff, latency, volume, metadata — persist in `settings.json
 beside `pairings.json`. Command-line flags override the file for that run
 without rewriting it. Chosen receivers are deliberately *not* remembered
 between runs.
+
+Press `s` from either the picker or the dashboard for the **settings
+overlay** — handoff, latency, volume, metadata and the keybind-line
+preference.
+
+From the dashboard it is drawn *over* the live frame rather than replacing it,
+so you can watch the buffer bars react while you adjust the latency. That
+feedback loop is the only thing that makes a latency control comprehensible.
+
+Everything on it applies to a running stream. Toggling handoff mid-stream
+switches the Windows default device and moves capture to it without rebuilding
+the audio pipeline. The new capture is started and proven *before* the old one
+is dropped, so if it fails you keep the stream you had and the setting stays
+where it was — the reason appears on the row that caused it.
+
+> Sample rates are followed across the swap. Your speakers at 48 kHz and a
+> virtual cable at 44.1 kHz are different rates, and a consumer that kept
+> resampling at the old ratio would shift *pitch* rather than glitch — easy to
+> misdiagnose as a receiver fault.
 
 Keybind lines list only what you wouldn't guess. Arrow keys and `q` aren't on
 them, because anyone will try those anyway and naming them crowds out the keys

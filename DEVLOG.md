@@ -4,6 +4,90 @@
 
 ---
 
+## 2026-08-21 — Session 18: the settings overlay, and a pitch bug found on the way (project D)
+
+**Goal.** A settings surface reachable both before and during a stream, where
+everything that *can* apply to a running stream does.
+
+### The sample-rate fix was the real find
+
+The plan put it first because it stands alone, and it should have been done
+regardless of this project.
+
+`CaptureSource::new(ring, rate, …)` took the rate **by value**, captured once at
+stream start. `--handoff` swaps the capture device to a virtual cable, and the
+cable need not run at the speakers' rate. A consumer still resampling at the old
+ratio does not glitch — it **shifts pitch**. That is a bug you would chase into
+the receiver, the codec, or the network before suspecting the resampler.
+
+Two details only became visible while writing the code:
+
+- `LinearResampler` caches `resample_ratio` at construction, so "make the rate an
+  atomic" was not the whole change. It needed a `set_rate` that recomputes the
+  ratio **without** re-priming the interpolation bracket — re-priming would put a
+  discontinuity at every device change.
+- `device_rate` also feeds the prebuffer size and both drift thresholds. So the
+  cached `u32` stays and is refreshed once per `fill()`, rather than every
+  derived size becoming an atomic load.
+
+### Ordering, chosen for failure rather than for the gap
+
+The live handoff swap is: move the endpoint → start the new capture on the shared
+ring → clear the ring → publish the new rate → drop the old capture.
+
+The two captures are loopbacks on *different* endpoints, so they can overlap —
+and that is the whole point. If starting the new capture fails, the old one never
+stopped: the stream is still fed, and the setting simply does not change. Tearing
+down first would have meant a settings keystroke could leave the user with no
+audio source and nothing to fall back to.
+
+The rate is published *after* the ring is cleared for the same class of reason:
+otherwise one block gets resampled with a ratio that does not match the samples
+in front of it. The same pitch bug, in miniature.
+
+### The overlay had to keep the dashboard alive
+
+Making settings an overlay rather than a page was justified by "you can watch the
+buffer bars react while you drag the latency". That justification is only true if
+the dashboard underneath keeps *sampling* — and `tick`, `poll_timeout`,
+`finished_summary` and `request_exit` all matched on `Screen::Streaming`
+directly, so opening settings would have frozen the very thing being adjusted
+against.
+
+Fixed with `Screen::streaming()` / `streaming_mut()` accessors that see through
+the overlay, and by making the tick and draw functions recursive. A stream that
+ends while settings are open still finishes and prints its summary.
+
+### The applier closure earned its keep immediately
+
+`openair-tui` does not depend on `openair-capture`, so switching a Windows
+endpoint had to be someone else's job. A closure supplied by the CLI, matching
+the `StreamLauncher` idiom.
+
+The payoff was not architectural purity but testing: "the applier refused, the
+row explains why, the setting reverted, and nothing was written to
+`settings.json`" is a unit test with a two-line fake. No hardware, no unplugging.
+
+`Rc`/`RefCell` shares the rig between the launcher and the applier — not
+`Arc`/`Mutex`, because both closures stay on the main thread. That is the same
+`!Send` fact about `cpal::Stream` that makes rebuilding capture in place possible
+at all.
+
+### A test caught a footer that had quietly outgrown the terminal
+
+Adding `s settings` pushed the full keybind line past 120 columns, so `q quit`
+was being silently truncated off the end. `⏎ start` came off both forms — the
+ready button carries that glyph where the eye already is. A keybind line long
+enough to truncate is worse than a shorter one.
+
+### Note on process
+
+`cargo fmt -p openair-tui` reformatted six files this project never touched. That
+went in its own `style:` commit rather than being buried in a feature commit;
+the crate had never been fully formatted before.
+
+---
+
 ## 2026-08-21 — Session 17: the dashboard reads per receiver (projects E + C)
 
 **Goal.** Two presentation projects. E reworked the dashboard layout; C made the
