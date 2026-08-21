@@ -21,6 +21,7 @@ pub mod picker_ui;
 pub mod rect;
 pub mod settings;
 pub mod settings_screen;
+pub mod settings_ui;
 pub mod term;
 
 pub use app::{App, Screen, StartAt, StreamHandle, StreamLauncher};
