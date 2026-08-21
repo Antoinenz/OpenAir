@@ -116,15 +116,21 @@ impl StreamSession {
         }
         dict.insert("isMultiSelectAirPlay".into(), true.into());
         dict.insert("groupContainsGroupLeader".into(), false.into());
-        dict.insert("model".into(), "OpenAir1,1".into());
-        dict.insert("name".into(), "OpenAir".into());
-        dict.insert("osName".into(), "Windows".into());
-        dict.insert("osVersion".into(), "10".into());
+        // Receivers make presentation decisions from these, so they are not
+        // cosmetic — see crate::identity.
+        let profile = crate::identity::profile();
+        dict.insert("model".into(), profile.model.into());
+        dict.insert("name".into(), profile.name.into());
+        dict.insert("osName".into(), profile.os_name.into());
+        dict.insert("osVersion".into(), profile.os_version.into());
+        if let Some(build) = profile.os_build_version {
+            dict.insert("osBuildVersion".into(), build.into());
+        }
         dict.insert("senderSupportsRelay".into(), false.into());
         dict.insert("sourceVersion".into(), "690.7.1".into());
         dict.insert("statsCollectionEnabled".into(), false.into());
 
-        info!(?timing, sender_id, "SETUP phase 1 (timing)");
+        info!(?timing, sender_id, model = profile.model, os = profile.os_name, "SETUP phase 1 (timing)");
         let resp = self.request_plist("SETUP", None, plist::Value::Dictionary(dict))?;
         self.ports.event_port = get_port(&resp, "eventPort")?;
         self.ports.timing_port = get_port(&resp, "timingPort").unwrap_or(0);

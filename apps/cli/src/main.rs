@@ -1012,6 +1012,17 @@ async fn main() -> Result<()> {
         tracing::info!(sender_id = %id, "using a random sender identity for this run");
     }
 
+    // Diagnostic, same family. We announce model=OpenAir1,1 / osName=Windows,
+    // which is unlike any device a receiver has met; pyatv -- a third-party
+    // sender that works -- impersonates an iPhone instead. Receivers make
+    // presentation decisions from these fields, and an Apple TV showing no
+    // AirPlay UI at all is a presentation decision.
+    let (args, impersonate) = extract_flag(&args, "--impersonate-iphone");
+    if impersonate {
+        let p = openair_rtsp::identity::impersonate_iphone();
+        tracing::info!(model = p.model, os = p.os_name, "impersonating an iPhone for this run");
+    }
+
     // --- Interactive picker -------------------------------------------------
     //
     // Bare `openair` on a terminal opens the TUI picker instead of scanning and

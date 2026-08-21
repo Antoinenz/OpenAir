@@ -45,6 +45,69 @@ pub fn randomise() -> &'static str {
     SENDER_ID.get_or_init(random_mac)
 }
 
+/// The device this sender claims to be, announced in the SETUP plist.
+///
+/// All fields are `&'static str` so a profile can be a `const` and live in
+/// a `OnceLock` without allocation or locking on the read path.
+///
+/// Receivers make presentation decisions from these fields, so what we claim is
+/// not cosmetic.
+pub struct SenderProfile {
+    pub model: &'static str,
+    pub name: &'static str,
+    pub os_name: &'static str,
+    pub os_version: &'static str,
+    /// Absent for OpenAir's own profile; real Apple senders always send one.
+    pub os_build_version: Option<&'static str>,
+}
+
+/// What we are: honest, and unlike anything a receiver has seen before.
+pub const OPENAIR: SenderProfile = SenderProfile {
+    model: "OpenAir1,1",
+    name: "OpenAir",
+    os_name: "Windows",
+    os_version: "10",
+    os_build_version: None,
+};
+
+/// An iPhone, copied field-for-field from pyatv's AirPlay 2 sender — a known
+/// working third-party implementation.
+///
+/// `name` is deliberately *not* copied. It is a free-text label (a real iPhone
+/// sends "Someone's iPhone", pyatv sends "pyatv"), so it cannot be what a
+/// receiver keys behaviour on, and showing "pyatv" on someone's television
+/// would be baffling. Every field that describes the device *class* is copied
+/// exactly.
+pub const IPHONE: SenderProfile = SenderProfile {
+    model: "iPhone14,3",
+    name: "iPhone",
+    os_name: "iPhone OS",
+    os_version: "16.5",
+    os_build_version: Some("20F66"),
+};
+
+static PROFILE: OnceLock<&'static SenderProfile> = OnceLock::new();
+
+/// The profile for this run.
+pub fn profile() -> &'static SenderProfile {
+    PROFILE.get().copied().unwrap_or(&OPENAIR)
+}
+
+/// Claim to be an iPhone for this run.
+///
+/// Diagnostic, behind `--impersonate-iphone`. The open question it exists to
+/// answer: an Apple TV shows no AirPlay UI at all for any session after the
+/// first one following a reboot, and every difference between a working and a
+/// failing run of *ours* has been ruled out — the RTSP exchange is byte
+/// identical. What has not been ruled out is that a receiver treats an unknown
+/// sender model differently from an iPhone.
+///
+/// Idempotent within a run, and for the same reason as [`randomise`]: every
+/// receiver in a group must be told the same thing.
+pub fn impersonate_iphone() -> &'static SenderProfile {
+    PROFILE.get_or_init(|| &IPHONE)
+}
+
 /// A random locally-administered unicast MAC.
 ///
 /// Bit 1 of the first octet set marks it locally administered, and bit 0 clear
@@ -97,6 +160,31 @@ mod tests {
         assert_ne!(a, b);
     }
 
+    #[test]
+    fn the_iphone_profile_matches_pyatv_field_for_field() {
+        // Copied from pyatv's AirPlay 2 sender, which is the known-working
+        // third-party implementation this test exists to imitate. If these
+        // drift, the experiment stops being the one we think we are running.
+        assert_eq!(IPHONE.model, "iPhone14,3");
+        assert_eq!(IPHONE.os_name, "iPhone OS");
+        assert_eq!(IPHONE.os_version, "16.5");
+        assert_eq!(IPHONE.os_build_version, Some("20F66"));
+    }
+
+    #[test]
+    fn openair_sends_no_build_version_and_the_iphone_does() {
+        // Real Apple senders always send one; we never have. That asymmetry is
+        // part of what is being tested, so it is pinned rather than incidental.
+        assert!(OPENAIR.os_build_version.is_none());
+        assert!(IPHONE.os_build_version.is_some());
+    }
+
+    #[test]
+    fn the_profiles_describe_different_devices() {
+        assert_ne!(OPENAIR.model, IPHONE.model);
+        assert_ne!(OPENAIR.os_name, IPHONE.os_name);
+    }
+
     /// The only test that touches the process-wide identity.
     ///
     /// Kept as one test rather than several because `OnceLock` is set once per
@@ -113,5 +201,17 @@ mod tests {
         // A second call must not hand a different identity to a receiver that
         // has already seen the first — that would split a multi-room group.
         assert_eq!(randomise(), first, "randomise is idempotent within a run");
+
+        // The profile global, folded in here for the same reason: OnceLock is
+        // set once per process and tests run in parallel, so two tests each
+        // asserting on it would race on who set it first.
+        assert_eq!(profile().model, OPENAIR.model, "unchanged unless asked");
+        assert_eq!(impersonate_iphone().model, IPHONE.model);
+        assert_eq!(profile().model, IPHONE.model, "the run keeps one profile");
+        assert_eq!(
+            impersonate_iphone().model,
+            IPHONE.model,
+            "idempotent within a run, like the sender id"
+        );
     }
 }
