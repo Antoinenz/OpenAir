@@ -4,6 +4,96 @@
 
 ---
 
+## 2026-08-21 — Session 19: it was never a metadata bug
+
+**Status: open.** Recorded now because four theories were falsified by
+experiment and that is worth more than the theories were.
+
+### The symptom, restated correctly
+
+The Apple TV shows **no AirPlay UI at all** on affected sessions — not a UI with
+missing text. Audio plays normally. So now-playing metadata was never the
+failing mechanism: our DMAP is delivered, accepted with 200 OK, and lands in a
+session that has no screen attached to it.
+
+That is why every send-side audit came back clean. We were auditing the wrong
+half for three sessions.
+
+### The one bit that predicts it
+
+The receiver's `updateInfo` on the reverse event channel carries `flags`. Across
+nine runs:
+
+| flags | AirPlay UI |
+|---|---|
+| `0x20644` → **`0x120644`** | shown |
+| `0x20644` only | never shown |
+
+The differing bit is `0x100000`, `ReceiverSessionIsActive` in the
+reverse-engineering notes. In a working run the receiver sets it and re-announces
+itself ~44 ms after our first metadata push; in a failing run it never does and
+the channel stays silent for the whole session.
+
+Whatever the bit is really called, the correlation is 9/9 and it is machine
+checkable, which makes it the cheapest possible triage: if `0x120644` never
+arrives, do not go looking at the metadata path.
+
+### The pattern
+
+**The first session after a receiver reboot works. Every session after it fails,
+until the next reboot.** Session length, clean `TEARDOWN`, and time between runs
+are all irrelevant.
+
+### Four theories, each killed by an experiment
+
+1. **Orphaned sessions from drops** (session 14's conclusion). Killed: a run with
+   no drops, no reconnects and a clean `TEARDOWN` still failed. Session 14's
+   "only displays on a session that has never dropped" was a correlation with
+   *being the first session after a restart*, not with dropping.
+2. **The unanswered MediaRemote `play`.** The receiver sends
+   `sendMediaRemoteCommand` on the event channel and we answer 200 OK without
+   acting. Killed: a first session that ended before any `play` arrived still
+   poisoned the second.
+3. **A stale per-sender record keyed to our identity.** Every build has announced
+   the same placeholder `deviceID`/`macAddress`. Killed by `--random-sender-id`:
+   two runs, two distinct random identities, second run still failed.
+4. **Something we send differs between runs.** Killed by diffing: the RTSP
+   exchange of a working and a failing run is byte-identical apart from the
+   sender id. Same requests, same responses, same order.
+
+### What that leaves
+
+The state lives inside the receiver, is not keyed to our identity, is not
+reachable by anything we currently send, and is cleared only by a reboot.
+
+**Next test is deliberately not ours:** AirPlay from an iPhone or Mac twice
+consecutively without rebooting. If Apple's own sender gets a UI the second
+time, something a real sender does is missing from our exchange and
+`tools/mitm_proxy.py` across two consecutive sessions will show what. If Apple's
+sender also fails, this is a tvOS 26.6 bug and we stop.
+
+Deciding whether a bug is even ours should have come earlier than the third
+experiment.
+
+### Side results worth keeping
+
+- **`#22`'s payload is now known.** The receiver's command decodes to
+  `type=sendMediaRemoteCommand`, `modernMediaRemoteCommand`, with
+  `kMRMediaRemoteOptionSenderID`, `kMRMediaRemoteOptionCommandID` (a UUID) and
+  `kMRMediaRemoteOptionSendOptionsNumber`; the observed command was `play`.
+  Session 14 asked for exactly this and it is no longer invisible.
+- **`tools/event_channel_dump.py`** decodes every reverse-channel message in a
+  log. The whole investigation ran on it.
+- **`--random-sender-id`** stays, off by default. A clean negative, and the
+  identity is now logged at SETUP so it is one fewer variable in future traces.
+- **Artwork is re-sent on every 10 s resend**, not just on track change. The
+  resend was justified in session 14 as costing "~90 bytes", which is true of the
+  DMAP alone; with art it is 70–250 KB chunked into 1024-byte encrypted frames.
+  Unrelated to this bug — the failure predates any resend — but not what the code
+  intends.
+
+---
+
 ## 2026-08-21 — Session 18: the settings overlay, and a pitch bug found on the way (project D)
 
 **Goal.** A settings surface reachable both before and during a stream, where
