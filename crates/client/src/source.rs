@@ -6,7 +6,7 @@ use std::collections::VecDeque;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -84,6 +84,16 @@ impl LinearResampler {
             prev,
             next,
         }
+    }
+
+    /// Change the source rate mid-stream, keeping the interpolation bracket
+    /// and the fractional position.
+    ///
+    /// Deliberately does **not** re-prime: `prev`/`next` are real samples that
+    /// are still valid, and discarding them would put a discontinuity at every
+    /// device change. Only the rate at which `src_pos` advances changes.
+    pub(crate) fn set_rate(&mut self, src_rate: u32) {
+        self.resample_ratio = f64::from(src_rate) / f64::from(SAMPLE_RATE);
     }
 
     /// True once the source has been exhausted and the last interpolatable
@@ -283,7 +293,17 @@ const DRIFT_DRAIN_TARGET_MS: u32 = 300;
 /// only the `Arc<Mutex<VecDeque<i16>>>` ring crosses the thread boundary.
 pub struct CaptureSource {
     ring: Arc<Mutex<VecDeque<i16>>>,
+    /// The rate the producer is currently capturing at.
+    ///
+    /// Shared rather than owned because `--handoff` can swap the capture
+    /// device mid-stream, and the two devices need not run at the same rate.
+    /// Read once per `fill()` into `device_rate`.
+    rate_source: Arc<AtomicU32>,
+    /// Cached copy of `rate_source`, so the several derived sizes below
+    /// (prebuffer, drift high-water, drain target) stay plain arithmetic.
     device_rate: u32,
+    /// Count of observed rate changes, for tests and diagnostics.
+    rate_changes: u64,
     resampler: LinearResampler,
     /// Total 44100 Hz output frames left to produce, if a max duration was
     /// requested. `None` means stream indefinitely.
@@ -321,7 +341,25 @@ impl CaptureSource {
         max_seconds: Option<u32>,
         stop: Option<Arc<AtomicBool>>,
     ) -> Self {
+        Self::new_with_rate(
+            ring,
+            Arc::new(AtomicU32::new(device_rate)),
+            max_seconds,
+            stop,
+        )
+    }
+
+    /// As [`CaptureSource::new`], but the capture rate is shared and may change
+    /// while the stream runs — which is what happens when `--handoff` switches
+    /// the capture device to a virtual cable running at a different rate.
+    pub fn new_with_rate(
+        ring: Arc<Mutex<VecDeque<i16>>>,
+        rate: Arc<AtomicU32>,
+        max_seconds: Option<u32>,
+        stop: Option<Arc<AtomicBool>>,
+    ) -> Self {
         let frames_remaining = max_seconds.map(|s| u64::from(s) * u64::from(SAMPLE_RATE));
+        let device_rate = rate.load(Ordering::Relaxed);
         // The resampler needs an initial two-frame bracket, but the ring
         // may not have any data yet (capture just started) — prime with
         // silence; fill() waits for the real prebuffer before producing
@@ -330,7 +368,9 @@ impl CaptureSource {
         let resampler = LinearResampler::new(device_rate, || Some([0, 0]));
         CaptureSource {
             ring,
+            rate_source: rate,
             device_rate,
+            rate_changes: 0,
             resampler,
             frames_remaining,
             prebuffer_done: false,
@@ -339,6 +379,31 @@ impl CaptureSource {
             silent_frames: 0,
             blocking: false,
         }
+    }
+
+    /// How many times the capture rate has changed under this source.
+    pub fn rate_changes(&self) -> u64 {
+        self.rate_changes
+    }
+
+    /// Adopt a new capture rate if the producer has changed device.
+    ///
+    /// Compared against the cached value rather than applied unconditionally:
+    /// re-priming on every `fill()` would put a discontinuity in every buffer.
+    /// A zero is ignored — that is an uninitialised atomic, not a real rate.
+    fn sync_rate(&mut self) {
+        let current = self.rate_source.load(Ordering::Relaxed);
+        if current == self.device_rate || current == 0 {
+            return;
+        }
+        tracing::info!(
+            from_hz = self.device_rate,
+            to_hz = current,
+            "capture device rate changed — following it"
+        );
+        self.device_rate = current;
+        self.rate_changes += 1;
+        self.resampler.set_rate(current);
     }
 
     /// Enable blocking mode: `fill()` waits (bounded) for live ring data
@@ -434,6 +499,9 @@ impl AudioSource for CaptureSource {
     }
 
     fn fill(&mut self, buf: &mut [i16]) -> usize {
+        // Before anything reads `device_rate` — the prebuffer size and the
+        // drift thresholds below are all derived from it.
+        self.sync_rate();
         if let Some(stop) = &self.stop {
             if stop.load(Ordering::Relaxed) {
                 return 0;
@@ -831,6 +899,71 @@ mod tests {
         // wait for.
         src.prebuffer_done = true;
         (src, ring)
+    }
+
+    /// As `capture_source_with_ring`, but the rate is shared so a test can
+    /// change it mid-stream the way a device swap does.
+    fn capture_source_with_shared_rate(
+        rate: Arc<AtomicU32>,
+        frames: &[[i16; 2]],
+    ) -> (CaptureSource, Arc<Mutex<VecDeque<i16>>>) {
+        let ring = Arc::new(Mutex::new(VecDeque::new()));
+        {
+            let mut guard = ring.lock().unwrap();
+            for f in frames {
+                guard.push_back(f[0]);
+                guard.push_back(f[1]);
+            }
+        }
+        let mut src = CaptureSource::new_with_rate(ring.clone(), rate, None, None);
+        src.prebuffer_done = true;
+        (src, ring)
+    }
+
+    #[test]
+    fn a_rate_change_is_picked_up_mid_stream() {
+        // The --handoff hazard: the producer is swapped to a device running at
+        // a different rate. A source that keeps resampling at the old ratio
+        // does not glitch -- it shifts pitch, which is easy to misdiagnose as
+        // a receiver fault. So the ratio must follow the atomic.
+        let rate = Arc::new(AtomicU32::new(44_100));
+        let frames = ramp_frames(40_000);
+        let (mut src, ring) = capture_source_with_shared_rate(Arc::clone(&rate), &frames);
+
+        let mut buf = vec![0i16; 2_000];
+
+        let before = ring.lock().unwrap().len();
+        assert!(src.fill(&mut buf) > 0, "produced nothing at 1:1");
+        let consumed_slow = before - ring.lock().unwrap().len();
+
+        // Double the source rate: two source frames now collapse into one
+        // output frame, so the same buffer consumes about twice as much ring.
+        rate.store(88_200, Ordering::Relaxed);
+        let before = ring.lock().unwrap().len();
+        src.fill(&mut buf);
+        let consumed_fast = before - ring.lock().unwrap().len();
+
+        assert_eq!(src.rate_changes(), 1, "the change was observed exactly once");
+        assert!(
+            consumed_fast > consumed_slow * 3 / 2,
+            "the resample ratio did not follow the rate:              {consumed_fast} consumed at 88200 vs {consumed_slow} at 44100"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_rate_does_not_reset_the_resampler() {
+        // Reading the atomic every fill() must not be mistaken for a change,
+        // which would re-prime the interpolation bracket on every call and put
+        // a discontinuity in every buffer.
+        let rate = Arc::new(AtomicU32::new(48_000));
+        let frames = ramp_frames(40_000);
+        let (mut src, _ring) = capture_source_with_shared_rate(rate, &frames);
+
+        let mut buf = vec![0i16; 512];
+        for _ in 0..10 {
+            src.fill(&mut buf);
+        }
+        assert_eq!(src.rate_changes(), 0, "no change was made, none should be seen");
     }
 
     #[test]
