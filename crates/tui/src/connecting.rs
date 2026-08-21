@@ -239,7 +239,11 @@ mod tests {
 
     #[test]
     fn one_receiver_failing_names_its_reason() {
-        let state = with(vec![stat(51, ReceiverState::Failed, Some("try --bind 10.0.0.2"))]);
+        let state = with(vec![stat(
+            51,
+            ReceiverState::Failed,
+            Some("try --bind 10.0.0.2"),
+        )]);
         assert_eq!(
             state.failure_summary(),
             "could not connect: try --bind 10.0.0.2"
@@ -272,7 +276,10 @@ mod tests {
     #[test]
     fn a_failure_without_a_reason_still_reads() {
         let state = with(vec![stat(51, ReceiverState::Failed, None)]);
-        assert_eq!(state.failure_summary(), "could not connect to that receiver");
+        assert_eq!(
+            state.failure_summary(),
+            "could not connect to that receiver"
+        );
     }
 }
 
@@ -329,7 +336,10 @@ pub fn render(frame: &mut Frame, state: &ConnectingState) {
                 };
                 let mut spans = vec![
                     Span::raw(format!("  {:<24}", r.name)),
-                    Span::styled(format!("{:<15}", r.state.label()), Style::default().fg(colour)),
+                    Span::styled(
+                        format!("{:<15}", r.state.label()),
+                        Style::default().fg(colour),
+                    ),
                 ];
                 // The reason matters more than the status word, so give it the
                 // rest of the row rather than truncating it away.
@@ -435,7 +445,10 @@ mod render_tests {
         state.sample(&stats);
 
         let out = draw(100, 30, &state);
-        assert!(out.contains("refused"), "the reason must be on screen: {out}");
+        assert!(
+            out.contains("refused"),
+            "the reason must be on screen: {out}"
+        );
         assert!(out.contains("Living Room"));
     }
 

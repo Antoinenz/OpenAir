@@ -55,7 +55,9 @@ pub fn render(frame: &mut Frame, state: &PairingState) {
     let pin_style = if state.phase() == PairPhase::Verifying {
         Style::default().fg(Color::DarkGray)
     } else {
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(format!("   {cells}"), pin_style))),

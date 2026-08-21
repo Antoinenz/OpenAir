@@ -381,7 +381,11 @@ mod tests {
             s.on_result(Err("incorrect PIN".into()));
         }
         assert_eq!(s.current().unwrap().name, "Pool Room");
-        assert_eq!(s.attempts_left(), MAX_ATTEMPTS, "a fresh device, fresh tries");
+        assert_eq!(
+            s.attempts_left(),
+            MAX_ATTEMPTS,
+            "a fresh device, fresh tries"
+        );
     }
 
     #[test]

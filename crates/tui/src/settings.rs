@@ -200,7 +200,10 @@ mod tests {
 
     fn temp_path(name: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("openair-settings-test-{name}-{}", std::process::id()));
+        p.push(format!(
+            "openair-settings-test-{name}-{}",
+            std::process::id()
+        ));
         p.push(FILE_NAME);
         p
     }
@@ -267,7 +270,10 @@ mod tests {
         std::fs::write(&path, r#"{"version":999,"latency_ms":1234}"#).unwrap();
         let loaded = Settings::load_from(&path);
         assert_eq!(loaded, Settings::default());
-        assert_ne!(loaded.latency_ms, 1234, "must not adopt values we can't vouch for");
+        assert_ne!(
+            loaded.latency_ms, 1234,
+            "must not adopt values we can't vouch for"
+        );
         cleanup(&path);
     }
 
@@ -310,7 +316,11 @@ mod tests {
 
         assert_eq!(effective.latency_ms, 300, "flag wins over file");
         assert!(!effective.handoff, "file wins over built-in default");
-        assert_eq!(effective.volume_db, default_volume(), "default where neither set");
+        assert_eq!(
+            effective.volume_db,
+            default_volume(),
+            "default where neither set"
+        );
     }
 
     #[test]
@@ -361,5 +371,4 @@ mod tests {
         s.nudge_latency(true);
         assert_eq!(s.latency_ms, 500 + LATENCY_STEP_MS);
     }
-
 }

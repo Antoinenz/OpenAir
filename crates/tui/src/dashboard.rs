@@ -742,7 +742,6 @@ mod tests {
         assert_eq!(d.log_scroll, 0, "never negative");
     }
 
-
     #[test]
     fn latency_and_receivers_come_from_the_snapshot() {
         let mut d = dash();

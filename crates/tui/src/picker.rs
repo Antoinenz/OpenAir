@@ -312,9 +312,8 @@ impl PickerState {
 
     fn toggle_handoff(&mut self) -> PickerAction {
         if !self.handoff_available {
-            return self.hint_action(
-                "no virtual audio cable detected — install VB-CABLE to use handoff",
-            );
+            return self
+                .hint_action("no virtual audio cable detected — install VB-CABLE to use handoff");
         }
         self.settings.handoff = !self.settings.handoff;
         PickerAction::None
@@ -538,7 +537,11 @@ mod tests {
         p.insert(device("Zulu", "192.168.1.11", "2", TRANSIENT)); // paired, sorts first
         assert_eq!(p.rows()[0].name, "Zulu");
         assert_eq!(p.chosen().len(), 1);
-        assert_eq!(p.chosen()[0].name, "Alpha", "selection stayed with the device");
+        assert_eq!(
+            p.chosen()[0].name,
+            "Alpha",
+            "selection stayed with the device"
+        );
     }
 
     #[test]
@@ -701,7 +704,10 @@ mod tests {
         p.set_banner("nothing connected");
         assert!(p.banner().is_some());
         p.on_key(KeyCode::Down);
-        assert!(p.banner().is_none(), "a stale explanation becomes furniture");
+        assert!(
+            p.banner().is_none(),
+            "a stale explanation becomes furniture"
+        );
     }
 
     #[test]
