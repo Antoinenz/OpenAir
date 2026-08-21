@@ -999,6 +999,19 @@ async fn main() -> Result<()> {
     let (raw_args, handoff_device) = util::extract_value(&raw_args, "--handoff-device");
     let (args, buffered) = extract_flag(&raw_args, "--buffered");
 
+    // Diagnostic. Every OpenAir run has always announced the same placeholder
+    // deviceID/macAddress, so a receiver sees the same sender device coming
+    // back each time. An Apple TV displays now-playing metadata on the first
+    // session after a reboot and never again until rebooted, which a stale
+    // per-sender record would explain. This presents a fresh identity per run
+    // so that can be tested. Not the default: the identity we announce is
+    // protocol-visible and should change on evidence, not on a hunch.
+    let (args, random_sender_id) = extract_flag(&args, "--random-sender-id");
+    if random_sender_id {
+        let id = openair_rtsp::identity::randomise();
+        tracing::info!(sender_id = %id, "using a random sender identity for this run");
+    }
+
     // --- Interactive picker -------------------------------------------------
     //
     // Bare `openair` on a terminal opens the TUI picker instead of scanning and

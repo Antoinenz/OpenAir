@@ -91,8 +91,10 @@ impl StreamSession {
     pub fn setup_timing(&mut self, timing: TimingConfig) -> Result<(), SessionError> {
         let session_uuid = uuid_v4_ish();
         let mut dict = plist::Dictionary::new();
-        dict.insert("deviceID".into(), "AA:BB:CC:DD:EE:FF".into());
-        dict.insert("macAddress".into(), "AA:BB:CC:DD:EE:FF".into());
+        // One identity for the whole run, shared by every receiver in a group.
+        let sender_id = crate::identity::sender_id();
+        dict.insert("deviceID".into(), sender_id.into());
+        dict.insert("macAddress".into(), sender_id.into());
         dict.insert("sessionUUID".into(), session_uuid.clone().into());
         match timing {
             TimingConfig::Ptp => {
@@ -122,7 +124,7 @@ impl StreamSession {
         dict.insert("sourceVersion".into(), "690.7.1".into());
         dict.insert("statsCollectionEnabled".into(), false.into());
 
-        info!(?timing, "SETUP phase 1 (timing)");
+        info!(?timing, sender_id, "SETUP phase 1 (timing)");
         let resp = self.request_plist("SETUP", None, plist::Value::Dictionary(dict))?;
         self.ports.event_port = get_port(&resp, "eventPort")?;
         self.ports.timing_port = get_port(&resp, "timingPort").unwrap_or(0);

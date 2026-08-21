@@ -1,3 +1,4 @@
+pub mod identity;
 pub mod connection;
 pub mod dmap;
 pub mod session;
