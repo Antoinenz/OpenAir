@@ -20,6 +20,7 @@ pub mod picker;
 pub mod picker_ui;
 pub mod rect;
 pub mod settings;
+pub mod settings_screen;
 pub mod term;
 
 pub use app::{App, Screen, StartAt, StreamHandle, StreamLauncher};
@@ -28,3 +29,4 @@ pub use logs::{LogBuffer, LogLayer, LogLine};
 pub use picker::{PickerAction, PickerRow, PickerState};
 pub use term::is_interactive;
 pub use settings::{Overrides, Settings};
+pub use settings_screen::{SettingsAction, SettingsRow, SettingsState};
