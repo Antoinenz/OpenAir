@@ -440,6 +440,12 @@ const RECONNECT_BACKOFF: Duration = Duration::from_secs(2);
 const UNDERRUN_LEAD_FLOOR: Duration = Duration::from_millis(120);
 /// How much to raise the anchor latency each time underrun risk is detected.
 const AUTO_LATENCY_STEP_MS: u64 = 250;
+
+/// Lowest latency a manual change may request. Mirrors the TUI's
+/// `LATENCY_MIN_MS`; duplicated rather than imported because `client` must not
+/// depend on `tui`. Below this the anchor sits inside one packet of audio and
+/// the stream cannot stay ahead of itself.
+const LATENCY_FLOOR_MS: u64 = 100;
 /// Ceiling for auto-raised latency (a bump-only heuristic never lowers it).
 const AUTO_LATENCY_MAX_MS: u64 = 2000;
 /// Evaluation window: the minimum lead seen over this span is what's compared
@@ -823,6 +829,34 @@ impl BufferedReceiver {
 /// `rtptime` is heard at the shared instant `t_local_ns` (on OUR PTP clock),
 /// translated onto the clock that receiver actually follows and shifted by
 /// its user offset. Used for the initial anchor and for every resume.
+/// Re-anchor every live receiver so the current head plays `latency_ms` from
+/// now, returning the new `anchor_t_local`.
+///
+/// Shared by auto-latency and by a manual latency change from the settings
+/// overlay. Two code paths computing an anchor slightly differently is the kind
+/// of divergence that produces a bug reproducible only one way round.
+///
+/// A receiver that cannot be re-anchored is marked dead; the caller is expected
+/// to `reap_dead` afterwards.
+fn re_anchor_group(
+    ptp: &PtpMaster,
+    group: &mut [BufferedReceiver],
+    latency_ms: u64,
+    rtptime: u32,
+    why: &str,
+) -> u64 {
+    let t_local = ptp_now_ns() + latency_ms * 1_000_000;
+    for r in group.iter_mut() {
+        if r.alive {
+            if let Err(e) = anchor_receiver(ptp, r, t_local, rtptime) {
+                warn!(receiver = %r.name, "{why} anchor failed — dropping: {e}");
+                r.alive = false;
+            }
+        }
+    }
+    t_local
+}
+
 fn anchor_receiver(
     ptp: &PtpMaster,
     r: &mut BufferedReceiver,
@@ -943,6 +977,13 @@ fn apply_command(
     use stats::{StreamCommand, TRIM_MAX_DB, TRIM_MIN_DB};
 
     match cmd {
+        // Owned by the stream loop, which holds the anchor and the master
+        // level. Routed here only if a caller bypasses that dispatch.
+        StreamCommand::SetLatency { .. }
+        | StreamCommand::SetMasterVolume { .. }
+        | StreamCommand::SetMetadataEnabled { .. } => {
+            debug_assert!(false, "a global command reached apply_command");
+        }
         StreamCommand::SetTrim { addr, db } => {
             let db = db.clamp(TRIM_MIN_DB, TRIM_MAX_DB);
             // Update the pending reconnect too, so a receiver that is away
@@ -1291,6 +1332,8 @@ pub fn stream_audio_buffered_multi(
     // Latest now-playing info, re-sent to receivers that rejoin after a drop so
     // a reconnecting room shows the current track instead of a blank screen.
     let mut current_metadata: Option<NowPlaying> = None;
+    // Gates transmission only; the watcher upstream keeps running either way.
+    let mut metadata_enabled = metadata_rx.is_some();
     let mut last_metadata_send = Instant::now();
 
     // Auto-latency: track the minimum play-deadline lead over each window; if
@@ -1362,23 +1405,70 @@ pub fn stream_audio_buffered_multi(
         // paused/priming `continue` paths below.
         if let Some(s) = &stats {
             for cmd in s.drain_commands() {
-                apply_command(
-                    cmd,
-                    &mut group,
-                    &mut handles,
-                    &ptp,
-                    current_volume_db,
-                    anchor_t_local,
-                    anchor_rtptime,
-                    rtptime,
-                );
+                match cmd {
+                    stats::StreamCommand::SetLatency { ms } => {
+                        let ms = ms.clamp(LATENCY_FLOOR_MS, AUTO_LATENCY_MAX_MS);
+                        if ms != current_latency {
+                            info!(from_ms = current_latency, to_ms = ms, "latency changed");
+                            current_latency = ms;
+                            anchor_t_local = re_anchor_group(
+                                &ptp,
+                                &mut group,
+                                current_latency,
+                                rtptime,
+                                "latency change",
+                            );
+                            anchor_rtptime = rtptime;
+                            // Count a manual change as a bump, so auto-latency
+                            // does not immediately step on top of a value the
+                            // user just chose.
+                            last_bump = Instant::now();
+                            reap_dead(&mut group, &mut handles, reconnect);
+                            s.set_latency_ms(current_latency);
+                        }
+                    }
+                    stats::StreamCommand::SetMasterVolume { db } => {
+                        current_volume_db = Some(db);
+                        for r in group.iter_mut() {
+                            if r.alive {
+                                let level = stats::effective_volume_db(db, r.trim_db);
+                                if let Err(e) = r.session.set_volume(level) {
+                                    warn!(receiver = %r.name, "set_volume failed (continuing): {e}");
+                                }
+                            }
+                        }
+                    }
+                    stats::StreamCommand::SetMetadataEnabled { on } => {
+                        info!(enabled = on, "now-playing metadata toggled");
+                        metadata_enabled = on;
+                    }
+                    other => apply_command(
+                        other,
+                        &mut group,
+                        &mut handles,
+                        &ptp,
+                        current_volume_db,
+                        anchor_t_local,
+                        anchor_rtptime,
+                        rtptime,
+                    ),
+                }
             }
         }
 
         // Now-playing metadata: same loop position as volume, so it still runs
         // on the paused/priming `continue` paths below.
         if let Some(rx) = &metadata_rx {
-            if let Some(np) = drain_latest_metadata(rx) {
+            // Drained even while switched off, so the channel does not back up
+            // and switching back on sends the *current* track rather than
+            // replaying a queue. The watcher itself keeps running; only
+            // transmission stops.
+            let latest = drain_latest_metadata(rx);
+            if !metadata_enabled {
+                if let Some(np) = latest {
+                    current_metadata = Some(np);
+                }
+            } else if let Some(np) = latest {
                 info!(title = %np.title, artist = %np.artist, "sending now-playing metadata");
                 for r in group.iter_mut() {
                     if r.alive {
@@ -1557,15 +1647,8 @@ pub fn stream_audio_buffered_multi(
                     // Re-anchor the group deeper: current head plays
                     // `current_latency` from now, giving the receiver buffer
                     // room to refill.
-                    let t_local = ptp_now_ns() + current_latency * 1_000_000;
-                    for r in &mut group {
-                        if r.alive {
-                            if let Err(e) = anchor_receiver(&ptp, r, t_local, rtptime) {
-                                warn!(receiver = %r.name, "auto-latency anchor failed — dropping: {e}");
-                                r.alive = false;
-                            }
-                        }
-                    }
+                    let t_local =
+                        re_anchor_group(&ptp, &mut group, current_latency, rtptime, "auto-latency");
                     reap_dead(&mut group, &mut handles, reconnect);
                     anchor_t_local = t_local;
                     anchor_rtptime = rtptime;

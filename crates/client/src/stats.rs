@@ -100,6 +100,21 @@ pub enum StreamCommand {
     },
     /// Remove a receiver: tear it down and do not reconnect.
     Remove { addr: SocketAddr },
+    /// Set the group anchor latency in ms and re-anchor every live receiver.
+    ///
+    /// Both directions are allowed. Lowering re-anchors *shallower* and may
+    /// underrun immediately, at which point auto-latency raises it back — a
+    /// self-correcting failure, visible in the log panel and the buffer bars.
+    /// Refusing to lower would hide a capability to prevent a failure the
+    /// system already handles.
+    SetLatency { ms: u64 },
+    /// Set the group master volume in dB. Per-receiver trims are relative and
+    /// survive this untouched, which is the property `--handoff`'s volume
+    /// mirroring already depends on.
+    SetMasterVolume { db: f32 },
+    /// Whether now-playing metadata is transmitted. The watcher keeps running
+    /// either way; this gates sending.
+    SetMetadataEnabled { on: bool },
 }
 
 /// Volume trim bounds. Wide enough to balance a quiet room against a loud one,
@@ -485,4 +500,25 @@ mod tests {
         assert_eq!(stats.bytes_sent(), 1000);
         assert_eq!(stats.take_min_lead_ms(), Some(42));
     }
+
+    #[test]
+    fn the_global_commands_round_trip_in_order() {
+        let stats = StreamStats::new(500);
+        assert!(stats.send(StreamCommand::SetLatency { ms: 750 }));
+        assert!(stats.send(StreamCommand::SetMasterVolume { db: -12.0 }));
+        assert!(stats.send(StreamCommand::SetMetadataEnabled { on: false }));
+
+        let drained = stats.drain_commands();
+        assert_eq!(
+            drained,
+            vec![
+                StreamCommand::SetLatency { ms: 750 },
+                StreamCommand::SetMasterVolume { db: -12.0 },
+                StreamCommand::SetMetadataEnabled { on: false },
+            ],
+            "order matters: two latency changes in one tick must not transpose"
+        );
+        assert!(stats.drain_commands().is_empty(), "draining consumes");
+    }
+
 }
