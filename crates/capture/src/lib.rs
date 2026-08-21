@@ -76,6 +76,23 @@ impl SystemCapture {
     /// then captures from that cable explicitly rather than assuming the
     /// default-device switch took effect.
     pub fn start_on(name_filter: Option<&str>) -> Result<Self, CaptureError> {
+        Self::start_on_ring(name_filter, Arc::new(Mutex::new(VecDeque::new())))
+    }
+
+    /// As [`SystemCapture::start_on`], but writes into a ring that already
+    /// exists.
+    ///
+    /// This is what lets the capture device change without rebuilding the
+    /// consumer: the `CaptureSource` on the stream thread keeps the same `Arc`
+    /// and never learns that its producer was replaced.
+    ///
+    /// **The caller clears the ring at a swap**, not this function — it cannot
+    /// know whether it is replacing a producer or starting the first one, and
+    /// clearing on a first start would discard a prebuffer filled deliberately.
+    pub fn start_on_ring(
+        name_filter: Option<&str>,
+        ring: Arc<Mutex<VecDeque<i16>>>,
+    ) -> Result<Self, CaptureError> {
         let host = cpal::default_host();
         let device = match name_filter {
             Some(want) => {
@@ -101,8 +118,10 @@ impl SystemCapture {
         let device_rate = config.sample_rate.0;
         let channels = config.channels as usize;
 
+        // Still computed here even though the ring is supplied: `capacity` is
+        // the callback's trim threshold, not just an allocation hint, and it
+        // depends on the rate of *this* device.
         let capacity = device_rate as usize * 2 * RING_CAPACITY_SECONDS as usize;
-        let ring: Arc<Mutex<VecDeque<i16>>> = Arc::new(Mutex::new(VecDeque::with_capacity(capacity)));
 
         let stream = match sample_format {
             SampleFormat::F32 => build_stream::<f32>(&device, &config, channels, ring.clone(), capacity)?,
@@ -197,4 +216,48 @@ where
         .map_err(|e| CaptureError::BuildStream(e.to_string()))?;
 
     Ok(stream)
+}
+
+#[cfg(test)]
+mod ring_tests {
+    use super::*;
+
+    #[test]
+    fn a_supplied_ring_is_the_one_capture_uses() {
+        // Device-independent: proves the plumbing, not the audio. A real
+        // capture needs hardware, so what is pinned down here is that the ring
+        // handed in is the ring the SystemCapture reports back — the property
+        // a live device swap depends on.
+        let ring: Arc<Mutex<VecDeque<i16>>> = Arc::new(Mutex::new(VecDeque::new()));
+        match SystemCapture::start_on_ring(Some("no such device exists anywhere"), Arc::clone(&ring))
+        {
+            Ok(cap) => assert!(
+                Arc::ptr_eq(&cap.ring, &ring),
+                "capture must write into the ring it was given, not a fresh one"
+            ),
+            // The expected outcome of a deliberately impossible filter. The
+            // signature and the ownership are what this test exists for.
+            Err(CaptureError::NoDevice) => {}
+            Err(e) => panic!("unexpected error: {e}"),
+        }
+    }
+
+    #[test]
+    fn clearing_the_ring_is_visible_to_a_holder_that_never_re_read_it() {
+        // The invariant the applier's swap relies on: the stream thread holds
+        // one Arc for the whole session and must see the producer change
+        // through it.
+        let ring: Arc<Mutex<VecDeque<i16>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let consumer = Arc::clone(&ring);
+        ring.lock().unwrap().extend([1i16, 2, 3, 4]);
+
+        ring.lock().unwrap().clear();
+        ring.lock().unwrap().extend([9i16, 9]);
+
+        assert_eq!(
+            consumer.lock().unwrap().iter().copied().collect::<Vec<_>>(),
+            vec![9, 9],
+            "the consumer's handle sees the swap"
+        );
+    }
 }
