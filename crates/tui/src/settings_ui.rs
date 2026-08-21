@@ -20,11 +20,13 @@ pub fn render(frame: &mut Frame, state: &SettingsState) {
     // gaps between glyphs.
     frame.render_widget(Clear, area);
 
-    let block = Block::default().borders(Borders::ALL).title(if state.streaming() {
-        " settings — changes are live "
-    } else {
-        " settings "
-    });
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(if state.streaming() {
+            " settings — changes are live "
+        } else {
+            " settings "
+        });
     let inner = block.inner(area);
     frame.render_widget(block, area);
 

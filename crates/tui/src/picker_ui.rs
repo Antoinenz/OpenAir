@@ -54,13 +54,17 @@ fn footer(state: &PickerState) -> Line<'static> {
 /// With `show_controls` off this is only what is non-obvious or easy to forget.
 /// Arrow keys to move are neither — anyone will try them — and quitting answers
 /// to `q`, `Esc` and `Ctrl+C`, so a line advertising one of the three earns
-/// little. `⏎ start` is omitted too: the ready button already carries the glyph
-/// where the eye is.
+/// little.
+///
+/// `⏎ start` is omitted from **both** forms: the ready button already carries
+/// that glyph where the eye is, and with `s settings` added the full line
+/// overflowed 120 columns and silently lost `q quit` off the end. A keybind
+/// line long enough to truncate is worse than a shorter one.
 fn controls_text(show_all: bool) -> &'static str {
     if show_all {
-        "↑↓ move · space select · ⏎ start · h handoff · <> latency · q quit"
+        "↑↓ move · space select · h handoff · <> latency · s settings · q quit"
     } else {
-        "space select · h handoff · <> latency"
+        "space select · h handoff · <> latency · s settings"
     }
 }
 
@@ -342,8 +346,11 @@ mod tests {
         assert!(screen.contains("space select"), "the non-obvious ones stay");
         assert!(screen.contains("h handoff"));
         assert!(screen.contains("<> latency"));
-        assert!(!screen.contains("move"), "arrows are guessable:
-{screen}");
+        assert!(
+            !screen.contains("move"),
+            "arrows are guessable:
+{screen}"
+        );
         assert!(!screen.contains("quit"), "q, esc and ctrl+c all work");
     }
 
@@ -374,8 +381,11 @@ mod tests {
 
         let screen = draw(120, 20, &state).backend().to_string();
         for expected in ["handoff on", "500 ms", "-8 dB", "1 selected"] {
-            assert!(screen.contains(expected), "missing {expected}:
-{screen}");
+            assert!(
+                screen.contains(expected),
+                "missing {expected}:
+{screen}"
+            );
         }
     }
 

@@ -168,9 +168,7 @@ impl SettingsState {
                     (self.settings.volume_db + delta).clamp(VOLUME_MIN_DB, VOLUME_MAX_DB);
             }
             SettingsRow::Metadata => self.settings.metadata = !self.settings.metadata,
-            SettingsRow::ShowControls => {
-                self.settings.show_controls = !self.settings.show_controls
-            }
+            SettingsRow::ShowControls => self.settings.show_controls = !self.settings.show_controls,
         }
         SettingsAction::Apply(self.settings.clone())
     }
@@ -212,7 +210,10 @@ mod tests {
 
         s.settings.latency_ms = LATENCY_MIN_MS;
         s.on_key(KeyCode::Left);
-        assert_eq!(s.settings.latency_ms, LATENCY_MIN_MS, "clamped at the floor");
+        assert_eq!(
+            s.settings.latency_ms, LATENCY_MIN_MS,
+            "clamped at the floor"
+        );
 
         s.settings.latency_ms = 500;
         s.on_key(KeyCode::Right);
@@ -323,6 +324,9 @@ mod tests {
         let mut s = state();
         s.set_error(SettingsRow::Handoff, "cable disappeared");
         s.on_key(KeyCode::Down);
-        assert!(s.error().is_none(), "a stale explanation is worse than none");
+        assert!(
+            s.error().is_none(),
+            "a stale explanation is worse than none"
+        );
     }
 }

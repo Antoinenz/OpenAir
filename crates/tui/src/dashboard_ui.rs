@@ -225,27 +225,33 @@ fn render_top(frame: &mut Frame, area: Rect, state: &DashboardState) {
         None => "—".to_string(),
     };
     frame.render_widget(
-        boxed("latency", vec![
-            Line::from(Span::styled(
-                format!("{} ms", state.latency_ms),
-                Style::default().add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(lead, Style::default().fg(Color::DarkGray))),
-        ]),
+        boxed(
+            "latency",
+            vec![
+                Line::from(Span::styled(
+                    format!("{} ms", state.latency_ms),
+                    Style::default().add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(lead, Style::default().fg(Color::DarkGray))),
+            ],
+        ),
         latency,
     );
 
     frame.render_widget(
-        boxed("bandwidth", vec![
-            Line::from(Span::styled(
-                format_bitrate(state.bandwidth_bps()),
-                Style::default().add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
-                format_bytes(state.bytes_total()),
-                Style::default().fg(Color::DarkGray),
-            )),
-        ]),
+        boxed(
+            "bandwidth",
+            vec![
+                Line::from(Span::styled(
+                    format_bitrate(state.bandwidth_bps()),
+                    Style::default().add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    format_bytes(state.bytes_total()),
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ],
+        ),
         bandwidth,
     );
 
@@ -284,8 +290,7 @@ fn boxed<'a>(title: &'a str, lines: Vec<Line<'a>>) -> Paragraph<'a> {
 }
 
 fn render_graph(frame: &mut Frame, area: Rect, state: &DashboardState) {
-    let [chart, footer] =
-        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
+    let [chart, footer] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
 
     // Distinct from the "bandwidth" stat box above: one is the current
     // rate, this is its history.
@@ -393,7 +398,10 @@ fn render_receivers(frame: &mut Frame, area: Rect, state: &DashboardState) {
                     };
                     spans.push(Span::styled(format!(" {bar} "), style));
                 }
-                spans.push(Span::styled(format!(" {}", r.state.label()), row.fg(colour)));
+                spans.push(Span::styled(
+                    format!(" {}", r.state.label()),
+                    row.fg(colour),
+                ));
                 if let Some(why) = &r.error {
                     spans.push(Span::styled(format!("  {why}"), row.fg(Color::Red)));
                 }
@@ -419,9 +427,9 @@ fn render_receivers(frame: &mut Frame, area: Rect, state: &DashboardState) {
 /// and none of them are guessable.
 fn receiver_controls(show_all: bool) -> &'static str {
     if show_all {
-        "   [↑↓] select · [+/-] vol · [<>] offset · [a] add · [r] retry · [d] drop"
+        "   [↑↓] select · [+/-] vol · [<>] offset · [a] add · [r] retry · [d] drop · [s] settings"
     } else {
-        "   [+/-] vol · [<>] offset · [a] add · [r] retry · [d] drop"
+        "   [+/-] vol · [<>] offset · [a] add · [r] retry · [d] drop · [s] settings"
     }
 }
 
@@ -462,7 +470,10 @@ fn render_logs(frame: &mut Frame, area: Rect, buffer: &LogBuffer, state: &Dashbo
             };
             Line::from(vec![
                 Span::styled(format!(" {} ", l.ts), Style::default().fg(Color::DarkGray)),
-                Span::styled(format!("{:<5} ", l.level.as_str()), Style::default().fg(colour)),
+                Span::styled(
+                    format!("{:<5} ", l.level.as_str()),
+                    Style::default().fg(colour),
+                ),
                 Span::raw(l.msg.clone()),
             ])
         })
@@ -474,9 +485,9 @@ fn render_logs(frame: &mut Frame, area: Rect, buffer: &LogBuffer, state: &Dashbo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Instant;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use std::time::Instant;
 
     fn draw(width: u16, height: u16, state: &DashboardState) -> Terminal<TestBackend> {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -628,8 +639,11 @@ mod tests {
         let state = DashboardState::new(500);
         let screen = draw(100, 32, &state).backend().to_string();
         assert!(screen.contains("PgUp/PgDn"), "the real one stays");
-        assert!(!screen.contains("[b] graph"), "the dead one is gone:
-{screen}");
+        assert!(
+            !screen.contains("[b] graph"),
+            "the dead one is gone:
+{screen}"
+        );
     }
 
     #[test]
@@ -651,7 +665,10 @@ mod tests {
     fn the_graph_shows_bandwidth() {
         let state = DashboardState::new(500);
         let terminal = draw(100, 32, &state);
-        assert!(terminal.backend().to_string().contains("bandwidth over time"));
+        assert!(terminal
+            .backend()
+            .to_string()
+            .contains("bandwidth over time"));
     }
 
     #[test]

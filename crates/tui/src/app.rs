@@ -29,7 +29,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use openair_client::{GroupTarget, StreamStats};
+use openair_client::{GroupTarget, StreamCommand, StreamStats};
 use openair_discovery::BrowseHandle;
 
 use crate::connecting::{self, ConnectAction, ConnectOutcome, ConnectingState};
@@ -41,6 +41,8 @@ use crate::pairing_ui;
 use crate::picker::{PickerAction, PickerRow, PickerState};
 use crate::picker_ui;
 use crate::settings::Settings;
+use crate::settings_screen::{SettingsAction, SettingsRow, SettingsState};
+use crate::settings_ui;
 use crate::term;
 
 /// Render/sample rate. Fast enough to feel live, slow enough to be invisible
@@ -75,6 +77,20 @@ pub type StreamLauncher<'a> = Box<
     dyn FnMut(Vec<GroupTarget>, Settings, Arc<StreamStats>, Arc<AtomicBool>) -> StreamHandle + 'a,
 >;
 
+/// Apply a settings change that needs work the TUI cannot do itself —
+/// switching a Windows audio endpoint, above all.
+///
+/// Receives the settings in force before the change and after it, so the
+/// applier acts only on what actually differs. Supplied by the CLI for the same
+/// reason [`StreamLauncher`] is: `openair-tui` does not depend on
+/// `openair-capture`, and that boundary is what keeps this crate testable on
+/// every platform.
+///
+/// Called on the main thread. `cpal::Stream` is `!Send`, so `SystemCapture` —
+/// and the capture rig holding it — never leave the thread that created them,
+/// which is this one.
+pub type SettingsApplier<'a> = Box<dyn FnMut(&Settings, &Settings) -> Result<(), String> + 'a>;
+
 /// A running stream.
 pub struct StreamHandle {
     thread: JoinHandle<Result<(), String>>,
@@ -99,6 +115,8 @@ pub enum Screen {
     Pairing(Box<PairingScreen>),
     Connecting(Box<ConnectingScreen>),
     Streaming(Box<StreamingScreen>),
+    /// The settings overlay, drawn *over* the screen it was opened from.
+    Settings(Box<SettingsScreen>),
 }
 
 impl Screen {
@@ -109,8 +127,39 @@ impl Screen {
             Screen::Pairing(_) => "pairing",
             Screen::Connecting(_) => "connecting",
             Screen::Streaming(_) => "streaming",
+            Screen::Settings(_) => "settings",
         }
     }
+
+    /// The streaming screen, whether it is on top or underneath the settings
+    /// overlay.
+    ///
+    /// Sampling, stopping and the closing summary all have to reach it either
+    /// way. The overlay exists precisely so the user can watch the dashboard
+    /// react while they adjust something — freezing it the moment settings
+    /// opened would defeat the point.
+    fn streaming(&self) -> Option<&StreamingScreen> {
+        match self {
+            Screen::Streaming(s) => Some(s),
+            Screen::Settings(s) => s.origin.streaming(),
+            _ => None,
+        }
+    }
+
+    fn streaming_mut(&mut self) -> Option<&mut StreamingScreen> {
+        match self {
+            Screen::Streaming(s) => Some(s),
+            Screen::Settings(s) => s.origin.streaming_mut(),
+            _ => None,
+        }
+    }
+}
+
+/// The settings overlay, plus the screen it was opened from so closing returns
+/// there rather than to a fixed destination.
+pub struct SettingsScreen {
+    pub state: SettingsState,
+    origin: Box<Screen>,
 }
 
 /// Everything a running stream needs to be observed and stopped.
@@ -166,6 +215,10 @@ pub struct App<'a> {
     logs: LogBuffer,
     settings: Settings,
     launch: StreamLauncher<'a>,
+    /// Applies settings changes that need work this crate cannot do — see
+    /// [`SettingsApplier`]. `None` in tests and on platforms with nothing to
+    /// apply, where a change is simply stored.
+    applier: Option<SettingsApplier<'a>>,
     handoff_available: bool,
     /// Device keys the user last chose, so a return to the picker does not
     /// make them pick again.
@@ -189,6 +242,7 @@ impl<'a> App<'a> {
             logs,
             settings,
             launch,
+            applier: None,
             handoff_available,
             last_selection: Vec::new(),
             quitting: false,
@@ -257,39 +311,118 @@ impl<'a> App<'a> {
     }
 
     /// Per-iteration work that isn't input: draining discovery, sampling stats.
-    fn tick(&mut self) {
-        match &mut self.screen {
-            Screen::Picker(p) => {
-                if let Some(browse) = &p.browse {
-                    while let Ok(device) = browse.devices.try_recv() {
-                        p.state.insert(device);
-                    }
+    /// Supply the closure that applies platform-side settings changes.
+    pub fn with_applier(mut self, applier: SettingsApplier<'a>) -> Self {
+        self.applier = Some(applier);
+        self
+    }
+
+    /// A fresh, empty picker. Used only as a placeholder while another screen
+    /// is moved out from under `&mut self`.
+    fn placeholder(&self) -> Screen {
+        Screen::Picker(Box::new(PickerScreen {
+            state: PickerState::new(self.settings.clone(), Vec::new(), self.handoff_available),
+            browse: None,
+        }))
+    }
+
+    /// Open the settings overlay over whatever is on screen now.
+    pub fn open_settings(&mut self) {
+        let streaming = self.screen.streaming().is_some();
+        let state = SettingsState::new(self.settings.clone(), self.handoff_available, streaming);
+        let placeholder = self.placeholder();
+        let origin = Box::new(std::mem::replace(&mut self.screen, placeholder));
+        self.screen = Screen::Settings(Box::new(SettingsScreen { state, origin }));
+    }
+
+    /// Close the overlay, returning to the screen it was opened from.
+    fn close_settings(&mut self) {
+        let placeholder = self.placeholder();
+        if let Screen::Settings(s) = std::mem::replace(&mut self.screen, placeholder) {
+            self.screen = *s.origin;
+        }
+    }
+
+    /// Apply a settings change, reverting it if the applier refuses.
+    ///
+    /// Order matters: platform work first, then the stream commands, then
+    /// persistence. A setting that could not be applied must never reach
+    /// `settings.json`, or the file would claim a state the program is not in.
+    fn apply_settings(&mut self, previous: Settings, next: Settings) {
+        if let Some(applier) = self.applier.as_mut() {
+            if let Err(why) = applier(&previous, &next) {
+                if let Screen::Settings(s) = &mut self.screen {
+                    s.state.set_error(row_for_change(&previous, &next), why);
+                    s.state.revert(previous);
                 }
-            }
-            Screen::Pairing(p) => {
-                if let Some(result) = p.worker.as_ref().and_then(|w| w.poll()) {
-                    p.worker = None;
-                    p.state.on_result(result);
-                }
-            }
-            Screen::Connecting(c) => {
-                let now = Instant::now();
-                if now.duration_since(c.last_sample) >= TICK {
-                    c.state.sample(&c.running.stats);
-                    c.last_sample = now;
-                }
-            }
-            Screen::Streaming(s) => {
-                // Sampling runs on a clock, not on loop iterations: `event::poll`
-                // returns early when a key arrives, so tying it to the loop made
-                // a held key shrink every measurement window.
-                let now = Instant::now();
-                if now.duration_since(s.last_sample) >= TICK {
-                    s.state.sample(&s.running.stats, now);
-                    s.last_sample = now;
-                }
+                return;
             }
         }
+
+        if let Some(stream) = self.screen.streaming_mut() {
+            let stats = Arc::clone(&stream.running.stats);
+            let queue = |cmd| {
+                if !stats.send(cmd) {
+                    tracing::warn!("could not queue command — stream mailbox unavailable");
+                }
+            };
+            if next.latency_ms != previous.latency_ms {
+                queue(StreamCommand::SetLatency {
+                    ms: next.latency_ms,
+                });
+            }
+            if next.volume_db != previous.volume_db {
+                queue(StreamCommand::SetMasterVolume { db: next.volume_db });
+            }
+            if next.metadata != previous.metadata {
+                queue(StreamCommand::SetMetadataEnabled { on: next.metadata });
+            }
+            stream.state.show_controls = next.show_controls;
+        }
+
+        // The screen underneath keeps its own copy: leaving it stale would show
+        // old values in the picker's footer the moment the overlay closes, and
+        // its `h` key would toggle from the wrong starting point.
+        if let Screen::Settings(s) = &mut self.screen {
+            if let Screen::Picker(p) = s.origin.as_mut() {
+                p.state.settings = next.clone();
+            }
+        }
+
+        self.settings = next;
+        if let Err(e) = self.settings.save() {
+            tracing::warn!("could not save settings: {e}");
+        }
+    }
+
+    /// Key handling for the paths that need no terminal.
+    ///
+    /// `on_key` takes one for the add-receiver overlay, which a unit test
+    /// cannot supply. The settings overlay never needs it, so this exposes the
+    /// same dispatch for the screens that do not.
+    #[cfg(test)]
+    fn on_key_for_test(&mut self, code: KeyCode) {
+        if code == KeyCode::Char('s')
+            && matches!(self.screen, Screen::Picker(_) | Screen::Streaming(_))
+        {
+            self.open_settings();
+            return;
+        }
+        if matches!(self.screen, Screen::Settings(_)) {
+            let previous = self.settings.clone();
+            let Screen::Settings(sc) = &mut self.screen else {
+                unreachable!("just matched");
+            };
+            match sc.state.on_key(code) {
+                SettingsAction::None => {}
+                SettingsAction::Close => self.close_settings(),
+                SettingsAction::Apply(next) => self.apply_settings(previous, next),
+            }
+        }
+    }
+
+    fn tick(&mut self) {
+        tick_screen(&mut self.screen);
         self.advance_from_pairing();
         self.advance_from_connecting();
     }
@@ -375,40 +508,49 @@ impl<'a> App<'a> {
             last_sample: Instant::now(),
         }));
     }
+}
 
-    fn draw(&mut self, terminal: &mut term::Tui) -> io::Result<()> {
-        match &self.screen {
-            Screen::Picker(p) => {
-                terminal.draw(|frame| picker_ui::render(frame, &p.state))?;
-            }
-            Screen::Pairing(p) => {
-                terminal.draw(|frame| pairing_ui::render(frame, &p.state))?;
-            }
-            Screen::Connecting(c) => {
-                terminal.draw(|frame| connecting::render(frame, &c.state))?;
-            }
-            Screen::Streaming(s) => {
-                let logs = &self.logs;
-                terminal.draw(|frame| dashboard_ui::render(frame, &s.state, logs))?;
-            }
+/// Draw one screen. Recursive so the settings overlay draws the screen it was
+/// opened from underneath itself.
+fn render_screen(frame: &mut ratatui::Frame, screen: &Screen, logs: &LogBuffer) {
+    match screen {
+        Screen::Picker(p) => picker_ui::render(frame, &p.state),
+        Screen::Pairing(p) => pairing_ui::render(frame, &p.state),
+        Screen::Connecting(c) => connecting::render(frame, &c.state),
+        Screen::Streaming(s) => dashboard_ui::render(frame, &s.state, logs),
+        Screen::Settings(s) => {
+            render_screen(frame, &s.origin, logs);
+            settings_ui::render(frame, &s.state);
         }
+    }
+}
+
+impl<'a> App<'a> {
+    fn draw(&mut self, terminal: &mut term::Tui) -> io::Result<()> {
+        let screen = &self.screen;
+        let logs = &self.logs;
+        terminal.draw(|frame| render_screen(frame, screen, logs))?;
         Ok(())
     }
 
     /// How long to wait for a key before the next iteration.
     fn poll_timeout(&self) -> Duration {
+        // Through the overlay too: the dashboard underneath still needs its
+        // sampling cadence while settings are open.
+        if let Some(s) = self.screen.streaming() {
+            return poll_timeout(s.last_sample.elapsed());
+        }
         match &self.screen {
             Screen::Connecting(c) => poll_timeout(c.last_sample.elapsed()),
-            Screen::Streaming(s) => poll_timeout(s.last_sample.elapsed()),
             _ => TICK,
         }
     }
 
     /// `Some` once the stream has ended and the app should leave.
     fn finished_summary(&mut self) -> Option<Summary> {
-        let Screen::Streaming(s) = &mut self.screen else {
-            return None;
-        };
+        // Reached through the overlay as well: a stream that ends while the
+        // user has settings open must still finish and print its summary.
+        let s = self.screen.streaming_mut()?;
         if !s.running.stats.ended() {
             return None;
         }
@@ -442,7 +584,28 @@ impl<'a> App<'a> {
             return Ok(());
         }
 
+        // `s` means the same thing on the two screens that offer it, so it is
+        // answered here rather than threaded through two key handlers that
+        // would each have to return a new action for it.
+        if code == KeyCode::Char('s')
+            && matches!(self.screen, Screen::Picker(_) | Screen::Streaming(_))
+        {
+            self.open_settings();
+            return Ok(());
+        }
+
         match &mut self.screen {
+            Screen::Settings(_) => {
+                let previous = self.settings.clone();
+                let Screen::Settings(sc) = &mut self.screen else {
+                    unreachable!("just matched");
+                };
+                match sc.state.on_key(code) {
+                    SettingsAction::None => {}
+                    SettingsAction::Close => self.close_settings(),
+                    SettingsAction::Apply(next) => self.apply_settings(previous, next),
+                }
+            }
             Screen::Picker(p) => match p.state.on_key(code) {
                 PickerAction::Quit => self.quitting = true,
                 PickerAction::Start => {
@@ -522,6 +685,16 @@ impl<'a> App<'a> {
                 self.quitting = true;
             }
             Screen::Picker(_) | Screen::Pairing(_) => self.quitting = true,
+            // Ctrl+C with the overlay open means the same as without it: act
+            // on what is actually running underneath.
+            Screen::Settings(s) => match s.origin.as_ref() {
+                Screen::Streaming(st) => st.running.stop(),
+                Screen::Connecting(c) => {
+                    c.running.stop();
+                    self.quitting = true;
+                }
+                _ => self.quitting = true,
+            },
         }
     }
 
@@ -625,6 +798,67 @@ pub fn targets_from(rows: &[PickerRow]) -> Vec<GroupTarget> {
         .collect()
 }
 
+/// One tick of whatever the screen needs: draining discovery, polling a pair
+/// worker, sampling a stream.
+///
+/// A free function so the settings overlay can recurse into the screen beneath
+/// it. Without that, opening settings over the dashboard would freeze the
+/// buffer bars — and watching them react is the whole reason the settings
+/// panel is an overlay rather than a page.
+fn tick_screen(screen: &mut Screen) {
+    match screen {
+        Screen::Settings(s) => tick_screen(&mut s.origin),
+        Screen::Picker(p) => {
+            if let Some(browse) = &p.browse {
+                while let Ok(device) = browse.devices.try_recv() {
+                    p.state.insert(device);
+                }
+            }
+        }
+        Screen::Pairing(p) => {
+            if let Some(result) = p.worker.as_ref().and_then(|w| w.poll()) {
+                p.worker = None;
+                p.state.on_result(result);
+            }
+        }
+        Screen::Connecting(c) => {
+            let now = Instant::now();
+            if now.duration_since(c.last_sample) >= TICK {
+                c.state.sample(&c.running.stats);
+                c.last_sample = now;
+            }
+        }
+        Screen::Streaming(s) => {
+            // Sampling runs on a clock, not on loop iterations: `event::poll`
+            // returns early when a key arrives, so tying it to the loop made
+            // a held key shrink every measurement window.
+            let now = Instant::now();
+            if now.duration_since(s.last_sample) >= TICK {
+                s.state.sample(&s.running.stats, now);
+                s.last_sample = now;
+            }
+        }
+    }
+}
+
+/// Which row a change belongs to, so a failure lands on the row that caused it.
+///
+/// Falls back to handoff, the only row whose apply can fail today — and the one
+/// a caller with no detectable difference most likely came from.
+fn row_for_change(previous: &Settings, next: &Settings) -> SettingsRow {
+    if previous.latency_ms != next.latency_ms {
+        SettingsRow::Latency
+    } else if previous.volume_db != next.volume_db {
+        SettingsRow::Volume
+    } else if previous.metadata != next.metadata {
+        SettingsRow::Metadata
+    } else if previous.show_controls != next.show_controls {
+        SettingsRow::ShowControls
+    } else {
+        SettingsRow::Handoff
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -669,6 +903,75 @@ mod tests {
             }))
         });
         App::new(Settings::default(), LogBuffer::new(10), false, launch)
+    }
+
+    #[test]
+    fn s_opens_settings_and_esc_returns_to_the_picker() {
+        let started = std::sync::Mutex::new(Vec::new());
+        let mut app = test_app(&started);
+        app.open_settings();
+        assert_eq!(app.screen().name(), "settings");
+
+        app.close_settings();
+        assert_eq!(
+            app.screen().name(),
+            "picker",
+            "closing returns to where it was opened from, not to a fixed screen"
+        );
+    }
+
+    #[test]
+    fn a_failed_apply_reverts_the_setting_and_explains() {
+        // The property the applier closure exists to make testable: no
+        // hardware, no endpoint switch, just "the applier said no".
+        let started = std::sync::Mutex::new(Vec::new());
+        let calls = std::cell::RefCell::new(Vec::new());
+        let applier: SettingsApplier<'_> = Box::new(|old: &Settings, new: &Settings| {
+            calls.borrow_mut().push((old.latency_ms, new.latency_ms));
+            Err("cable disappeared".to_string())
+        });
+        let mut app = test_app(&started).with_applier(applier);
+
+        let before = app.settings.clone();
+        app.open_settings();
+        // Move to latency and step it up.
+        app.on_key_for_test(KeyCode::Down);
+        app.on_key_for_test(KeyCode::Right);
+
+        let Screen::Settings(sc) = &app.screen else {
+            panic!("still on the settings overlay");
+        };
+        assert_eq!(
+            sc.state.settings.latency_ms, before.latency_ms,
+            "reverted to what is actually in force"
+        );
+        assert_eq!(sc.state.error(), Some("cable disappeared"));
+        assert_eq!(sc.state.error_row(), Some(SettingsRow::Latency));
+        assert_eq!(
+            app.settings.latency_ms, before.latency_ms,
+            "a setting that could not be applied must not become the app's"
+        );
+        assert_eq!(calls.borrow().len(), 1, "the applier was consulted once");
+    }
+
+    #[test]
+    fn a_successful_apply_reaches_the_screen_underneath() {
+        // The picker keeps its own copy of the settings. Leaving it stale
+        // would show old values in its footer the moment the overlay closes,
+        // and its `h` key would toggle from the wrong starting point.
+        let started = std::sync::Mutex::new(Vec::new());
+        let mut app = test_app(&started);
+
+        app.open_settings();
+        app.on_key_for_test(KeyCode::Down);
+        app.on_key_for_test(KeyCode::Right);
+        let raised = app.settings.latency_ms;
+        app.close_settings();
+
+        let Screen::Picker(p) = &app.screen else {
+            panic!("back on the picker");
+        };
+        assert_eq!(p.state.settings.latency_ms, raised);
     }
 
     #[test]
@@ -829,7 +1132,11 @@ mod tests {
             panic!("expected the picker");
         };
         p.state.insert(test_device("192.168.1.51"));
-        assert_eq!(p.state.chosen().len(), 1, "still selected when it reappears");
+        assert_eq!(
+            p.state.chosen().len(),
+            1,
+            "still selected when it reappears"
+        );
     }
 
     /// Publish one receiver in `state` and let the app react.
@@ -837,16 +1144,18 @@ mod tests {
         let Screen::Connecting(c) = &mut app.screen else {
             panic!("expected connecting");
         };
-        c.running.stats.set_receivers(vec![openair_client::ReceiverStat {
-            name: "Pool Room".into(),
-            addr: "192.168.1.51:7000".parse().unwrap(),
-            state,
-            offset_ms: 0,
-            trim_db: 0.0,
-            lead_ms: None,
-            health: 0.0,
-            error: error.map(str::to_string),
-        }]);
+        c.running
+            .stats
+            .set_receivers(vec![openair_client::ReceiverStat {
+                name: "Pool Room".into(),
+                addr: "192.168.1.51:7000".parse().unwrap(),
+                state,
+                offset_ms: 0,
+                trim_db: 0.0,
+                lead_ms: None,
+                health: 0.0,
+                error: error.map(str::to_string),
+            }]);
         c.state.sample(&c.running.stats);
         app.advance_from_connecting();
     }

@@ -28,6 +28,6 @@ pub use app::{App, Screen, StartAt, StreamHandle, StreamLauncher};
 pub use dashboard_ui::Summary;
 pub use logs::{LogBuffer, LogLayer, LogLine};
 pub use picker::{PickerAction, PickerRow, PickerState};
-pub use term::is_interactive;
 pub use settings::{Overrides, Settings};
 pub use settings_screen::{SettingsAction, SettingsRow, SettingsState};
+pub use term::is_interactive;
