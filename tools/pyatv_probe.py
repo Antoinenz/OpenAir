@@ -16,7 +16,13 @@ import pyatv  # noqa: E402
 
 
 async def main():
-    ident = sys.argv[1] if len(sys.argv) > 1 else "002324B60750"
+    # Defaults to the Apple TV, not Pool Room: the interesting questions are
+    # all about the Apple TV, and Shairport rejects pyatv's transient
+    # /pair-pin-start with 400 anyway, which looks like a failure but is not.
+    #   Apple TV (test):  3AA1CB971A87
+    #   Living Room:      C869CD679216
+    #   Pool Room:        002324B60750
+    ident = sys.argv[1] if len(sys.argv) > 1 else "3AA1CB971A87"
     wav = sys.argv[2] if len(sys.argv) > 2 else "C:/Users/antoi/AppData/Local/Temp/test.wav"
     loop = asyncio.get_event_loop()
     confs = await pyatv.scan(loop, identifier=ident, timeout=5)
