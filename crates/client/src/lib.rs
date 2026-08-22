@@ -453,6 +453,21 @@ pub fn stream_audio(
 /// ahead of wall-clock playback: while `frames_sent - elapsed_frames` is at
 /// or above this, we sleep briefly instead of encoding/sending more.
 const BUFFERED_LEAD_SAMPLES: i64 = 88_200; // 2s @ 44100 Hz
+
+/// The send-ahead window for a given anchor latency, in samples.
+///
+/// Derived rather than constant. A hardcoded 2 s silently capped the headroom
+/// at 2000 ms however deep the anchor was set, so raising the latency ceiling
+/// without this would have produced a buffer that could never fill to the
+/// number the user asked for.
+///
+/// A little beyond the latency itself, so the loop is not gated at exactly the
+/// depth it is trying to hold — otherwise it spends every window on the
+/// boundary, alternately sleeping and sending.
+fn lead_samples_for(latency_ms: u64) -> i64 {
+    let frames = (latency_ms as i64 * SAMPLE_RATE as i64) / 1000;
+    (frames + frames / 10).max(BUFFERED_LEAD_SAMPLES / 4)
+}
 /// Default PTP lead time before the anchor's rtpTime=0 is scheduled to play.
 /// This IS the end-to-end latency of a buffered stream (plus capture-side
 /// buffering) — the realtime pipeline's ~2 s is fixed by protocol constants,
@@ -512,7 +527,7 @@ const AUTO_LATENCY_STEP_MS: u64 = 250;
 /// the stream cannot stay ahead of itself.
 const LATENCY_FLOOR_MS: u64 = 100;
 /// Ceiling for auto-raised latency (a bump-only heuristic never lowers it).
-const AUTO_LATENCY_MAX_MS: u64 = 2000;
+const AUTO_LATENCY_MAX_MS: u64 = 4000;
 /// Evaluation window: the minimum lead seen over this span is what's compared
 /// against the floor, so a single transient dip can't ratchet latency up.
 const AUTO_LATENCY_WINDOW: Duration = Duration::from_millis(1000);
@@ -1595,7 +1610,7 @@ pub fn stream_audio_buffered_multi(
         if !paused {
             let elapsed_frames =
                 (pace_origin.elapsed().as_secs_f64() * SAMPLE_RATE as f64) as i64;
-            if frames_sent - elapsed_frames >= BUFFERED_LEAD_SAMPLES {
+            if frames_sent - elapsed_frames >= lead_samples_for(current_latency) {
                 std::thread::sleep(Duration::from_millis(10));
                 continue;
             }
@@ -2095,6 +2110,27 @@ mod tests {
         // Headroom went to -400 ms in the reported session; that is the most
         // urgent case, not an edge one.
         assert!(underrun_response(-400_000_000, AUTO_LATENCY_MAX_MS, true).is_some());
+    }
+
+
+    #[test]
+    fn the_send_ahead_window_follows_the_latency() {
+        // A hardcoded 2 s capped headroom at 2000 ms no matter how deep the
+        // anchor was set, so a 3 s buffer could never actually fill.
+        let two_s = lead_samples_for(2000);
+        let three_s = lead_samples_for(3000);
+        assert!(three_s > two_s, "{three_s} should exceed {two_s}");
+        assert!(
+            two_s >= 88_200,
+            "must not gate below the latency it is holding"
+        );
+    }
+
+    #[test]
+    fn a_tiny_latency_still_leaves_a_usable_window() {
+        // Gating at nearly zero would make the loop sleep and wake constantly.
+        assert!(lead_samples_for(0) > 0);
+        assert!(lead_samples_for(100) > 0);
     }
 
 }

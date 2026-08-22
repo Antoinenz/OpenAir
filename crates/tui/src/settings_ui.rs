@@ -12,7 +12,7 @@ use crate::settings_screen::{SettingsRow, SettingsState};
 
 /// Overlay size, borders included. Wide enough for the longest label, its
 /// value, and a short reason on the same line.
-const PANEL: (u16, u16) = (58, 9);
+const PANEL: (u16, u16) = (58, 10);
 
 pub fn render(frame: &mut Frame, state: &SettingsState) {
     let area = crate::rect::centred(frame.area(), PANEL.0, PANEL.1);
@@ -69,6 +69,7 @@ fn row_line(row: SettingsRow, state: &SettingsState, selected: bool) -> Line<'st
         SettingsRow::Volume => ("volume", format!("{:.0} dB", s.volume_db)),
         SettingsRow::Metadata => ("metadata", on_off(s.metadata)),
         SettingsRow::ShowControls => ("controls", on_off(s.show_controls)),
+        SettingsRow::AdaptiveResampling => ("smooth fix", on_off(s.adaptive_resampling)),
     };
 
     let mut spans = vec![

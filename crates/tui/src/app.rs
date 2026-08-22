@@ -885,6 +885,8 @@ fn row_for_change(previous: &Settings, next: &Settings) -> SettingsRow {
         SettingsRow::Metadata
     } else if previous.show_controls != next.show_controls {
         SettingsRow::ShowControls
+    } else if previous.adaptive_resampling != next.adaptive_resampling {
+        SettingsRow::AdaptiveResampling
     } else {
         SettingsRow::Handoff
     }

@@ -35,7 +35,7 @@ use std::collections::VecDeque;
 
 use rubato::audioadapter_buffers::number_to_float::InterleavedNumbers;
 use rubato::{
-    Async, FixedAsync, Indexing, Resampler as _, SincInterpolationParameters,
+    Adjustable as _, Async, FixedAsync, Indexing, Resampler as _, SincInterpolationParameters,
     SincInterpolationType, WindowFunction,
 };
 use tracing::{debug, warn};
@@ -60,6 +60,14 @@ const CHANNELS: usize = 2;
 /// Halving this would halve the delay and still sound excellent, if latency
 /// ever becomes the binding constraint.
 const SINC_LEN: usize = 256;
+
+/// How far the resample ratio may be pushed from nominal, as a factor.
+///
+/// Room for the drift trim to work in. Allocated at construction — rubato
+/// sizes its buffers for the largest input a chunk could need — so this is
+/// deliberately modest rather than generous. Well beyond any trim we would
+/// ever apply; the audible ceiling is a fraction of a percent.
+const MAX_RATIO_RELATIVE: f64 = 1.1;
 
 /// Cutoff as a fraction of the *lower* of the two Nyquist frequencies.
 ///
@@ -90,6 +98,8 @@ enum Mode {
 struct SincState {
     inner: Async<f32>,
     src_rate: u32,
+    /// Current ratio trim, relative to nominal. See `Resampler::set_trim`.
+    trim: f64,
     /// Interleaved i16 scratch, reused every chunk so the audio path does not
     /// allocate. rubato works in f32 internally; the `InterleavedNumbers`
     /// adapter converts on read and write, so nothing here is planar and
@@ -161,6 +171,57 @@ impl Resampler {
             return;
         }
         *self = Resampler::new(src_rate);
+    }
+
+    /// Nudge the resample ratio away from nominal, as a relative factor.
+    ///
+    /// This is how a gap gets closed without a cutout. Consuming slightly more
+    /// input per output frame drains a backlogged capture ring; slightly less
+    /// lets it refill. The audio plays imperceptibly fast or slow while it
+    /// happens — at 0.5% the pitch moves about 8.6 cents, where a semitone is
+    /// 100 — and the alternative is discarding audio or re-anchoring, both of
+    /// which are plainly audible.
+    ///
+    /// `1.0` is nominal. Returns whether the trim could be applied: in
+    /// passthrough there is no filter to retune, and the caller needs to know
+    /// that so it can fall back.
+    ///
+    /// Ramped rather than stepped, so the ratio slews instead of jumping.
+    pub(crate) fn set_trim(&mut self, relative: f64) -> bool {
+        let Mode::Sinc(state) = &mut self.mode else {
+            return false;
+        };
+        if (relative - state.trim).abs() < f64::EPSILON {
+            return true;
+        }
+        match state.inner.set_resample_ratio_relative(relative, true) {
+            Ok(()) => {
+                state.trim = relative;
+                true
+            }
+            Err(e) => {
+                warn!(relative, "resampler refused a trim: {e}");
+                false
+            }
+        }
+    }
+
+    /// The trim currently applied. `1.0` when nominal or in passthrough.
+    pub(crate) fn trim(&self) -> f64 {
+        match &self.mode {
+            Mode::Passthrough => 1.0,
+            Mode::Sinc(s) => s.trim,
+        }
+    }
+
+    /// Whether a trim can be applied at all.
+    ///
+    /// False in passthrough — a source already at the pipeline rate is copied
+    /// bit-for-bit, and there is no filter to retune. Keeping that property is
+    /// worth more than making drift correction universal: someone who has
+    /// matched their device rate by hand has asked for exactly this.
+    pub(crate) fn can_trim(&self) -> bool {
+        matches!(self.mode, Mode::Sinc(_))
     }
 
     /// True once no further output can be produced.
@@ -358,7 +419,7 @@ fn build_sinc(src_rate: u32) -> Option<SincState> {
     // caller asks for a buffer's worth of output.
     let inner = Async::<f32>::new_sinc(
         f64::from(SAMPLE_RATE) / f64::from(src_rate),
-        1.0,
+        MAX_RATIO_RELATIVE,
         &params,
         CHUNK_FRAMES,
         CHANNELS,
@@ -371,6 +432,7 @@ fn build_sinc(src_rate: u32) -> Option<SincState> {
     Some(SincState {
         inner,
         src_rate,
+        trim: 1.0,
         input: vec![0; in_cap],
         input_frames: 0,
         output: vec![0; out_cap],
@@ -573,4 +635,102 @@ mod tests {
         let mut r = Resampler::new(48_000);
         assert_eq!(r.fill(&mut [], || Some([0, 0])), 0);
     }
+
+    #[test]
+    fn a_trim_changes_how_much_input_is_consumed() {
+        // The mechanism the gap-closing depends on: for the same amount of
+        // output, a trim below nominal eats more of the source. That is what
+        // drains a backlogged capture ring without discarding anything.
+        fn consumed(trim: f64) -> usize {
+            let input = tone(1_000.0, 48_000, 200_000);
+            let mut r = Resampler::new(48_000);
+            assert!(r.set_trim(trim), "48k is resampled, so trim must apply");
+            let mut iter = input.iter().copied();
+            let mut taken = 0usize;
+            let mut buf = vec![0i16; 2048];
+            let mut produced = 0usize;
+            while produced < 40_000 {
+                let n = r.fill(&mut buf, || {
+                    let v = iter.next();
+                    if v.is_some() {
+                        taken += 1;
+                    }
+                    v
+                });
+                if n == 0 {
+                    break;
+                }
+                produced += n;
+            }
+            taken
+        }
+
+        let nominal = consumed(1.0);
+        let faster = consumed(0.99);
+        let slower = consumed(1.01);
+        assert!(
+            faster > nominal,
+            "a low trim should consume more input: {faster} vs {nominal}"
+        );
+        assert!(
+            slower < nominal,
+            "a high trim should consume less input: {slower} vs {nominal}"
+        );
+    }
+
+    #[test]
+    fn a_trim_is_reported_back() {
+        let mut r = Resampler::new(48_000);
+        assert_eq!(r.trim(), 1.0, "starts nominal");
+        assert!(r.can_trim());
+        assert!(r.set_trim(0.997));
+        assert!((r.trim() - 0.997).abs() < 1e-9);
+    }
+
+    #[test]
+    fn passthrough_refuses_a_trim_rather_than_pretending() {
+        // A matched device is copied bit-for-bit and there is no filter to
+        // retune. The caller has to know, so it can fall back rather than
+        // believe a correction was applied.
+        let mut r = Resampler::new(SAMPLE_RATE);
+        assert!(!r.can_trim());
+        assert!(!r.set_trim(0.99));
+        assert_eq!(r.trim(), 1.0);
+    }
+
+    #[test]
+    fn an_absurd_trim_is_refused_not_applied() {
+        // Beyond what was allocated at construction. Refusing keeps the
+        // stream at a ratio the resampler can actually honour.
+        let mut r = Resampler::new(48_000);
+        assert!(!r.set_trim(5.0));
+        assert_eq!(r.trim(), 1.0, "left at nominal after a refusal");
+    }
+
+    #[test]
+    fn a_trimmed_stream_is_still_clean() {
+        // Being slightly off-speed must not cost audio quality -- the whole
+        // point is that the listener cannot tell.
+        let input = tone(15_000.0, 48_000, 48_000);
+        let mut r = Resampler::new(48_000);
+        assert!(r.set_trim(0.995));
+        let mut iter = input.iter().copied();
+        let mut out = Vec::new();
+        let mut buf = vec![0i16; 2048];
+        while out.len() < 40_000 {
+            let n = r.fill(&mut buf, || iter.next());
+            if n == 0 {
+                break;
+            }
+            for i in 0..n {
+                out.push([buf[i * 2], buf[i * 2 + 1]]);
+            }
+        }
+        let level = rms_dbfs(&out, 4_000);
+        assert!(
+            (level - INPUT_DBFS).abs() < 1.0,
+            "a trimmed 15 kHz tone should keep its level, got {level:.1} dBFS"
+        );
+    }
+
 }

@@ -644,6 +644,9 @@ impl CaptureRig {
         match self.prepare(&settings) {
             Ok((ring, rate, volume_rx, metadata_rx)) => {
                 let blocking = self.buffered || targets.len() > 1;
+                // Close ring drift by trimming the resample ratio instead of
+                // discarding audio -- see CaptureSource::apply_drift_control.
+                let adaptive = settings.adaptive_resampling;
                 let seconds = self.seconds;
                 openair_tui::StreamHandle::new(std::thread::spawn(move || {
                     let mut source = openair_client::CaptureSource::new_with_rate(
@@ -651,7 +654,8 @@ impl CaptureRig {
                         rate,
                         seconds,
                         Some(stop),
-                    );
+                    )
+                    .with_drift_trim(adaptive);
                     // Buffered pipelines send ahead of realtime; a live source
                     // must rate-limit them by blocking for data rather than
                     // padding silence, which sounds like chopped audio for the

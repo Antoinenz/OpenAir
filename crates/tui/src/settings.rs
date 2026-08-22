@@ -25,7 +25,7 @@ const CURRENT_VERSION: u32 = 2;
 const FILE_NAME: &str = "settings.json";
 
 pub const LATENCY_MIN_MS: u64 = 100;
-pub const LATENCY_MAX_MS: u64 = 2000;
+pub const LATENCY_MAX_MS: u64 = 4000;
 pub const LATENCY_STEP_MS: u64 = 50;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -48,6 +48,14 @@ pub struct Settings {
     /// list back.
     #[serde(default = "default_show_controls")]
     pub show_controls: bool,
+    /// Close capture-ring drift by trimming the resample ratio rather than by
+    /// discarding audio.
+    ///
+    /// On by default. Off restores the older behaviour, which discards a
+    /// backlog above a threshold -- audible when it fires, and the reason a
+    /// network stall used to cost the buffer permanently.
+    #[serde(default = "default_adaptive_resampling")]
+    pub adaptive_resampling: bool,
 }
 
 fn default_version() -> u32 {
@@ -68,6 +76,9 @@ fn default_metadata() -> bool {
 fn default_show_controls() -> bool {
     false
 }
+fn default_adaptive_resampling() -> bool {
+    true
+}
 
 impl Default for Settings {
     fn default() -> Self {
@@ -78,6 +89,7 @@ impl Default for Settings {
             volume_db: default_volume(),
             metadata: default_metadata(),
             show_controls: default_show_controls(),
+            adaptive_resampling: default_adaptive_resampling(),
         }
     }
 }

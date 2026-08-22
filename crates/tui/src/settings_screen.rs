@@ -26,14 +26,16 @@ pub enum SettingsRow {
     Volume,
     Metadata,
     ShowControls,
+    AdaptiveResampling,
 }
 
-const ROWS: [SettingsRow; 5] = [
+const ROWS: [SettingsRow; 6] = [
     SettingsRow::Handoff,
     SettingsRow::Latency,
     SettingsRow::Volume,
     SettingsRow::Metadata,
     SettingsRow::ShowControls,
+    SettingsRow::AdaptiveResampling,
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -169,6 +171,9 @@ impl SettingsState {
             }
             SettingsRow::Metadata => self.settings.metadata = !self.settings.metadata,
             SettingsRow::ShowControls => self.settings.show_controls = !self.settings.show_controls,
+            SettingsRow::AdaptiveResampling => {
+                self.settings.adaptive_resampling = !self.settings.adaptive_resampling
+            }
         }
         SettingsAction::Apply(self.settings.clone())
     }

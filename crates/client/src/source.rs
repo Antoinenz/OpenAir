@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use hound::{SampleFormat, WavReader};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::resample::Resampler;
 use crate::{AudioSource, SAMPLE_RATE};
@@ -170,12 +170,48 @@ const PREBUFFER_POLL_MS: u64 = 5;
 const BLOCKING_WAIT_MS: u64 = 60;
 
 /// Ring exceeding this many ms of buffered audio indicates the sender is
-/// falling behind the device's capture rate (clock drift or a stalled RTP
-/// pacing loop); [`CaptureSource::fill`] drains it back down to avoid
-/// unbounded latency growth.
+/// falling behind the device's capture rate; without drift trim, the ring is
+/// drained back down to avoid unbounded latency growth.
+///
+/// **Discarding is the fallback, not the plan.** It is what caused a
+/// three-room session to lose its buffer permanently: a 1.5 s network stall
+/// left 1.5 s of audio in the ring — exactly the audio needed to catch back
+/// up — and the very next `fill()` threw 1.2 s of it away as though it were
+/// drift. Headroom went from 2000 ms to 800 ms and stayed there.
 const DRIFT_HIGH_WATER_MS: u32 = 1000;
-/// Target ms of buffered audio left after a drift-guard drain.
+/// Target ms of buffered audio left after a drain.
 const DRIFT_DRAIN_TARGET_MS: u32 = 300;
+
+/// Ring level the drift trim holds, in ms.
+///
+/// Enough to absorb capture-callback jitter, small enough that it is not
+/// itself a source of latency.
+const RING_TARGET_MS: u32 = 250;
+
+/// Error band inside which no trim is applied at all.
+///
+/// Without it the ratio would wander continuously on ordinary jitter. Inside
+/// the band the resampler runs at exactly nominal.
+const RING_DEADBAND_MS: u32 = 60;
+
+/// Ring error producing full trim deflection.
+const RING_FULL_SCALE_MS: u32 = 500;
+
+/// Largest ratio deviation the trim will apply.
+///
+/// 0.5% moves the pitch about 8.6 cents, where a semitone is 100 — inaudible
+/// on music unless you are listening for it. Correcting a 500 ms deficit at
+/// this rate takes ~100 s, which is the trade: slow and unnoticeable, against
+/// instant and obvious.
+const MAX_DRIFT_TRIM: f64 = 0.005;
+
+/// Beyond this the ring is drained regardless of trim.
+///
+/// A backstop for the case trim cannot fix in time — the capture ring is only
+/// [`RING_CAPACITY_SECONDS`](openair_capture) long, and the callback drops the
+/// oldest samples once it is full. Discarding deliberately here is better than
+/// letting the producer do it arbitrarily.
+const RING_PANIC_MS: u32 = 3000;
 
 /// Live system-audio capture source: resamples from a shared ring buffer
 /// (filled by `openair_capture::SystemCapture` on a cpal callback thread,
@@ -196,6 +232,9 @@ pub struct CaptureSource {
     device_rate: u32,
     /// Count of observed rate changes, for tests and diagnostics.
     rate_changes: u64,
+    /// Close ring-level error by trimming the resample ratio rather than by
+    /// discarding audio. See [`CaptureSource::apply_drift_control`].
+    drift_trim: bool,
     resampler: Resampler,
     /// Total 44100 Hz output frames left to produce, if a max duration was
     /// requested. `None` means stream indefinitely.
@@ -258,6 +297,7 @@ impl CaptureSource {
             rate_source: rate,
             device_rate,
             rate_changes: 0,
+            drift_trim: true,
             resampler,
             frames_remaining,
             prebuffer_done: false,
@@ -360,22 +400,101 @@ impl CaptureSource {
         self.prebuffer_done = true;
     }
 
-    /// If the ring has accumulated more than `DRIFT_HIGH_WATER_MS` of
-    /// audio, drain it down to `DRIFT_DRAIN_TARGET_MS`. The producer (cpal
-    /// callback) and consumer (this resampler, paced by the RTP send loop)
-    /// run on independent clocks; without this guard a persistent drift
-    /// would grow buffered latency without bound.
-    fn apply_drift_guard(&self) {
-        let high_water = (self.device_rate as u64 * 2 * u64::from(DRIFT_HIGH_WATER_MS) / 1000) as usize;
-        let target = (self.device_rate as u64 * 2 * u64::from(DRIFT_DRAIN_TARGET_MS) / 1000) as usize;
-        let mut guard = self.ring.lock().unwrap();
-        if guard.len() > high_water {
-            let drain = guard.len() - target;
-            debug!(
-                ring_len = guard.len(),
-                drain, "capture ring overfull, draining for drift"
+    /// Enable or disable closing ring-level error by ratio trim.
+    ///
+    /// Disabled falls back to discarding audio above the high-water mark,
+    /// which is the older behaviour and audible when it fires.
+    pub fn with_drift_trim(mut self, enabled: bool) -> Self {
+        self.drift_trim = enabled;
+        self
+    }
+
+    /// The trim currently applied to the resample ratio, for observers.
+    pub fn drift_trim_ratio(&self) -> f64 {
+        self.resampler.trim()
+    }
+
+    /// Hold the capture ring near [`RING_TARGET_MS`].
+    ///
+    /// The producer (a cpal callback on the device's clock) and the consumer
+    /// (this source, paced by the RTP send loop) run on independent clocks, so
+    /// the ring level wanders. A network stall makes it jump.
+    ///
+    /// Both are corrected the same way: nudge the resample ratio so slightly
+    /// more or slightly less source audio is consumed per output frame, and
+    /// let the error close over tens of seconds. Nothing is discarded and
+    /// nothing is re-anchored — the audio is imperceptibly fast or slow while
+    /// it happens.
+    ///
+    /// Falls back to discarding when trim is off, or when the source is at the
+    /// pipeline rate and is therefore being copied bit-for-bit with no filter
+    /// to retune.
+    fn apply_drift_control(&mut self) {
+        let level_ms = self.ring_ms();
+
+        // Backstop first: past this the producer would start dropping the
+        // oldest samples itself, and a deliberate drain beats an arbitrary one.
+        if level_ms > RING_PANIC_MS {
+            self.drain_ring_to(RING_TARGET_MS);
+            warn!(
+                level_ms,
+                "capture ring far beyond what trim can absorb — draining"
             );
-            guard.drain(..drain);
+            return;
+        }
+
+        if !self.drift_trim || !self.resampler.can_trim() {
+            if level_ms > DRIFT_HIGH_WATER_MS {
+                debug!(level_ms, "capture ring overfull, draining for drift");
+                self.drain_ring_to(DRIFT_DRAIN_TARGET_MS);
+            }
+            return;
+        }
+
+        let target = self.resampler_trim_for(level_ms);
+        if (target - self.resampler.trim()).abs() > f64::EPSILON {
+            debug!(
+                level_ms,
+                trim = target,
+                "adjusting resample ratio to close ring drift"
+            );
+            self.resampler.set_trim(target);
+        }
+    }
+
+    /// The trim that should be applied at a given ring level.
+    ///
+    /// A ring above target means audio is piling up, so *more* of it should be
+    /// consumed per output frame — which is a ratio below nominal. Below
+    /// target is the reverse. Quantised so ordinary jitter does not re-ramp
+    /// the resampler on every packet.
+    fn resampler_trim_for(&self, level_ms: u32) -> f64 {
+        let error = f64::from(level_ms) - f64::from(RING_TARGET_MS);
+        if error.abs() <= f64::from(RING_DEADBAND_MS) {
+            return 1.0;
+        }
+        let norm = (error / f64::from(RING_FULL_SCALE_MS)).clamp(-1.0, 1.0);
+        let trim = 1.0 - norm * MAX_DRIFT_TRIM;
+        (trim * 10_000.0).round() / 10_000.0
+    }
+
+    /// Buffered audio in the ring, in ms.
+    fn ring_ms(&self) -> u32 {
+        let samples = self.ring.lock().map(|g| g.len()).unwrap_or(0) as u64;
+        let per_ms = u64::from(self.device_rate) * 2 / 1000;
+        if per_ms == 0 {
+            return 0;
+        }
+        (samples / per_ms) as u32
+    }
+
+    fn drain_ring_to(&self, target_ms: u32) {
+        let keep = (u64::from(self.device_rate) * 2 * u64::from(target_ms) / 1000) as usize;
+        if let Ok(mut guard) = self.ring.lock() {
+            if guard.len() > keep {
+                let drain = guard.len() - keep;
+                guard.drain(..drain);
+            }
         }
     }
 }
@@ -429,7 +548,7 @@ impl AudioSource for CaptureSource {
             self.wait_for_frames(max_frames);
         }
 
-        self.apply_drift_guard();
+        self.apply_drift_control();
 
         let ring = &self.ring;
         let written = self
@@ -848,13 +967,13 @@ mod tests {
         let overfull_seconds = 2u32;
         let frame_count = device_rate as usize * overfull_seconds as usize;
         let frames = ramp_frames(frame_count);
-        let (src, ring) = capture_source_with_ring(device_rate, None, &frames);
+        let (mut src, ring) = capture_source_with_ring(device_rate, None, &frames);
 
         // Sanity: ring holds ~2s of stereo audio before the guard runs.
         let before = ring.lock().unwrap().len();
         assert_eq!(before, frame_count * 2);
 
-        src.apply_drift_guard();
+        src.apply_drift_control();
 
         let after = ring.lock().unwrap().len();
         let target_samples = (device_rate as u64 * 2 * u64::from(DRIFT_DRAIN_TARGET_MS) / 1000) as usize;
@@ -863,4 +982,94 @@ mod tests {
             "drift guard should drain ring down to the target watermark"
         );
     }
+
+    #[test]
+    fn a_backlogged_ring_is_trimmed_away_not_thrown_away() {
+        // The bug this whole mechanism exists for. A network stall leaves the
+        // ring holding exactly the audio needed to catch back up; the old
+        // guard discarded it on the very next fill(), so the buffer headroom
+        // never recovered. At a resampled rate the ring must survive intact.
+        let device_rate = 48_000u32;
+        // 1.5 s: past the old high-water mark, so the old guard would have
+        // discarded most of it.
+        let frames = ramp_frames(device_rate as usize * 3 / 2);
+        let (mut src, ring) = capture_source_with_ring(device_rate, None, &frames);
+
+        let before = ring.lock().unwrap().len();
+        src.apply_drift_control();
+        let after = ring.lock().unwrap().len();
+
+        assert_eq!(after, before, "nothing may be discarded while trim can act");
+        assert!(
+            src.drift_trim_ratio() < 1.0,
+            "an overfull ring should trim below nominal to consume faster, got {}",
+            src.drift_trim_ratio()
+        );
+    }
+
+    #[test]
+    fn trim_disabled_falls_back_to_discarding() {
+        let device_rate = 48_000u32;
+        // Comfortably past the high-water mark rather than exactly on it.
+        let frames = ramp_frames(device_rate as usize * 3 / 2);
+        let (src, ring) = capture_source_with_ring(device_rate, None, &frames);
+        let mut src = src.with_drift_trim(false);
+
+        src.apply_drift_control();
+        let after = ring.lock().unwrap().len();
+        let target = (device_rate as u64 * 2 * u64::from(DRIFT_DRAIN_TARGET_MS) / 1000) as usize;
+        assert_eq!(after, target, "the older behaviour is still available");
+    }
+
+    #[test]
+    fn an_extreme_backlog_is_drained_even_with_trim_on() {
+        // Trim cannot close several seconds before the capture callback starts
+        // dropping the oldest samples itself. A deliberate drain beats an
+        // arbitrary one.
+        let device_rate = 48_000u32;
+        let frames = ramp_frames(device_rate as usize * 4);
+        let (mut src, ring) = capture_source_with_ring(device_rate, None, &frames);
+
+        src.apply_drift_control();
+        let after = ring.lock().unwrap().len();
+        let target = (device_rate as u64 * 2 * u64::from(RING_TARGET_MS) / 1000) as usize;
+        assert_eq!(after, target);
+    }
+
+    #[test]
+    fn the_trim_law_points_the_right_way() {
+        let device_rate = 48_000u32;
+        let (src, _ring) = capture_source_with_ring(device_rate, None, &[]);
+
+        // Above target: consume faster, so below nominal.
+        assert!(src.resampler_trim_for(RING_TARGET_MS + 400) < 1.0);
+        // Below target: consume slower, so above nominal.
+        assert!(src.resampler_trim_for(0) > 1.0);
+        // At target: exactly nominal, no pitch change at all.
+        assert_eq!(src.resampler_trim_for(RING_TARGET_MS), 1.0);
+    }
+
+    #[test]
+    fn the_trim_law_has_a_deadband_and_a_ceiling() {
+        let device_rate = 48_000u32;
+        let (src, _ring) = capture_source_with_ring(device_rate, None, &[]);
+
+        // Ordinary jitter must not move the ratio, or it would re-ramp
+        // constantly for no reason.
+        assert_eq!(src.resampler_trim_for(RING_TARGET_MS + RING_DEADBAND_MS), 1.0);
+        assert_eq!(
+            src.resampler_trim_for(RING_TARGET_MS.saturating_sub(RING_DEADBAND_MS)),
+            1.0
+        );
+
+        // And a huge error cannot produce an audible speed change.
+        let extreme = src.resampler_trim_for(RING_TARGET_MS + 10_000);
+        assert!(
+            (extreme - (1.0 - MAX_DRIFT_TRIM)).abs() < 1e-6,
+            "clamped to the ceiling, got {extreme}"
+        );
+        let extreme_low = src.resampler_trim_for(0);
+        assert!(extreme_low <= 1.0 + MAX_DRIFT_TRIM + 1e-6);
+    }
+
 }
