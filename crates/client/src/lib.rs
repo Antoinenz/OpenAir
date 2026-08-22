@@ -21,6 +21,7 @@ use openair_timing::{ptp_now_ns, ptp_ns_to_secs_frac, PtpMaster};
 use tracing::{debug, info, trace, warn};
 
 mod pairings;
+mod resample;
 mod source;
 mod stats;
 pub use pairings::PairingStore;

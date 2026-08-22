@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use hound::{SampleFormat, WavReader};
 use tracing::debug;
 
+use crate::resample::Resampler;
 use crate::{AudioSource, SAMPLE_RATE};
 
 /// Generates a sine tone at `freq` Hz for a fixed duration. Reproduces the
@@ -51,114 +52,14 @@ impl AudioSource for SineSource {
     }
 }
 
-/// Linear-interpolation resampler from an arbitrary source sample rate to
-/// the pipeline's fixed 44100 Hz, operating on interleaved stereo i16
-/// frames.
-///
-/// Callers supply source frames one at a time via `next_source_frame`
-/// (`None` means the source is exhausted); the resampler keeps its
-/// fractional position and interpolation bracket (`prev`/`next`) across
-/// calls to [`fill`](LinearResampler::fill), so a source can be pulled
-/// incrementally across many `fill` calls without re-priming.
-pub(crate) struct LinearResampler {
-    /// Fractional read position in the *source* sample-rate timeline.
-    /// Always advances by `resample_ratio` per output frame produced.
-    src_pos: f64,
-    resample_ratio: f64,
-    /// Previous and next source stereo frame, bracketing `src_pos`, used for
-    /// interpolation. `next` is `None` once the source is exhausted.
-    prev: [i16; 2],
-    next: Option<[i16; 2]>,
-}
-
-impl LinearResampler {
-    /// Creates a resampler for `src_rate` -> 44100 Hz. `next_source_frame`
-    /// is called twice to prime the initial interpolation bracket.
-    pub(crate) fn new(src_rate: u32, mut next_source_frame: impl FnMut() -> Option<[i16; 2]>) -> Self {
-        let resample_ratio = f64::from(src_rate) / f64::from(SAMPLE_RATE);
-        let prev = next_source_frame().unwrap_or([0, 0]);
-        let next = next_source_frame();
-        LinearResampler {
-            src_pos: 0.0,
-            resample_ratio,
-            prev,
-            next,
-        }
-    }
-
-    /// Change the source rate mid-stream, keeping the interpolation bracket
-    /// and the fractional position.
-    ///
-    /// Deliberately does **not** re-prime: `prev`/`next` are real samples that
-    /// are still valid, and discarding them would put a discontinuity at every
-    /// device change. Only the rate at which `src_pos` advances changes.
-    pub(crate) fn set_rate(&mut self, src_rate: u32) {
-        self.resample_ratio = f64::from(src_rate) / f64::from(SAMPLE_RATE);
-    }
-
-    /// True once the source has been exhausted and the last interpolatable
-    /// frame has been emitted (i.e. `fill` will produce no more output).
-    pub(crate) fn is_exhausted(&self) -> bool {
-        self.next.is_none()
-    }
-
-    /// Produces up to `buf.len()/2` resampled stereo frames into `buf`,
-    /// pulling additional source frames from `next_source_frame` as needed.
-    /// Returns the number of frames written.
-    pub(crate) fn fill(
-        &mut self,
-        buf: &mut [i16],
-        mut next_source_frame: impl FnMut() -> Option<[i16; 2]>,
-    ) -> usize {
-        let max_frames = buf.len() / 2;
-        let mut written = 0;
-
-        while written < max_frames {
-            let Some(next) = self.next else {
-                // No more source frames to interpolate towards; stop.
-                break;
-            };
-
-            // Linear interpolation between prev (at floor(src_pos)) and
-            // next (at floor(src_pos)+1), using the fractional part of
-            // src_pos as the blend weight.
-            let frac = self.src_pos.fract();
-            let l = lerp(self.prev[0], next[0], frac);
-            let r = lerp(self.prev[1], next[1], frac);
-            buf[written * 2] = l;
-            buf[written * 2 + 1] = r;
-            written += 1;
-
-            self.src_pos += self.resample_ratio;
-
-            // Advance the source frame bracket until it straddles the new
-            // src_pos (normally one step; can be more if resample_ratio > 1,
-            // i.e. downsampling from a higher source rate).
-            while self.src_pos >= 1.0 {
-                self.src_pos -= 1.0;
-                self.prev = next;
-                self.next = next_source_frame();
-                if self.next.is_none() {
-                    break;
-                }
-            }
-            if self.next.is_none() {
-                // Emitted the last interpolatable frame; stop after this.
-                break;
-            }
-        }
-
-        written
-    }
-}
 
 /// Reads a WAV file and yields interleaved stereo i16 samples at 44100 Hz,
 /// regardless of the file's native format.
 ///
 /// Supported inputs: 16-bit integer PCM or 32-bit float, 1 or 2 channels,
 /// any sample rate. Mono is duplicated to both channels; float samples are
-/// scaled by `i16::MAX` with clamping; sample rates other than 44100 Hz are
-/// converted with a simple linear-interpolation resampler.
+/// scaled by `i16::MAX` with clamping; sample rates other than 44100 Hz go
+/// through [`crate::resample::Resampler`].
 ///
 /// Decoding happens incrementally in [`fill`](AudioSource::fill): the
 /// decoder keeps a small internal buffer of source-rate stereo frames rather
@@ -167,12 +68,12 @@ pub struct WavSource {
     reader: WavReader<BufReader<File>>,
     src_channels: u16,
     sample_format: SampleFormat,
-    resampler: LinearResampler,
+    resampler: Resampler,
 }
 
 impl WavSource {
     pub fn open(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
-        let mut reader = WavReader::open(path)?;
+        let reader = WavReader::open(path)?;
         let spec = reader.spec();
 
         if spec.channels != 1 && spec.channels != 2 {
@@ -194,12 +95,7 @@ impl WavSource {
             }
         }
 
-        let resampler = LinearResampler::new(spec.sample_rate, || {
-            read_stereo_frame(&mut reader, spec.channels, spec.sample_format)
-        });
-        // The closure's borrow of `reader` ends here (`new` only calls it
-        // synchronously to prime the bracket), so `reader` is free to move
-        // into the struct below.
+        let resampler = Resampler::new(spec.sample_rate);
 
         Ok(WavSource {
             reader,
@@ -257,10 +153,6 @@ impl AudioSource for WavSource {
     }
 }
 
-fn lerp(a: i16, b: i16, t: f64) -> i16 {
-    let v = f64::from(a) + (f64::from(b) - f64::from(a)) * t;
-    v.round().clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i16
-}
 
 /// Minimum amount of device-rate audio (in ms) buffered in the ring before
 /// the first `fill()` call starts producing output. Absorbs startup jitter
@@ -304,7 +196,7 @@ pub struct CaptureSource {
     device_rate: u32,
     /// Count of observed rate changes, for tests and diagnostics.
     rate_changes: u64,
-    resampler: LinearResampler,
+    resampler: Resampler,
     /// Total 44100 Hz output frames left to produce, if a max duration was
     /// requested. `None` means stream indefinitely.
     frames_remaining: Option<u64>,
@@ -360,12 +252,7 @@ impl CaptureSource {
     ) -> Self {
         let frames_remaining = max_seconds.map(|s| u64::from(s) * u64::from(SAMPLE_RATE));
         let device_rate = rate.load(Ordering::Relaxed);
-        // The resampler needs an initial two-frame bracket, but the ring
-        // may not have any data yet (capture just started) — prime with
-        // silence; fill() waits for the real prebuffer before producing
-        // output, and by the time it does, pull_ring_frame will be reading
-        // live data anyway.
-        let resampler = LinearResampler::new(device_rate, || Some([0, 0]));
+        let resampler = Resampler::new(device_rate);
         CaptureSource {
             ring,
             rate_source: rate,
@@ -562,9 +449,10 @@ impl AudioSource for CaptureSource {
             }
             total = max_frames;
             if self.resampler.is_exhausted() {
-                // Re-arm the resampler so subsequent fills resume pulling
-                // from the ring instead of reporting exhausted forever.
-                self.resampler = LinearResampler::new(self.device_rate, || Some([0, 0]));
+                // Re-arm rather than rebuild: a rebuild would throw away the
+                // filter's history and put a discontinuity at every moment the
+                // ring briefly ran dry, which on a live capture is often.
+                self.resampler.rearm();
             }
         }
 
@@ -781,98 +669,11 @@ mod tests {
         }
     }
 
-    // -- LinearResampler --------------------------------------------------
-
-    /// Builds a source of `n` stereo frames with a distinct ramp value per
-    /// frame (L=2*i, R=2*i+1, clamped to i16), consumed via an index cursor.
+    /// A rising ramp, so a test can tell one frame from another.
     fn ramp_frames(n: usize) -> Vec<[i16; 2]> {
         (0..n)
             .map(|i| [(2 * i) as i16, (2 * i + 1) as i16])
             .collect()
-    }
-
-    #[test]
-    fn linear_resampler_identity_at_44100_passes_through() {
-        let frames = ramp_frames(1000);
-        let mut idx = 0usize;
-        let mut resampler = LinearResampler::new(44100, || {
-            let f = frames.get(idx).copied();
-            idx += 1;
-            f
-        });
-
-        let mut buf = [0i16; 352 * 2];
-        let written = resampler.fill(&mut buf, || {
-            let f = frames.get(idx).copied();
-            idx += 1;
-            f
-        });
-
-        // Identity resample ratio (44100 -> 44100): frame count should
-        // match exactly, and since consecutive ramp values are close, the
-        // interpolated output should equal the source almost exactly.
-        assert_eq!(written, 352);
-    }
-
-    #[test]
-    fn linear_resampler_48000_to_44100_frame_count_ratio() {
-        // 48000 Hz source, request enough output for ~1 second: expect
-        // ~44100 frames consumed from ~48000 source frames (ratio ~0.919).
-        let total_src = 48000usize;
-        let frames = ramp_frames(total_src);
-        let mut idx = 0usize;
-        let mut pull = || {
-            let f = frames.get(idx).copied();
-            idx += 1;
-            f
-        };
-        let mut resampler = LinearResampler::new(48000, &mut pull);
-
-        let mut total_written = 0u64;
-        loop {
-            let mut buf = [0i16; 352 * 2];
-            let written = resampler.fill(&mut buf, &mut pull);
-            total_written += written as u64;
-            if written < 352 {
-                // Source exhausted mid-fill; stop.
-                break;
-            }
-        }
-
-        let expected = (total_src as f64 * 44100.0 / 48000.0) as i64;
-        assert!(
-            (total_written as i64 - expected).abs() <= 2,
-            "total_written={total_written}, expected ~{expected}"
-        );
-    }
-
-    #[test]
-    fn linear_resampler_is_continuous_across_calls() {
-        // Ramp source with a constant per-frame step; verify no discontinuity
-        // (beyond the expected per-frame step) at the boundary between two
-        // separate fill() calls.
-        let frames = ramp_frames(2000);
-        let mut idx = 0usize;
-        let mut pull = || {
-            let f = frames.get(idx).copied();
-            idx += 1;
-            f
-        };
-        let mut resampler = LinearResampler::new(44100, &mut pull);
-
-        let mut buf1 = [0i16; 352 * 2];
-        let mut buf2 = [0i16; 352 * 2];
-        assert_eq!(resampler.fill(&mut buf1, &mut pull), 352);
-        assert_eq!(resampler.fill(&mut buf2, &mut pull), 352);
-
-        let last = buf1[buf1.len() - 2];
-        let first = buf2[0];
-        // Ramp advances by 2 per source frame at 1:1 resample ratio; allow
-        // a little slack for interpolation rounding.
-        assert!(
-            (i32::from(first) - i32::from(last)).abs() <= 4,
-            "discontinuity across fill() calls: last={last}, first={first}"
-        );
     }
 
     // -- CaptureSource ------------------------------------------------------
