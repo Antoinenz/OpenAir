@@ -20,10 +20,12 @@ use openair_rtsp::{StreamFormat, StreamSession, TimingConfig};
 use openair_timing::{ptp_now_ns, ptp_ns_to_secs_frac, PtpMaster};
 use tracing::{debug, info, trace, warn};
 
+mod mediaremote;
 mod pairings;
 mod resample;
 mod source;
 mod stats;
+pub use mediaremote::{set_media_handler_fn as set_media_handler, MediaCommand};
 pub use pairings::PairingStore;
 pub use source::{CaptureSource, SineSource, WavSource};
 pub use stats::{
@@ -225,6 +227,12 @@ fn event_reader(mut rdr: TcpStream, mut wtr: TcpStream, event_keys: Option<([u8;
                             session_active = flags & 0x10_0000 != 0,
                             "receiver status flags"
                         );
+                    }
+                    // Act on it before answering: the receiver is waiting on
+                    // the reply, and a remote that responds only after the
+                    // next round trip feels broken.
+                    if let Some(cmd) = mediaremote::parse(&request) {
+                        mediaremote::dispatch(cmd);
                     }
                     let response = event_response(&request);
                     match tx.encrypt(&response) {

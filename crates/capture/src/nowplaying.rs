@@ -48,6 +48,68 @@ pub enum MetadataError {
     SessionManager(String),
 }
 
+/// A transport action to apply to the machine's current media session.
+///
+/// Mirrors `openair_client::MediaCommand` without depending on it: `client`
+/// depends on `capture`, so the type cannot come from there. The mapping is
+/// the caller's job, which keeps this crate free of AirPlay concepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    Play,
+    Pause,
+    TogglePlayPause,
+    Next,
+    Previous,
+    Stop,
+}
+
+/// Apply a transport action to whatever Windows is currently playing.
+///
+/// This is how an Apple TV remote reaches Spotify: the receiver asks the
+/// sender to play, and the sender's media session is the thing that can.
+///
+/// Runs on the calling thread and initialises COM there if needed, because it
+/// is invoked from the event-channel thread rather than the one the metadata
+/// watcher owns. Returns whether the session accepted it — `false` covers both
+/// "nothing is playing" and "the player refused", which are not worth
+/// distinguishing to a caller that can only log either way.
+pub fn control(action: Transport) -> Result<bool, MetadataError> {
+    // Tolerates an apartment that another component already initialised, and
+    // only uninitialises what it owns -- same rule as handoff's ComGuard.
+    let owned = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
+    let result = control_inner(action);
+    if owned {
+        unsafe { CoUninitialize() };
+    }
+    result
+}
+
+fn control_inner(action: Transport) -> Result<bool, MetadataError> {
+    let manager = GlobalSystemMediaTransportControlsSessionManager::RequestAsync()
+        .and_then(|op| op.get())
+        .map_err(|e| MetadataError::SessionManager(e.to_string()))?;
+
+    let Ok(session) = manager.GetCurrentSession() else {
+        debug!(?action, "no active media session to control");
+        return Ok(false);
+    };
+
+    let accepted = match action {
+        Transport::Play => session.TryPlayAsync().and_then(|op| op.get()),
+        Transport::Pause => session.TryPauseAsync().and_then(|op| op.get()),
+        Transport::TogglePlayPause => {
+            session.TryTogglePlayPauseAsync().and_then(|op| op.get())
+        }
+        Transport::Next => session.TrySkipNextAsync().and_then(|op| op.get()),
+        Transport::Previous => session.TrySkipPreviousAsync().and_then(|op| op.get()),
+        Transport::Stop => session.TryStopAsync().and_then(|op| op.get()),
+    }
+    .map_err(|e| MetadataError::SessionManager(e.to_string()))?;
+
+    debug!(?action, accepted, "applied transport command");
+    Ok(accepted)
+}
+
 /// Identify an image by magic bytes. Returns the MIME type, or `None` for
 /// anything we don't recognise — we skip unknown formats rather than
 /// mislabel them, since a wrong Content-Type is worse than no artwork.

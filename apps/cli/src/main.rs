@@ -1006,6 +1006,7 @@ async fn main() -> Result<()> {
     // per-sender record would explain. This presents a fresh identity per run
     // so that can be tested. Not the default: the identity we announce is
     // protocol-visible and should change on evidence, not on a hunch.
+    let (args, no_media_controls) = extract_flag(&args, "--no-media-controls");
     let (args, random_sender_id) = extract_flag(&args, "--random-sender-id");
     if random_sender_id {
         let id = openair_rtsp::identity::randomise();
@@ -1017,6 +1018,38 @@ async fn main() -> Result<()> {
     // sender that works -- impersonates an iPhone instead. Receivers make
     // presentation decisions from these fields, and an Apple TV showing no
     // AirPlay UI at all is a presentation decision.
+    // The receiver's own remote. An Apple TV asks the *sender* to play or
+    // skip, and since OpenAir streams system audio there is no OpenAir
+    // playback to act on -- the command belongs to whatever Windows is
+    // actually playing. So it goes to SMTC, the same media session the
+    // now-playing metadata is read from.
+    #[cfg(windows)]
+    if !no_media_controls {
+        openair_client::set_media_handler(|cmd| {
+            use openair_capture::nowplaying::Transport;
+            use openair_client::MediaCommand;
+            let action = match cmd {
+                MediaCommand::Play => Transport::Play,
+                MediaCommand::Pause => Transport::Pause,
+                MediaCommand::TogglePlayPause => Transport::TogglePlayPause,
+                MediaCommand::NextTrack => Transport::Next,
+                MediaCommand::PreviousTrack => Transport::Previous,
+                MediaCommand::Stop => Transport::Stop,
+            };
+            // Never propagate: this runs on the thread that keeps the session
+            // alive, and losing audio because a media key failed would be a
+            // poor trade.
+            match openair_capture::nowplaying::control(action) {
+                Ok(true) => {}
+                Ok(false) => tracing::debug!(
+                    command = cmd.as_str(),
+                    "no media session accepted the command"
+                ),
+                Err(e) => tracing::warn!(command = cmd.as_str(), "media command failed: {e}"),
+            }
+        });
+    }
+
     let (args, impersonate) = extract_flag(&args, "--impersonate-iphone");
     if impersonate {
         let p = openair_rtsp::identity::impersonate_iphone();
