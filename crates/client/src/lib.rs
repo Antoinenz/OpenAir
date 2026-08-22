@@ -111,6 +111,26 @@ fn rtsp_message_len(msg: &[u8]) -> Option<usize> {
 ///
 /// The receiver only needs acknowledgement; it carries no body. `CSeq` must be
 /// echoed back or the request is treated as unanswered.
+/// Pull `flags=0x...` out of a receiver's event-channel message.
+///
+/// The message is a binary plist, but the receiver embeds its own mDNS TXT
+/// record inside it as plain ASCII, so the value can be read without decoding
+/// the plist. Returns `None` when absent, which is normal for messages that are
+/// not `updateInfo`.
+fn receiver_status_flags(body: &[u8]) -> Option<u64> {
+    const NEEDLE: &[u8] = b"flags=0x";
+    let start = body
+        .windows(NEEDLE.len())
+        .position(|w| w == NEEDLE)?
+        + NEEDLE.len();
+    let hex: String = body[start..]
+        .iter()
+        .take_while(|b| b.is_ascii_hexdigit())
+        .map(|&b| b as char)
+        .collect();
+    u64::from_str_radix(&hex, 16).ok()
+}
+
 fn event_response(request: &[u8]) -> Vec<u8> {
     let head = header_block_end(request).unwrap_or(request.len());
     let headers = String::from_utf8_lossy(&request[..head]);
@@ -188,6 +208,23 @@ fn event_reader(mut rdr: TcpStream, mut wtr: TcpStream, event_keys: Option<([u8;
                         hex = %request.iter().map(|b| format!("{b:02x}")).collect::<String>(),
                         "event message (full)"
                     );
+                    // The receiver's statusFlags, pulled straight out of the
+                    // plist body. It embeds its mDNS TXT record as plain ASCII
+                    // ("flags=0x120644"), so a substring scan gets it without
+                    // decoding the bplist.
+                    //
+                    // Logged at INFO because it is the single most diagnostic
+                    // value we receive: bit 0x100000 tracks whether the
+                    // receiver has actually activated a session, and an Apple
+                    // TV that never sets it shows no AirPlay UI at all. See
+                    // DEVLOG session 19 / task #29.
+                    if let Some(flags) = receiver_status_flags(&request) {
+                        info!(
+                            flags = %format!("{flags:#x}"),
+                            session_active = flags & 0x10_0000 != 0,
+                            "receiver status flags"
+                        );
+                    }
                     let response = event_response(&request);
                     match tx.encrypt(&response) {
                         Ok(framed) => match std::io::Write::write_all(&mut wtr, &framed) {
@@ -1880,4 +1917,40 @@ mod tests {
         assert_eq!(drain_latest_volume(&rx), Some(-8.0));
         assert_eq!(drain_latest_volume(&rx), None);
     }
+
+    #[test]
+    fn status_flags_are_read_out_of_a_plist_body() {
+        // Real shape: the flag string is embedded in binary plist noise, so the
+        // scan has to survive non-UTF-8 either side of it.
+        let mut body = vec![0x00, 0xff, 0xfe, b'b', b'p', b'l', b'i', b's', b't'];
+        body.extend_from_slice(b"gid=X(flags=0x120644(igl=1");
+        body.extend_from_slice(&[0xff, 0x00]);
+        let flags = receiver_status_flags(&body).unwrap();
+        assert_eq!(flags, 0x12_0644);
+        assert!(flags & 0x10_0000 != 0, "session-active bit");
+    }
+
+    #[test]
+    fn the_inactive_flag_value_reads_as_inactive() {
+        // The value seen on every run where the Apple TV showed no UI.
+        let body = b"flags=0x20644(igl=1".to_vec();
+        let flags = receiver_status_flags(&body).unwrap();
+        assert_eq!(flags, 0x2_0644);
+        assert!(flags & 0x10_0000 == 0, "not active");
+    }
+
+    #[test]
+    fn a_message_without_flags_yields_none() {
+        assert!(receiver_status_flags(b"no flags here at all").is_none());
+        assert!(receiver_status_flags(b"").is_none());
+    }
+
+    #[test]
+    fn a_truncated_flag_value_does_not_panic() {
+        // The scan runs on whatever the receiver sent; a cut-off message must
+        // not take the event thread down.
+        assert!(receiver_status_flags(b"flags=0x").is_none());
+        assert_eq!(receiver_status_flags(b"flags=0x1").unwrap(), 1);
+    }
+
 }
