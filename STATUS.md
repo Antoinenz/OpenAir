@@ -34,7 +34,7 @@
 | `timing` | ✅ Done | Yes | NTP responder + PTP master with BMCA yield: tracks foreign grandmaster (offset EWMA), answers Delay_Req |
 | `capture` | ✅ Done (Win) | Yes | WASAPI loopback verified with live Spotify; PipeWire/CoreAudio later |
 | `ptp-helper` | ⬜ Stub | — | Privileged binary, IPC to main (Linux ports 319/320; not needed on Windows) |
-| `client` | ✅ Done (v1) | Yes | realtime + buffered pipelines, pairing store + auto-dispatch (pair-verify vs transient), event channel, `StreamStats` snapshot for observers, live `SetLatency`/`SetMasterVolume`/`SetMetadataEnabled` commands, capture rate followed through a shared atomic |
+| `client` | ✅ Done (v1) | Yes | windowed-sinc resampling (rubato 5), realtime + buffered pipelines, pairing store + auto-dispatch (pair-verify vs transient), event channel, `StreamStats` snapshot for observers, live `SetLatency`/`SetMasterVolume`/`SetMetadataEnabled` commands, capture rate followed through a shared atomic |
 | `apps/cli` | ✅ Done (v1) | Yes | scan, `pair` (PIN), tone/play/capture, devices, restore-audio; name resolution, --volume, --buffered, --latency <ms>, --offset <name=ms>, --handoff[-device] (Windows), --bind <ip>, --no-metadata, --log, --debug [0-2], --no-tui, Ctrl+C |
 | `tui` | ✅ Done (unified flow) | Yes | Library, not a binary — `openair` drives it. One App owns the terminal for the whole run: picker → pairing (in-TUI PIN) → connecting → dashboard, never dropping to a shell. Per-receiver volume/offset/buffer bar, add/remove/retry mid-stream, ready button, responsive layout, row cap on large networks, settings overlay (`s`, live handoff/latency/volume/metadata), settings persistence, log panel, panic-safe restore; 186 tests |
 
@@ -227,10 +227,11 @@ recovers by restarting the receiver, so a clean session is the precondition.
 
 ## Next Steps
 
-0. **Project A — audio quality.** *(Now the top item: project D is done.)* `crates/client/src/source.rs` resamples by
-   linear interpolation. Windows defaults to 48 kHz and 48 → 44.1 is exactly
-   where that damages high frequencies. Test first: set the Windows output to
-   44.1 kHz and listen. If that is it, the fix is `rubato`.
+0. ~~**Project A — audio quality.**~~ **Done.** Confirmed on hardware (setting
+   the capture device to 44.1 kHz by hand sounded materially better), then
+   fixed: `crates/client/src/resample.rs` uses a 256-tap windowed sinc via
+   rubato, with an untouched passthrough at 44.1 kHz. Still worth a listening
+   test at the Windows default of 48 kHz to confirm it in the living room.
 1. **#22 media controls** — the receiver's pause/play buttons are answered but
    not obeyed; a few toggles reset the session. Log the event message body first.
 2. **Step 9** — hardening (DSCP EF, thread priority, retransmit tuning)

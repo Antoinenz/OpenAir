@@ -227,6 +227,17 @@ that matter. Set `"show_controls": true` in `settings.json` for the full list.
 > `--no-tui` gives the plain scrolling output, and is selected automatically
 > when stdout isn't a terminal.
 
+### Sample-rate conversion
+
+The pipeline runs at 44.1 kHz because that is what AirPlay carries. Windows
+usually runs at 48 kHz, so most streams are resampled, and OpenAir uses a
+256-tap windowed sinc (via `rubato`) to do it — chosen because the obvious cheap
+alternative, linear interpolation, both dulls the top of the band and folds
+ultrasonic content back down into it as audible tones.
+
+If your capture device already runs at 44.1 kHz, **nothing is resampled at
+all** — the samples are passed through untouched.
+
 ### `--handoff`: silent speakers + Windows volume control
 
 `--handoff` switches the Windows **default output device** to a virtual audio

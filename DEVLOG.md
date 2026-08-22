@@ -4,6 +4,73 @@
 
 ---
 
+## 2026-08-22 — Session 20: the resampler was the audio quality bug (project A)
+
+**Confirmed before it was fixed.** Setting the virtual cable to 44.1 kHz by hand
+sounded materially better. That turned a hypothesis into a measurement target:
+whatever the resampler was doing between 48 kHz and 44.1 kHz was audible.
+
+### What linear interpolation actually does
+
+It is a sinc-squared low-pass, so it dulls the top of the band. That much was
+expected. The worse half is that it does not filter *before* decimating, so
+anything above the output Nyquist folds straight back down as audible tones that
+were never in the source.
+
+Measured, 48 kHz in, RMS of the output:
+
+| tone | sinc | linear |
+|---|---|---|
+| 1 kHz | −9.03 | −9.04 |
+| 10 kHz | −9.03 | **−10.26** |
+| 15 kHz | −9.03 | **−11.72** |
+| 20 kHz | −9.03 | **−13.26** |
+| 23 kHz | **−240** (rejected) | **−13.76** (folded into the band) |
+
+Windows defaults to 48 kHz and the pipeline is fixed at 44.1, so **the damaging
+path was the default one**. Every user who had not hand-matched their device
+rate was hearing this.
+
+### The test was wrong before the code was
+
+The first quality test compared the output sample-by-sample against an ideal
+tone and failed at −4 dBFS error, which looked like a broken resampler. It was
+not: a 256-tap sinc has ~2.7 ms of group delay, and at 15 kHz a single sample of
+skew is most of a cycle. The test was measuring latency and calling it
+distortion.
+
+Replaced with two delay-insensitive measurements that also happen to describe
+the actual defect: **passband level** (a 15 kHz tone must come out at the level
+it went in) and **stopband rejection** (a 23 kHz tone must not come out at all).
+Both compare against the old algorithm, reproduced in the test file, so the
+thresholds are demonstrated rather than asserted.
+
+### Passthrough is a feature, not an optimisation
+
+At 44.1 kHz in, nothing happens at all — no filter, no delay, no arithmetic,
+asserted bit-exact. That is what makes this change strictly non-regressive: a
+device already at the pipeline rate cannot be degraded by code that does not run.
+
+### rubato 5 turned out to suit the shape better than rubato 0.x would have
+
+The API redesign moves buffers behind `audioadapter`, which has an
+`InterleavedNumbers<i16, f32>` adapter — interleaved in and out, i16 storage,
+f32 internally, conversion handled on read and write. The pipeline is
+interleaved i16 throughout, so the planar `Vec<Vec<f32>>` shuffling the older
+API would have forced simply disappears.
+
+### Two behaviours worth naming
+
+- **The final partial chunk is capped** to the output the real input is worth.
+  rubato emits whole chunks, so a finite source would otherwise gain up to ~23 ms
+  of trailing silence. Caught by the existing WAV tests, which is what those
+  frame-count assertions were for.
+- **A dry ring re-arms rather than rebuilding.** Rebuilding would discard the
+  filter's history every time a live capture briefly starved, putting a
+  discontinuity into audio that was continuous.
+
+---
+
 ## 2026-08-21 — Session 19: it was never a metadata bug
 
 **Status: open.** Recorded now because four theories were falsified by
