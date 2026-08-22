@@ -467,7 +467,26 @@ const BUFFERED_ANCHOR_LEAD_MS_DEFAULT: u64 = 500;
 const SILENCE_PEAK: u16 = 64;
 /// How long a live source must stay silent before the AirPlay stream is
 /// paused (`rate=0`). Auto-resumes (re-anchor) the instant audio returns.
-const PAUSE_AFTER_SILENCE: Duration = Duration::from_millis(1500);
+const PAUSE_AFTER_SILENCE: Duration = Duration::from_secs(30);
+
+/// Why this is measured in tens of seconds rather than hundreds of
+/// milliseconds.
+///
+/// Pausing tells every receiver `set_rate(0)` and resuming re-anchors the whole
+/// group, which is an audible interruption and a resync risk. It is the right
+/// thing when the user has actually stopped the music -- holding three rooms
+/// hostage to a stream of digital silence is rude -- and the wrong thing for
+/// any gap shorter than that.
+///
+/// At 1500 ms it fired on the gap *between tracks*: a three-hour dinner party
+/// produced 37 pause/resume cycles, one per song change, each one stopping the
+/// music in three rooms and re-anchoring on the way back. The cost of being
+/// slow to notice a real stop is that receivers hold a silent stream a little
+/// longer. The cost of being quick is breaking playback every few minutes.
+const _: () = assert!(
+    PAUSE_AFTER_SILENCE.as_secs() >= 10,
+    "a threshold short enough to catch a track gap breaks playback every song"
+);
 
 /// How many times a dropped receiver is re-established (re-pair → SETUP →
 /// RECORD → re-anchor) before it is given up on. Only live (capture)
@@ -500,6 +519,11 @@ const AUTO_LATENCY_WINDOW: Duration = Duration::from_millis(1000);
 /// Wait this long after a bump before considering another, so the deeper
 /// buffer has time to fill and stabilise before we judge it again.
 const AUTO_LATENCY_COOLDOWN: Duration = Duration::from_secs(5);
+
+/// How often the buffer headroom is written at INFO. Every window would be
+/// 3600 lines an hour on top of an already large log; every 30 s is enough to
+/// see a slow decay while staying readable.
+const LEAD_LOG_INTERVAL: Duration = Duration::from_secs(30);
 
 /// How often the current track is re-stated to receivers. The first send goes
 /// out before any audio has, and a receiver may ignore metadata for a stream it
@@ -1409,6 +1433,7 @@ pub fn stream_audio_buffered_multi(
     let mut min_lead_ns: i64 = i64::MAX;
     let mut window_start = Instant::now();
     let mut last_bump = Instant::now();
+    let mut last_lead_log = Instant::now();
 
     info!(receivers = group.len(), live, "streaming buffered AAC audio");
 
@@ -1739,6 +1764,23 @@ pub fn stream_audio_buffered_multi(
                         s.set_latency_ms(current_latency);
                     }
                 }
+                // The number the dashboard shows as buffer headroom, which
+                // until now existed only on screen: a multi-hour log of a
+                // session where it visibly decayed to negative could not say
+                // so, because nothing ever wrote it down.
+                let lead_ms = min_lead_ns / 1_000_000;
+                if last_lead_log.elapsed() >= LEAD_LOG_INTERVAL {
+                    info!(
+                        min_lead_ms = lead_ms,
+                        latency_ms = current_latency,
+                        receivers = group.iter().filter(|r| r.alive).count(),
+                        "buffer headroom"
+                    );
+                    last_lead_log = Instant::now();
+                } else {
+                    debug!(min_lead_ms = lead_ms, "buffer headroom");
+                }
+
                 min_lead_ns = i64::MAX;
                 window_start = Instant::now();
             }
