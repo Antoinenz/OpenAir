@@ -875,6 +875,28 @@ impl BufferedReceiver {
 /// `rtptime` is heard at the shared instant `t_local_ns` (on OUR PTP clock),
 /// translated onto the clock that receiver actually follows and shifted by
 /// its user offset. Used for the initial anchor and for every resume.
+/// What to do at the end of an underrun window.
+///
+/// `Some(latency)` means re-anchor the group at that latency; `None` means
+/// leave it alone.
+///
+/// Extracted from the send loop because of the bug it exists to prevent. The
+/// re-anchor used to sit *inside* a `current_latency < AUTO_LATENCY_MAX_MS`
+/// guard, so a user who set the latency to exactly the maximum got no recovery
+/// at all: a brief network stall would eat the lead, nothing would give it
+/// back, and successive stalls walked the headroom down through zero into
+/// negative territory until the audio broke.
+///
+/// Raising the latency and recovering the lead are two different things.
+/// Raising buys margin for *next* time; re-anchoring is what fixes *this*
+/// time. Only the first has a ceiling.
+fn underrun_response(min_lead_ns: i64, current_latency: u64, cooldown_ok: bool) -> Option<u64> {
+    if min_lead_ns >= UNDERRUN_LEAD_FLOOR.as_nanos() as i64 || !cooldown_ok {
+        return None;
+    }
+    Some((current_latency + AUTO_LATENCY_STEP_MS).min(AUTO_LATENCY_MAX_MS))
+}
+
 /// Re-anchor every live receiver so the current head plays `latency_ms` from
 /// now, returning the new `anchor_t_local`.
 ///
@@ -1642,9 +1664,14 @@ pub fn stream_audio_buffered_multi(
             reap_dead(&mut group, &mut handles, reconnect);
 
             if let Some(s) = &stats {
-                // One AAC frame goes to every receiver, so this is per-receiver
-                // payload — the number a bandwidth reading should reflect.
-                s.add_bytes(aac_frame.len() as u64);
+                // Total payload actually put on the wire: the same AAC frame is
+                // sent to every live receiver, so three rooms cost three times
+                // one room. Reporting a single receiver's share made the
+                // dashboard read a third of reality on a three-room group,
+                // which is not what anyone comparing against their network
+                // monitor expects.
+                let alive = group.iter().filter(|r| r.alive).count().max(1) as u64;
+                s.add_bytes(aac_frame.len() as u64 * alive);
                 // Rebuilt here rather than inside `reap_dead` and the reconnect
                 // path: this is the one place that sees the group after every
                 // change, so the view cannot drift out of step with reality.
@@ -1677,22 +1704,31 @@ pub fn stream_audio_buffered_multi(
             }
 
             if window_start.elapsed() >= AUTO_LATENCY_WINDOW {
-                if min_lead_ns < UNDERRUN_LEAD_FLOOR.as_nanos() as i64
-                    && current_latency < AUTO_LATENCY_MAX_MS
-                    && last_bump.elapsed() >= AUTO_LATENCY_COOLDOWN
+                let cooldown_ok = last_bump.elapsed() >= AUTO_LATENCY_COOLDOWN;
+                if let Some(next_latency) =
+                    underrun_response(min_lead_ns, current_latency, cooldown_ok)
                 {
                     let old = current_latency;
-                    current_latency =
-                        (current_latency + AUTO_LATENCY_STEP_MS).min(AUTO_LATENCY_MAX_MS);
-                    warn!(
-                        from_ms = old,
-                        to_ms = current_latency,
-                        min_lead_ms = min_lead_ns / 1_000_000,
-                        "underrun risk — raising latency"
-                    );
+                    current_latency = next_latency;
+                    if current_latency > old {
+                        warn!(
+                            from_ms = old,
+                            to_ms = current_latency,
+                            min_lead_ms = min_lead_ns / 1_000_000,
+                            "underrun risk — raising latency"
+                        );
+                    } else {
+                        // Already at the ceiling. Re-anchoring still matters —
+                        // it is what gives back the lead a stall consumed.
+                        warn!(
+                            latency_ms = current_latency,
+                            min_lead_ms = min_lead_ns / 1_000_000,
+                            "underrun risk at maximum latency — re-anchoring"
+                        );
+                    }
                     // Re-anchor the group deeper: current head plays
                     // `current_latency` from now, giving the receiver buffer
-                    // room to refill.
+                    // room to refill. Unconditional, unlike the raise above.
                     let t_local =
                         re_anchor_group(&ptp, &mut group, current_latency, rtptime, "auto-latency");
                     reap_dead(&mut group, &mut handles, reconnect);
@@ -1960,6 +1996,63 @@ mod tests {
         // not take the event thread down.
         assert!(receiver_status_flags(b"flags=0x").is_none());
         assert_eq!(receiver_status_flags(b"flags=0x1").unwrap(), 1);
+    }
+
+
+    #[test]
+    fn an_underrun_at_maximum_latency_still_re_anchors() {
+        // The bug from the 3-room dinner-party session: latency set to exactly
+        // AUTO_LATENCY_MAX_MS meant the recovery block never ran, so a brief
+        // stall permanently ate the lead and successive stalls walked the
+        // headroom to -400 ms.
+        let starved = 0;
+        let got = underrun_response(starved, AUTO_LATENCY_MAX_MS, true);
+        assert_eq!(
+            got,
+            Some(AUTO_LATENCY_MAX_MS),
+            "must still re-anchor at the ceiling, just without raising"
+        );
+    }
+
+    #[test]
+    fn an_underrun_below_maximum_raises_and_re_anchors() {
+        let starved = 0;
+        let got = underrun_response(starved, 500, true).expect("should respond");
+        assert_eq!(got, 500 + AUTO_LATENCY_STEP_MS);
+    }
+
+    #[test]
+    fn the_raise_is_capped_but_the_response_is_not_suppressed() {
+        let starved = 0;
+        let near = AUTO_LATENCY_MAX_MS - 10;
+        assert_eq!(
+            underrun_response(starved, near, true),
+            Some(AUTO_LATENCY_MAX_MS),
+            "clamped to the ceiling rather than overshooting"
+        );
+    }
+
+    #[test]
+    fn healthy_headroom_does_nothing() {
+        let healthy = UNDERRUN_LEAD_FLOOR.as_nanos() as i64 * 4;
+        assert_eq!(underrun_response(healthy, 500, true), None);
+        assert_eq!(underrun_response(healthy, AUTO_LATENCY_MAX_MS, true), None);
+    }
+
+    #[test]
+    fn the_cooldown_suppresses_a_response() {
+        // Re-anchoring every window would be worse than the problem: each one
+        // interrupts playback timing on every receiver.
+        let starved = 0;
+        assert_eq!(underrun_response(starved, 500, false), None);
+        assert_eq!(underrun_response(starved, AUTO_LATENCY_MAX_MS, false), None);
+    }
+
+    #[test]
+    fn a_negative_lead_is_treated_as_starved() {
+        // Headroom went to -400 ms in the reported session; that is the most
+        // urgent case, not an edge one.
+        assert!(underrun_response(-400_000_000, AUTO_LATENCY_MAX_MS, true).is_some());
     }
 
 }
