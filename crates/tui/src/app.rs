@@ -423,8 +423,39 @@ impl<'a> App<'a> {
 
     fn tick(&mut self) {
         tick_screen(&mut self.screen);
+        self.adopt_stream_latency();
         self.advance_from_pairing();
         self.advance_from_connecting();
+    }
+
+    /// Persist a latency the *stream* chose.
+    ///
+    /// Auto-latency raises the anchor depth when a receiver is running dry, and
+    /// that value is the one the network actually needed. Leaving it unsaved
+    /// meant every run started back at a setting already known to be too low
+    /// for this house, and re-learned it the hard way — with a dropout each
+    /// time.
+    ///
+    /// Only ever adopts what the stream reports, so a user's own change is
+    /// still theirs: the stream is told about that one first, and reports the
+    /// same number straight back.
+    fn adopt_stream_latency(&mut self) {
+        let Some(stream) = self.screen.streaming() else {
+            return;
+        };
+        let live = stream.state.latency_ms;
+        if live == 0 || live == self.settings.latency_ms {
+            return;
+        }
+        tracing::info!(
+            from_ms = self.settings.latency_ms,
+            to_ms = live,
+            "adopting the latency the stream settled on"
+        );
+        self.settings.latency_ms = live;
+        if let Err(e) = self.settings.save() {
+            tracing::warn!("could not save settings: {e}");
+        }
     }
 
     /// Once every queued device has been dealt with, connect.
