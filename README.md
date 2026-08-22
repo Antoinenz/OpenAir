@@ -227,6 +227,32 @@ that matter. Set `"show_controls": true` in `settings.json` for the full list.
 > `--no-tui` gives the plain scrolling output, and is selected automatically
 > when stdout isn't a terminal.
 
+### Buffering, and how gaps get closed
+
+The latency setting is a safety margin: at 2000 ms the receivers hold two
+seconds of audio that hasn't played yet, which is what absorbs network trouble.
+
+A stall spends that margin. If the sender is blocked for a second, wall-clock
+time moves and your send position doesn't, so the margin shrinks by a second.
+Getting it back means sending *faster than realtime* for a while — and since
+live capture arrives at realtime, the only place that audio can come from is
+the capture ring.
+
+So OpenAir doesn't discard from that ring. It nudges the resample ratio
+instead: slightly more source audio consumed per output frame drains a
+backlog, slightly less lets it refill. The correction is capped at 0.5 %,
+about 8.6 cents of pitch where a semitone is 100, and closes a half-second
+deficit over roughly a minute and a half. You aren't meant to hear it.
+
+The same mechanism handles ordinary clock drift, which is a real thing: your
+sound card's 48 kHz and the receiver's are never exactly equal, and over hours
+that difference would otherwise grow without bound.
+
+Turn it off with **smooth fix** in the settings overlay, and audio above a
+threshold gets discarded instead — the older behaviour, audible when it fires.
+Sources already at 44.1 kHz are copied bit-for-bit and can't be trimmed at all
+(there's no filter to retune), so they use the discard path regardless.
+
 ### The receiver's remote
 
 An Apple TV's remote doesn't control the Apple TV while it's acting as an

@@ -4,6 +4,95 @@
 
 ---
 
+## 2026-08-23 — Session 21: three bugs behind one symptom
+
+A three-room dinner party, 2 s buffer, `--log` on. Reported as: the music
+occasionally stops, OpenAir doesn't call it a drop, and the buffer headroom
+walks down from ~2000 ms to 800 ms and eventually below zero without ever
+recovering.
+
+Three separate faults, and I got the first diagnosis wrong.
+
+### What was stopping the music
+
+Not the network. Us. `SILENCE_PEAK = 64` (−54 dBFS) with
+`PAUSE_AFTER_SILENCE = 1500 ms` meant the gap *between tracks* tripped the
+silence detector: `set_rate(0)` to all three rooms, then a full group
+re-anchor on the way back. The log has **37 pause/resume pairs**, spaced about
+one song apart. Threshold is now 30 s — long enough that only a real stop
+reaches it.
+
+### The wrong fix first
+
+Seeing headroom decay, I found that the underrun recovery block sat behind
+`current_latency < AUTO_LATENCY_MAX_MS`, and the user had set the latency to
+exactly that maximum — so recovery was silently disabled at one specific
+setting. Real bug, worth fixing, **not this one**, and the fix works by
+re-anchoring, which is the audible cutout the user had explicitly said was the
+wrong answer.
+
+The correction came from them: *"its not automatically filling the gap ... which
+shouldn't cut out the audio at all"*. Right. Raising the latency and refilling
+the buffer are different problems, and I had reached for the code I happened to
+be looking at.
+
+### Where the gap actually went
+
+Refilling means sending faster than realtime, which means having audio in hand.
+Live capture arrives at realtime, so the only source is the capture ring — and
+the drift guard was deleting it:
+
+```
+fn fill(...)  { self.sync_rate(); self.apply_drift_guard();  // ← first thing
+const DRIFT_HIGH_WATER_MS: u32 = 1000;
+const DRIFT_DRAIN_TARGET_MS: u32 = 300;
+```
+
+A 1.5 s stall leaves 1.5 s in the ring — exactly the recovery audio — and the
+next `fill()` drains it to 300 ms. **2000 − 1200 = 800 ms**, the number
+reported, arrived at independently.
+
+The guard was not wrong to exist. Producer and consumer run on independent
+clocks and the level does need managing. It was wrong to manage it by
+discarding.
+
+### The fix, which was the user's idea
+
+Vary the playback speed slightly instead. rubato's `Async` resampler is built
+for exactly this and ramps between ratios rather than stepping; it only needed
+`max_resample_ratio_relative` unlocking from 1.0. Ring above target consumes
+more source per output frame, below target consumes less, capped at 0.5 % —
+~8.6 cents, where a semitone is 100.
+
+Nothing is discarded, nothing is re-anchored, and the same loop handles both
+stall recovery and steady-state clock drift, because they are the same
+measurement.
+
+Kept as fallbacks: the setting off, and a source already at 44.1 kHz — copied
+bit-for-bit, no filter to retune, so `can_trim()` says so and the caller falls
+back rather than believing a correction landed. Plus a hard drain past 3 s,
+since beyond that the capture callback drops samples itself.
+
+### Two things that had to move together
+
+`BUFFERED_LEAD_SAMPLES` was a hardcoded `88_200` — exactly 2 s. The user's
+setting matching it was coincidence. Raising the latency ceiling without
+deriving this would have capped headroom at 2000 ms and looked broken in a new
+way. Now derived; ceiling raised to 4000 ms.
+
+### And the reason all of this took guesswork
+
+**The headroom was never logged.** It lived on the dashboard and nowhere else,
+so 9.6 MB of logs from the night it visibly decayed couldn't show that it had.
+Now at INFO every 30 s. The lesson generalises: a number a user can watch
+degrade in real time should be in the log by default.
+
+Also fixed in passing: bandwidth reported one receiver's share rather than what
+goes on the wire, so a three-room group read a third of reality — which is why
+it showed ~300 kbps against ~1 MB/s in Task Manager.
+
+---
+
 ## 2026-08-22 — Session 20: the resampler was the audio quality bug (project A)
 
 **Confirmed before it was fixed.** Setting the virtual cable to 44.1 kHz by hand

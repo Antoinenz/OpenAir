@@ -126,7 +126,14 @@ mod tests {
     fn every_row_and_its_value_is_drawn() {
         let state = SettingsState::new(Settings::default(), true, false);
         let screen = draw(100, 30, &state).backend().to_string();
-        for expected in ["handoff", "latency", "volume", "metadata", "controls"] {
+        for expected in [
+            "handoff",
+            "latency",
+            "volume",
+            "metadata",
+            "controls",
+            "smooth fix",
+        ] {
             assert!(screen.contains(expected), "missing {expected}:\n{screen}");
         }
         assert!(screen.contains("500 ms"), "the latency value:\n{screen}");
