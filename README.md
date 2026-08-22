@@ -227,6 +227,19 @@ that matter. Set `"show_controls": true` in `settings.json` for the full list.
 > `--no-tui` gives the plain scrolling output, and is selected automatically
 > when stdout isn't a terminal.
 
+### The receiver's remote
+
+An Apple TV's remote doesn't control the Apple TV while it's acting as an
+AirPlay receiver — it asks the **sender** to do something. OpenAir now acts on
+those requests, and since it streams system audio rather than owning any
+playback of its own, it forwards them to whatever Windows is actually playing:
+
+    Apple TV remote  →  OpenAir  →  Windows media session  →  Spotify
+
+Play, pause, play/pause toggle, next, previous and stop are handled. Anything
+that fails is logged and ignored — a media key is never worth dropping audio
+for. `--no-media-controls` turns it off.
+
 ### Sample-rate conversion
 
 The pipeline runs at 44.1 kHz because that is what AirPlay carries. Windows

@@ -232,8 +232,11 @@ recovers by restarting the receiver, so a clean session is the precondition.
    fixed: `crates/client/src/resample.rs` uses a 256-tap windowed sinc via
    rubato, with an untouched passthrough at 44.1 kHz. Still worth a listening
    test at the Windows default of 48 kHz to confirm it in the living room.
-1. **#22 media controls** — the receiver's pause/play buttons are answered but
-   not obeyed; a few toggles reset the session. Log the event message body first.
+1. ~~**#22 media controls**~~ **Done** (needs a hardware test). The payload was
+   decoded during the #29 investigation and is now parsed and forwarded to
+   SMTC. Still to confirm on hardware: whether acting on the command also stops
+   the receiver resetting the connection after a few toggles, which session 14
+   observed and which may or may not have shared a cause.
 2. **Step 9** — hardening (DSCP EF, thread priority, retransmit tuning)
 3. **#19** Pool Room (Shairport) refuses connections from the Wi-Fi subnet —
    server-side, reproducible without OpenAir
