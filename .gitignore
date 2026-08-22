@@ -25,3 +25,4 @@ desktop.ini
 
 # Run logs from --log (timestamped, one per run)
 logs/
+tools/atv_credentials.txt
