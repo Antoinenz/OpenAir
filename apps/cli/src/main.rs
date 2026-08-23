@@ -7,6 +7,8 @@ use tracing_subscriber::EnvFilter;
 
 use util::{extract_flag, extract_volume};
 
+mod help;
+
 const DEFAULT_DEVICE_ID: &str = "AA:BB:CC:DD:EE:FF";
 const DEFAULT_VOLUME_DB: f32 = -8.0;
 
@@ -968,6 +970,15 @@ fn start_handoff(
 #[tokio::main]
 async fn main() -> Result<()> {
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Answered before anything else happens. `--help` should not open a log
+    // file, touch the network, or take over the terminal — someone asking what
+    // the flags are has not asked for any of that.
+    if let Some(topic) = help::requested(&raw_args) {
+        print!("{}", help::render(&topic));
+        return Ok(());
+    }
+
     // Parsed before logging starts so the flag itself never reaches the
     // subcommand matching below.
     let (raw_args, want_log) = extract_flag(&raw_args, "--log");
