@@ -1236,6 +1236,7 @@ mod tests {
                 lead_ms: None,
                 health: 0.0,
                 error: error.map(str::to_string),
+                needs_pairing: false,
             }]);
         c.state.sample(&c.running.stats);
         app.advance_from_connecting();

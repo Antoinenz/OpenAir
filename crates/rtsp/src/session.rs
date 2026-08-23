@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 
 use openair_pairing::{Identity, NormalPairing, PairVerify, PeerCredentials, TransientPairing};
 use thiserror::Error;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::connection::{self, RtspConnection};
 
@@ -25,6 +25,12 @@ pub enum SessionError {
     /// "Speakers & TV Access" setting.
     #[error("device requires user authorization (HTTP 470) — approve on the device screen")]
     AuthorizationRequired,
+    /// The accessory has no record of us: it was reset, or the pairing was
+    /// removed on its side. Distinct from [`SessionError::Pairing`] because
+    /// the remedy is different -- pairing again fixes this and nothing else
+    /// does, so the caller can offer exactly that instead of a dead end.
+    #[error("the receiver rejected our stored pairing — it needs pairing again")]
+    CredentialsRejected,
     #[error("unexpected HTTP status {0}")]
     Http(u16),
     #[error("empty response")]
@@ -165,7 +171,9 @@ pub fn pair_verify(
     check_status(&m2_raw, 200)?;
 
     info!("pair-verify M3");
-    let m3_body = pv.process_m2_build_m3(connection::extract_body(&m2_raw))?;
+    let m3_body = pv
+        .process_m2_build_m3(connection::extract_body(&m2_raw))
+        .map_err(rejected_credentials)?;
     let m4_raw = conn.request(
         "POST", "/pair-verify",
         &hkp,
@@ -174,7 +182,9 @@ pub fn pair_verify(
     )?;
     check_status(&m4_raw, 200)?;
 
-    let keys = pv.process_m4(connection::extract_body(&m4_raw))?;
+    let keys = pv
+        .process_m4(connection::extract_body(&m4_raw))
+        .map_err(rejected_credentials)?;
     conn.enable_encryption(&keys.write, &keys.read);
     conn.set_event_keys(keys.events_write, keys.events_read);
     info!("encrypted channel established (pair-verify)");
@@ -192,6 +202,19 @@ pub fn pair_and_get_info(
     let info_raw = conn.request("GET", "/info", &[], &[], None)?;
     debug!(bytes = info_raw.len(), "GET /info response received");
     Ok(info_raw)
+}
+
+/// Reshape an authentication failure seen *during pair-verify* into the one
+/// error whose remedy the caller can act on.
+///
+/// Only meaningful here. The same TLV code in pair-setup means a mistyped PIN,
+/// where "pair again" is what the user is already doing.
+fn rejected_credentials(e: openair_pairing::PairingError) -> SessionError {
+    if e.is_authentication() {
+        warn!("the receiver rejected our stored pairing ({e})");
+        return SessionError::CredentialsRejected;
+    }
+    SessionError::Pairing(e)
 }
 
 fn check_status(response: &[u8], expected: u16) -> Result<(), SessionError> {

@@ -146,6 +146,7 @@ mod tests {
             lead_ms: None,
             health: 0.0,
             error: error.map(str::to_string),
+            needs_pairing: false,
         }
     }
 
@@ -404,6 +405,7 @@ mod render_tests {
             lead_ms: None,
             health: 0.0,
             error: None,
+            needs_pairing: false,
         }]);
         let mut state = ConnectingState::new();
         state.sample(&stats);
@@ -429,6 +431,7 @@ mod render_tests {
                 lead_ms: None,
                 health: 0.0,
                 error: Some("connection refused".into()),
+                needs_pairing: false,
             },
             ReceiverStat {
                 name: "Living Room".into(),
@@ -439,6 +442,7 @@ mod render_tests {
                 lead_ms: None,
                 health: 0.0,
                 error: None,
+                needs_pairing: false,
             },
         ]);
         let mut state = ConnectingState::new();

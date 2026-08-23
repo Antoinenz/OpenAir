@@ -484,6 +484,7 @@ mod tests {
             lead_ms: None,
             health: 0.0,
             error: None,
+            needs_pairing: false,
         }
     }
 
@@ -756,6 +757,7 @@ mod tests {
             lead_ms: None,
             health: 0.0,
             error: None,
+            needs_pairing: false,
         }]);
         d.sample(&stats, Instant::now());
         assert_eq!(d.latency_ms, 750);

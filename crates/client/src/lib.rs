@@ -54,6 +54,28 @@ fn connect_session(
     Ok(StreamSession::connect(addr, device_id)?)
 }
 
+/// Whether this failure means "pair with it again" rather than "something
+/// went wrong".
+///
+/// Worth distinguishing because the two look identical to a user staring at a
+/// failed receiver, and only one of them has an action attached. A receiver
+/// that has been factory reset, or had this sender removed from its Home,
+/// will fail forever until it is paired again -- and nothing about a retry
+/// loop hints at that.
+pub fn needs_repairing(e: &(dyn std::error::Error + 'static)) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(err) = source {
+        if matches!(
+            err.downcast_ref::<openair_rtsp::SessionError>(),
+            Some(openair_rtsp::SessionError::CredentialsRejected)
+        ) {
+            return true;
+        }
+        source = err.source();
+    }
+    false
+}
+
 /// Connect the reverse "event" TCP channel (port from SETUP phase 1).
 ///
 /// Apple receivers (Apple TV / HomePod) expect the sender to connect here
@@ -1184,6 +1206,7 @@ fn receiver_stats(
                 .map(|ms| stats::buffer_health(ms, latency_ms))
                 .unwrap_or(0.0),
             error: None,
+            needs_pairing: false,
         })
         .collect();
 
@@ -1203,6 +1226,7 @@ fn receiver_stats(
             lead_ms: None,
             health: 0.0,
             error: None,
+            needs_pairing: false,
         });
     }
 
@@ -1290,6 +1314,7 @@ pub fn stream_audio_buffered_multi(
             lead_ms: None,
             health: 0.0,
             error: None,
+            needs_pairing: false,
         })
         .collect();
     if let Some(s) = &stats {
@@ -1335,10 +1360,19 @@ pub fn stream_audio_buffered_multi(
             }
             Err(e) => {
                 warn!(receiver = %name, "setup failed — skipping: {e}");
+                // Stored credentials the receiver no longer honours: it was
+                // reset, or we were removed from its Home. Retrying cannot fix
+                // that and neither can any hint about interfaces, so it is
+                // reported as itself and nothing else is guessed at.
+                let repair = needs_repairing(e.as_ref());
                 // A half-open connection reset by the receiver usually means we
                 // sourced it from the wrong interface; say so rather than
                 // leaving a bare OS error code.
-                let hint = openair_core::net::connection_hint(target.addr.ip());
+                let hint = if repair {
+                    None
+                } else {
+                    openair_core::net::connection_hint(target.addr.ip())
+                };
                 if let Some(hint) = &hint {
                     warn!(receiver = %name, "{hint}");
                 }
@@ -1348,6 +1382,7 @@ pub fn stream_audio_buffered_multi(
                     // tells the user nothing, "try --bind <ip>" tells them what
                     // to do. The raw error is already in the log above.
                     p.error = Some(hint.unwrap_or_else(|| e.to_string()));
+                    p.needs_pairing = repair;
                 }
             }
         }
@@ -1872,7 +1907,57 @@ mod tests {
             lead_ms: None,
             health: 0.0,
             error: Some(why.to_string()),
+            needs_pairing: false,
         }
+    }
+
+    /// An error that wraps another, to prove the walk reaches the bottom.
+    #[derive(Debug)]
+    struct Wrapped(Box<dyn std::error::Error + 'static>);
+
+    impl std::fmt::Display for Wrapped {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "while setting up the session")
+        }
+    }
+
+    impl std::error::Error for Wrapped {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(self.0.as_ref())
+        }
+    }
+
+    #[test]
+    fn a_rejected_pairing_is_recognised() {
+        let e = openair_rtsp::SessionError::CredentialsRejected;
+        assert!(needs_repairing(&e));
+    }
+
+    #[test]
+    fn a_rejected_pairing_is_recognised_through_a_wrapper() {
+        // The real call site sees whatever the setup closure boxed up, which is
+        // rarely the bare error -- a check that only handled the top of the
+        // chain would pass its unit test and never fire in practice.
+        let inner = Box::new(openair_rtsp::SessionError::CredentialsRejected);
+        let outer = Wrapped(Box::new(Wrapped(inner)));
+        assert!(needs_repairing(&outer));
+    }
+
+    #[test]
+    fn ordinary_failures_do_not_ask_for_re_pairing() {
+        // Offering to re-pair a receiver that is merely unreachable sends the
+        // user to type a PIN off a screen that will never show one.
+        for e in [
+            openair_rtsp::SessionError::Http(500),
+            openair_rtsp::SessionError::EmptyResponse,
+            // A device asking for on-screen approval is a different remedy:
+            // approve it there, not pair again.
+            openair_rtsp::SessionError::AuthorizationRequired,
+        ] {
+            assert!(!needs_repairing(&e), "{e} should not ask for re-pairing");
+        }
+        let io_error = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused");
+        assert!(!needs_repairing(&io_error));
     }
 
     #[test]

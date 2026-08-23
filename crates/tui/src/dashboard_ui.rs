@@ -516,6 +516,7 @@ mod tests {
             lead_ms: None,
             health: 0.0,
             error: None,
+            needs_pairing: false,
         }]);
         state.sample(&stats, Instant::now());
 
@@ -540,6 +541,7 @@ mod tests {
             lead_ms: Some(400),
             health: 0.8,
             error: None,
+            needs_pairing: false,
         }]);
         state.sample(&stats, Instant::now());
 
@@ -561,6 +563,7 @@ mod tests {
             lead_ms: Some(500),
             health: 1.0,
             error: None,
+            needs_pairing: false,
         }]);
         state.sample(&stats, Instant::now());
 
@@ -613,6 +616,7 @@ mod tests {
             lead_ms: None,
             health: 0.0,
             error: None,
+            needs_pairing: false,
         }]);
         state.sample(&stats, Instant::now());
 
@@ -687,6 +691,7 @@ mod tests {
             lead_ms: Some(500),
             health: 1.0,
             error: None,
+            needs_pairing: false,
         }]);
         state.sample(&stats, Instant::now());
 

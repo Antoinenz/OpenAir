@@ -33,6 +33,37 @@ pub enum PairingError {
     PeerMismatch,
 }
 
+/// HomeKit TLV8 error codes (HAP specification, table 5-5).
+///
+/// Only the ones we act on differently are named; the rest reach the user as
+/// the raw code, which is still better than a generic failure.
+pub mod error_code {
+    /// The accessory refused our credentials.
+    ///
+    /// In pair-setup this is a wrong PIN. In pair-verify it means the
+    /// accessory has no record of us -- it was reset, or the pairing was
+    /// removed on its side -- which is a different problem with a different
+    /// remedy, so the two are told apart by the caller, not here.
+    pub const AUTHENTICATION: u8 = 0x02;
+    /// Too many attempts; the accessory wants us to wait.
+    pub const MAX_TRIES: u8 = 0x05;
+}
+
+impl PairingError {
+    /// Whether this is the accessory rejecting who we are, as opposed to a
+    /// network, protocol or crypto failure.
+    ///
+    /// `PeerMismatch` counts: the accessory answered with an identity that is
+    /// not the one we stored, which is what a factory-reset receiver looks
+    /// like from here.
+    pub fn is_authentication(&self) -> bool {
+        matches!(
+            self,
+            PairingError::ServerError(error_code::AUTHENTICATION) | PairingError::PeerMismatch
+        )
+    }
+}
+
 /// Result of the M2→M3 SRP step: `(m3_body, m1_proof, srp_session_key)`.
 pub type SrpStepResult = Result<(Vec<u8>, Vec<u8>, Vec<u8>), PairingError>;
 
@@ -174,6 +205,32 @@ impl Default for TransientPairing {
 mod tests {
     use super::*;
     use crate::tlv8;
+
+    #[test]
+    fn only_a_rejected_identity_counts_as_authentication() {
+        assert!(PairingError::ServerError(error_code::AUTHENTICATION).is_authentication());
+        // A reset accessory answers with an identity that is not the one we
+        // stored, which is the same problem wearing a different error.
+        assert!(PairingError::PeerMismatch.is_authentication());
+    }
+
+    #[test]
+    fn transport_and_protocol_failures_are_not_authentication() {
+        // These must stay distinguishable: treating a busy accessory or a
+        // truncated message as "it forgot us" would send the user off to
+        // re-pair a receiver whose pairing was never the problem.
+        for e in [
+            PairingError::ServerError(error_code::MAX_TRIES),
+            PairingError::ServerError(0x07), // Busy
+            PairingError::MissingField("State"),
+            PairingError::M2Mismatch,
+            PairingError::UnexpectedState { got: 3, want: 2 },
+            PairingError::CryptoFailure("bad length"),
+            PairingError::SignatureInvalid("accessory"),
+        ] {
+            assert!(!e.is_authentication(), "{e:?} should not be authentication");
+        }
+    }
 
     #[test]
     fn m1_matches_hardware_verified_wire_format() {

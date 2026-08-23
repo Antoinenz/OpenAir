@@ -79,6 +79,12 @@ pub struct ReceiverStat {
     /// (the `--bind` hint for a wrong source interface), that hint belongs
     /// here; the raw error code belongs in the log panel.
     pub error: Option<String>,
+    /// The receiver rejected our stored pairing, so pairing again is the only
+    /// thing that will fix it.
+    ///
+    /// Separate from `error`, which is prose: this is the flag a screen keys
+    /// an offer to re-pair off, and prose is the wrong thing to match on.
+    pub needs_pairing: bool,
 }
 
 /// A request from an observer into a running stream.
@@ -332,6 +338,7 @@ mod tests {
             lead_ms: None,
             health: 0.0,
             error: None,
+            needs_pairing: false,
         }]);
         let got = stats.receivers();
         assert_eq!(got.len(), 1);
@@ -407,6 +414,7 @@ mod tests {
             lead_ms: None,
             health: 0.0,
             error: Some("connection refused".into()),
+            needs_pairing: false,
         }]);
         let got = stats.receivers();
         assert_eq!(got[0].error.as_deref(), Some("connection refused"));
