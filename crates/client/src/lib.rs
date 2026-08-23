@@ -260,9 +260,14 @@ fn event_reader(mut rdr: TcpStream, mut wtr: TcpStream, event_keys: Option<([u8;
 /// Shows a PIN on the device; `pin_provider` must return it (e.g. from
 /// stdin). On success the credentials are persisted, and every later
 /// connection to this device-id automatically uses pair-verify.
+///
+/// `name` is recorded alongside the credentials purely so they can be listed
+/// and forgotten later by something a person recognises. Pass what the
+/// receiver advertised.
 pub fn pair_device(
     addr: SocketAddr,
     device_id: &str,
+    name: Option<&str>,
     pin_provider: &mut dyn FnMut() -> String,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut store = PairingStore::load()?;
@@ -271,7 +276,7 @@ pub fn pair_device(
     store.ensure_saved()?;
     let identity = store.identity()?;
     let peer = openair_rtsp::pair_setup_normal(addr, device_id, &identity, pin_provider)?;
-    store.set_peer(device_id, &peer)?;
+    store.set_peer(device_id, &peer, name)?;
     info!(device_id, "pairing stored — future connections will use pair-verify");
     Ok(())
 }

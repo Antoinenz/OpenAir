@@ -215,14 +215,15 @@ pub struct PairWorker {
 }
 
 impl PairWorker {
-    pub fn spawn(addr: SocketAddr, device_id: String) -> Self {
+    pub fn spawn(addr: SocketAddr, device_id: String, name: String) -> Self {
         let (pin_tx, pin_rx) = mpsc::channel::<String>();
         let (result_tx, result_rx) = mpsc::channel();
 
         std::thread::spawn(move || {
             let mut provider = || pin_rx.recv().unwrap_or_default();
-            let result = openair_client::pair_device(addr, &device_id, &mut provider)
-                .map_err(|e| e.to_string());
+            let result =
+                openair_client::pair_device(addr, &device_id, Some(&name), &mut provider)
+                    .map_err(|e| e.to_string());
             let _ = result_tx.send(result);
         });
 

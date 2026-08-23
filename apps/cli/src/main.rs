@@ -479,9 +479,15 @@ mod util {
 /// A name is matched case-insensitively against discovered device names
 /// (cleaned of the mDNS service suffix); zero or multiple matches print the
 /// discovered names and return `None`.
-fn resolve_receiver(arg: &str) -> Option<(SocketAddr, String)> {
+/// Resolve one receiver argument to an address, a device id, and the name it
+/// advertised.
+///
+/// The name is `None` for a raw `ip:port`, where nothing was discovered and
+/// inventing one would put a label on a stored pairing that no device ever
+/// claimed.
+fn resolve_receiver(arg: &str) -> Option<(SocketAddr, String, Option<String>)> {
     if let Ok(addr) = arg.parse::<SocketAddr>() {
-        return Some((addr, DEFAULT_DEVICE_ID.to_string()));
+        return Some((addr, DEFAULT_DEVICE_ID.to_string(), None));
     }
 
     println!("'{}' is not an ip:port — searching for a receiver named like it (5s)...", arg);
@@ -506,7 +512,7 @@ fn resolve_receiver(arg: &str) -> Option<(SocketAddr, String)> {
                 .device_id
                 .clone()
                 .unwrap_or_else(|| DEFAULT_DEVICE_ID.to_string());
-            Some((addr, device_id))
+            Some((addr, device_id, Some(dev.display_name().to_string())))
         }
         0 => {
             println!("No receiver matched '{}'. Discovered device(s):", arg);
@@ -1208,7 +1214,7 @@ async fn main() -> Result<()> {
     // persisted; later `play`/`capture`/`tone` connect via pair-verify
     // automatically.
     if args.len() >= 2 && args[0] == "pair" {
-        let Some((addr, device_id)) = resolve_receiver(&args[1]) else {
+        let Some((addr, device_id, name)) = resolve_receiver(&args[1]) else {
             return Ok(());
         };
         println!("OpenAir — HomeKit pairing with {} ({})\n", addr, device_id);
@@ -1221,7 +1227,7 @@ async fn main() -> Result<()> {
             std::io::stdin().read_line(&mut line).ok();
             line.trim().to_string()
         };
-        match openair_client::pair_device(addr, &device_id, &mut pin_prompt) {
+        match openair_client::pair_device(addr, &device_id, name.as_deref(), &mut pin_prompt) {
             Ok(()) => println!("  ✓ paired — this device will now connect automatically"),
             Err(e) => println!("  ✗ pairing failed: {}", e),
         }

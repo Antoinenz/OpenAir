@@ -658,7 +658,11 @@ impl<'a> App<'a> {
                     // how sessions get dropped.
                     let worker = p.worker.get_or_insert_with(|| {
                         let device = p.state.current().expect("submitting implies a device");
-                        PairWorker::spawn(device.addr, device.device_id.clone())
+                        PairWorker::spawn(
+                            device.addr,
+                            device.device_id.clone(),
+                            device.name.clone(),
+                        )
                     });
                     worker.submit(pin);
                 }
