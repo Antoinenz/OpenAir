@@ -100,6 +100,19 @@ impl ConnectingState {
         }
     }
 
+    /// Receivers that failed because they no longer honour our stored pairing.
+    ///
+    /// Reported separately from [`Self::failure_summary`] because it is the
+    /// one failure with an action attached: these can be fixed here and now,
+    /// by pairing again, and everything else cannot.
+    pub fn needs_pairing(&self) -> Vec<std::net::SocketAddr> {
+        self.receivers
+            .iter()
+            .filter(|r| r.needs_pairing && r.state == ReceiverState::Failed)
+            .map(|r| r.addr)
+            .collect()
+    }
+
     /// One-line explanation for the all-failed case, for the picker's banner.
     ///
     /// Prefers a specific reason when every receiver gave the same one, since
@@ -134,6 +147,13 @@ mod tests {
 
     fn addr(n: u8) -> SocketAddr {
         format!("192.168.1.{n}:7000").parse().unwrap()
+    }
+
+    fn rejected(n: u8) -> ReceiverStat {
+        ReceiverStat {
+            needs_pairing: true,
+            ..stat(n, ReceiverState::Failed, Some("stored pairing rejected"))
+        }
     }
 
     fn stat(n: u8, state: ReceiverState, error: Option<&str>) -> ReceiverStat {
@@ -281,6 +301,43 @@ mod tests {
             state.failure_summary(),
             "could not connect to that receiver"
         );
+    }
+
+    #[test]
+    fn a_receiver_that_wants_pairing_is_reported() {
+        let mut s = ConnectingState::new();
+        s.receivers = vec![rejected(1), stat(2, ReceiverState::Connected, None)];
+        assert_eq!(s.needs_pairing(), vec![addr(1)]);
+    }
+
+    #[test]
+    fn an_ordinary_failure_does_not_ask_for_pairing() {
+        // Otherwise an unreachable receiver would send the user off to type a
+        // PIN off a screen that is never going to show one.
+        let mut s = ConnectingState::new();
+        s.receivers = vec![stat(1, ReceiverState::Failed, Some("connection refused"))];
+        assert!(s.needs_pairing().is_empty());
+    }
+
+    #[test]
+    fn a_receiver_still_connecting_is_not_yet_asking_for_anything() {
+        // The flag is only meaningful once the attempt has settled; acting on
+        // it mid-handshake would interrupt a connection that may still work.
+        let mut s = ConnectingState::new();
+        s.receivers = vec![ReceiverStat {
+            needs_pairing: true,
+            ..stat(1, ReceiverState::Connecting, None)
+        }];
+        assert!(s.needs_pairing().is_empty());
+    }
+
+    #[test]
+    fn every_rejected_receiver_is_reported_not_just_the_first() {
+        // A whole group can be stale at once -- one Apple TV reset takes every
+        // pairing with it -- and pairing one of three would look like a bug.
+        let mut s = ConnectingState::new();
+        s.receivers = vec![rejected(1), rejected(2), rejected(3)];
+        assert_eq!(s.needs_pairing().len(), 3);
     }
 }
 

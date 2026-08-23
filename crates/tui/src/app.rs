@@ -195,6 +195,10 @@ pub struct ConnectingScreen {
     /// Device id per receiver address, carried through so the dashboard can
     /// retry one later.
     device_ids: HashMap<SocketAddr, String>,
+    /// What this attempt was for, kept so a re-pair can rebuild the same
+    /// group rather than reassembling one from what the stream reported --
+    /// which would silently drop each receiver's play offset.
+    targets: Vec<GroupTarget>,
 }
 
 pub struct PickerScreen {
@@ -223,6 +227,18 @@ pub struct App<'a> {
     /// Device keys the user last chose, so a return to the picker does not
     /// make them pick again.
     last_selection: Vec<String>,
+    /// What each chosen receiver is called, by address.
+    ///
+    /// `GroupTarget` carries no name and the stream reports receivers by
+    /// address, so without this a re-pair prompt would ask for the PIN of
+    /// "192.168.1.64:7000" -- which is not what is written on the television.
+    receiver_names: HashMap<SocketAddr, String>,
+    /// Receivers we have already sent back through pairing this run.
+    ///
+    /// Stale credentials survive a skipped pairing, so the next attempt fails
+    /// exactly as the last one did. Without this the two screens would hand
+    /// the user back and forth forever.
+    repair_attempted: std::collections::HashSet<SocketAddr>,
     /// Set when the user asks to leave entirely.
     quitting: bool,
 }
@@ -245,6 +261,8 @@ impl<'a> App<'a> {
             applier: None,
             handoff_available,
             last_selection: Vec::new(),
+            receiver_names: HashMap::new(),
+            repair_attempted: std::collections::HashSet::new(),
             quitting: false,
         }
     }
@@ -536,6 +554,50 @@ impl<'a> App<'a> {
         self.start_stream(targets);
     }
 
+    /// The receivers on this screen that could be fixed by pairing again.
+    ///
+    /// Only ever offered once each per run. Skipping the prompt leaves the
+    /// stale credentials in place, so the next attempt fails identically --
+    /// offering again would bounce the user between two screens with no way
+    /// out but quitting.
+    fn repairable(&self, c: &ConnectingScreen) -> Vec<PendingPair> {
+        c.state
+            .needs_pairing()
+            .into_iter()
+            .filter(|addr| !self.repair_attempted.contains(addr))
+            .map(|addr| PendingPair {
+                name: self
+                    .receiver_names
+                    .get(&addr)
+                    .cloned()
+                    .unwrap_or_else(|| addr.to_string()),
+                addr,
+                device_id: c
+                    .device_ids
+                    .get(&addr)
+                    .cloned()
+                    .unwrap_or_else(|| DEFAULT_DEVICE_ID.to_string()),
+            })
+            .collect()
+    }
+
+    /// Send rejected receivers back through pairing, then connect again.
+    ///
+    /// The full target list is carried through, not just the rejected ones:
+    /// in a group, the rooms that connected were torn down along with the
+    /// rest, so the retry has to rebuild the whole group.
+    fn begin_repair(&mut self, repair: Vec<PendingPair>, targets: Vec<GroupTarget>) {
+        for p in &repair {
+            tracing::info!(receiver = %p.name, "stored pairing rejected — asking to pair again");
+            self.repair_attempted.insert(p.addr);
+        }
+        self.screen = Screen::Pairing(Box::new(PairingScreen {
+            state: PairingState::new(repair),
+            worker: None,
+            targets,
+        }));
+    }
+
     /// Move on once the group has settled.
     ///
     /// `Ready` goes to the dashboard; `AllFailed` stays put so the user can
@@ -549,10 +611,17 @@ impl<'a> App<'a> {
         match c.state.outcome() {
             ConnectOutcome::Waiting => return,
             ConnectOutcome::AllFailed => {
-                // Nothing to stream to, so waiting for the user to press
-                // esc would just be a dead screen. Go back and say why.
+                // A receiver that no longer honours our stored pairing can be
+                // fixed right here, so offer that instead of dropping the user
+                // back at the picker with a failure they cannot act on.
+                let repair = self.repairable(c);
                 let banner = c.state.failure_summary();
                 c.running.stop();
+                if !repair.is_empty() {
+                    let targets = c.targets.clone();
+                    self.begin_repair(repair, targets);
+                    return;
+                }
                 self.open_picker();
                 if let Screen::Picker(p) = &mut self.screen {
                     p.state.set_banner(banner);
@@ -690,6 +759,10 @@ impl<'a> App<'a> {
                     if let Err(e) = self.settings.save() {
                         tracing::warn!("could not save settings: {e}");
                     }
+                    self.receiver_names = chosen
+                        .iter()
+                        .map(|r| (r.addr, r.name.clone()))
+                        .collect();
                     self.begin(targets_from(&chosen), pending_pairs(&chosen));
                 }
                 PickerAction::None | PickerAction::Hint(_) => {}
@@ -819,6 +892,7 @@ impl<'a> App<'a> {
             .iter()
             .map(|t| (t.addr, t.device_id.clone()))
             .collect();
+        let kept = targets.clone();
         let handle = (self.launch)(
             targets,
             self.settings.clone(),
@@ -834,6 +908,7 @@ impl<'a> App<'a> {
             },
             last_sample: Instant::now(),
             device_ids,
+            targets: kept,
         }));
     }
 }
@@ -1240,6 +1315,109 @@ mod tests {
             }]);
         c.state.sample(&c.running.stats);
         app.advance_from_connecting();
+    }
+
+    /// Publish one receiver as failed *because its pairing was rejected*.
+    fn publish_rejected(app: &mut App<'_>) {
+        let Screen::Connecting(c) = &mut app.screen else {
+            panic!("expected connecting");
+        };
+        c.running
+            .stats
+            .set_receivers(vec![openair_client::ReceiverStat {
+                name: "192.168.1.51:7000".into(),
+                addr: "192.168.1.51:7000".parse().unwrap(),
+                state: ReceiverState::Failed,
+                offset_ms: 0,
+                trim_db: 0.0,
+                lead_ms: None,
+                health: 0.0,
+                error: Some("the receiver rejected our stored pairing".into()),
+                needs_pairing: true,
+            }]);
+        c.state.sample(&c.running.stats);
+        app.advance_from_connecting();
+    }
+
+    #[test]
+    fn a_rejected_pairing_offers_to_pair_again_instead_of_giving_up() {
+        // The whole point: a receiver that was reset is fixable from here, and
+        // dumping the user at the picker with "connection failed" hides that.
+        let started = std::sync::Mutex::new(Vec::new());
+        let mut app = test_app(&started);
+        app.start_stream(targets_from(&[row("192.168.1.51:7000", Some("AA:BB"))]));
+
+        publish_rejected(&mut app);
+        assert_eq!(app.screen().name(), "pairing");
+    }
+
+    #[test]
+    fn the_re_pair_prompt_names_the_room_not_its_address() {
+        // The PIN appears on a television the user knows by name; asking for
+        // "192.168.1.51:7000" makes them work out which box that is.
+        let started = std::sync::Mutex::new(Vec::new());
+        let mut app = test_app(&started);
+        app.receiver_names
+            .insert("192.168.1.51:7000".parse().unwrap(), "Living Room".into());
+        app.start_stream(targets_from(&[row("192.168.1.51:7000", Some("AA:BB"))]));
+
+        publish_rejected(&mut app);
+        let Screen::Pairing(p) = &app.screen else {
+            panic!("expected pairing");
+        };
+        assert_eq!(p.state.current().unwrap().name, "Living Room");
+        assert_eq!(p.state.current().unwrap().device_id, "AA:BB");
+    }
+
+    #[test]
+    fn a_rejected_pairing_is_only_offered_once_per_run() {
+        // Skipping the prompt leaves the stale credentials on disk, so the
+        // next attempt fails identically. Offering again would bounce the user
+        // between two screens with no way out but quitting.
+        let started = std::sync::Mutex::new(Vec::new());
+        let mut app = test_app(&started);
+        app.start_stream(targets_from(&[row("192.168.1.51:7000", Some("AA:BB"))]));
+        publish_rejected(&mut app);
+        assert_eq!(app.screen().name(), "pairing");
+
+        // The user skips, so nothing is left to stream to and we are back at
+        // the picker. Now the same failure happens again.
+        app.start_stream(targets_from(&[row("192.168.1.51:7000", Some("AA:BB"))]));
+        publish_rejected(&mut app);
+        assert_eq!(
+            app.screen().name(),
+            "picker",
+            "the second rejection must not reopen pairing"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_failure_still_returns_to_the_picker() {
+        // The re-pair path must not swallow failures it cannot fix.
+        let started = std::sync::Mutex::new(Vec::new());
+        let mut app = test_app(&started);
+        app.start_stream(targets_from(&[row("192.168.1.51:7000", Some("AA:BB"))]));
+
+        publish(&mut app, ReceiverState::Failed, Some("connection refused"));
+        assert_eq!(app.screen().name(), "picker");
+    }
+
+    #[test]
+    fn re_pairing_carries_the_group_through_so_the_retry_rebuilds_it() {
+        // Everything failed, so every room was torn down -- pairing the one
+        // that was rejected has to bring the others back with it.
+        let started = std::sync::Mutex::new(Vec::new());
+        let mut app = test_app(&started);
+        app.start_stream(targets_from(&[
+            row("192.168.1.51:7000", Some("AA:BB")),
+            row("192.168.1.64:7000", Some("CC:DD")),
+        ]));
+
+        publish_rejected(&mut app);
+        let Screen::Pairing(p) = &app.screen else {
+            panic!("expected pairing");
+        };
+        assert_eq!(p.targets.len(), 2, "the whole group is retried, not one");
     }
 
     #[test]
