@@ -12,27 +12,44 @@ use crate::settings_screen::{SettingsRow, SettingsState};
 
 /// Overlay size, borders included. Wide enough for the longest label, its
 /// value, and a short reason on the same line.
-const PANEL: (u16, u16) = (58, 10);
+const PANEL: (u16, u16) = (58, 11);
+
+/// Taller while the pairings list is open: it holds a row per paired receiver
+/// rather than a fixed set, plus a status line of its own.
+const LIST_PANEL: (u16, u16) = (58, 14);
 
 pub fn render(frame: &mut Frame, state: &SettingsState) {
-    let area = crate::rect::centred(frame.area(), PANEL.0, PANEL.1);
+    let panel = if state.list().is_some() {
+        LIST_PANEL
+    } else {
+        PANEL
+    };
+    let area = crate::rect::centred(frame.area(), panel.0, panel.1);
     // Drawn over a live frame — without this the dashboard shows through the
     // gaps between glyphs.
     frame.render_widget(Clear, area);
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(if state.streaming() {
-            " settings — changes are live "
-        } else {
-            " settings "
-        });
+    let title = if state.list().is_some() {
+        " settings › pairings "
+    } else if state.streaming() {
+        " settings — changes are live "
+    } else {
+        " settings "
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     // A terminal small enough to leave no interior is not an error worth
     // reporting — the border alone still says a panel is open.
     if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    // Same border, same position: opening the list should read as going
+    // deeper, not as a second window appearing somewhere else.
+    if let Some(list) = state.list() {
+        crate::pairing_list_ui::render(frame, inner, list);
         return;
     }
 
@@ -70,6 +87,7 @@ fn row_line(row: SettingsRow, state: &SettingsState, selected: bool) -> Line<'st
         SettingsRow::Metadata => ("metadata", on_off(s.metadata)),
         SettingsRow::ShowControls => ("controls", on_off(s.show_controls)),
         SettingsRow::AdaptiveResampling => ("smooth fix", on_off(s.adaptive_resampling)),
+        SettingsRow::Pairings => ("pairings", format!("{} →", state.pairing_count())),
     };
 
     let mut spans = vec![
@@ -138,6 +156,47 @@ mod tests {
         }
         assert!(screen.contains("500 ms"), "the latency value:\n{screen}");
         assert!(screen.contains("-8 dB"), "the volume value:\n{screen}");
+    }
+
+    #[test]
+    fn the_pairings_row_shows_how_many_are_stored() {
+        let state = SettingsState::with_peers(
+            Settings::default(),
+            true,
+            false,
+            vec![openair_client::PairedPeer {
+                device_id: "AA:AA".into(),
+                name: Some("Living Room".into()),
+            }],
+        );
+        let screen = draw(100, 30, &state).backend().to_string();
+        assert!(screen.contains("pairings"), "{screen}");
+        assert!(screen.contains('1'), "the count:\n{screen}");
+    }
+
+    #[test]
+    fn the_open_list_replaces_the_rows_in_the_same_panel() {
+        let mut state = SettingsState::with_peers(
+            Settings::default(),
+            true,
+            false,
+            vec![openair_client::PairedPeer {
+                device_id: "AA:AA".into(),
+                name: Some("Living Room".into()),
+            }],
+        );
+        while state.rows()[state.cursor()] != SettingsRow::Pairings {
+            state.on_key(crossterm::event::KeyCode::Down);
+        }
+        state.on_key(crossterm::event::KeyCode::Enter);
+
+        let screen = draw(100, 30, &state).backend().to_string();
+        assert!(screen.contains("Living Room"), "{screen}");
+        assert!(
+            !screen.contains("smooth fix"),
+            "the settings rows should be gone, not drawn underneath:\n{screen}"
+        );
+        assert!(screen.contains("pairings"), "the title says where we are");
     }
 
     #[test]

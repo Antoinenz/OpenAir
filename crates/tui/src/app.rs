@@ -327,9 +327,22 @@ impl<'a> App<'a> {
     }
 
     /// Open the settings overlay over whatever is on screen now.
+    ///
+    /// The pairing store is read here, once, rather than by the settings screen
+    /// itself: this is the layer that is allowed to touch the disk, and reading
+    /// on open means the list cannot show something stale from an earlier
+    /// visit.
     pub fn open_settings(&mut self) {
         let streaming = self.screen.streaming().is_some();
-        let state = SettingsState::new(self.settings.clone(), self.handoff_available, streaming);
+        let peers = openair_client::PairingStore::load()
+            .map(|s| s.peers())
+            .unwrap_or_default();
+        let state = SettingsState::with_peers(
+            self.settings.clone(),
+            self.handoff_available,
+            streaming,
+            peers,
+        );
         let placeholder = self.placeholder();
         let origin = Box::new(std::mem::replace(&mut self.screen, placeholder));
         self.screen = Screen::Settings(Box::new(SettingsScreen { state, origin }));
@@ -340,6 +353,35 @@ impl<'a> App<'a> {
         let placeholder = self.placeholder();
         if let Screen::Settings(s) = std::mem::replace(&mut self.screen, placeholder) {
             self.screen = *s.origin;
+        }
+    }
+
+    /// Drop a stored pairing, and tell the screen how it went.
+    ///
+    /// Reported back rather than assumed: a read-only or missing store is a
+    /// real outcome, and a row that vanished while the file still held the
+    /// credentials would be a lie the user only discovers next time the
+    /// receiver connects without asking for a PIN.
+    fn forget_pairing(&mut self, device_id: &str) {
+        let outcome = openair_client::PairingStore::load()
+            .and_then(|mut store| store.forget(device_id))
+            .map_err(|e| e.to_string());
+
+        let Screen::Settings(s) = &mut self.screen else {
+            return;
+        };
+        match outcome {
+            Ok(true) => {
+                tracing::info!(device_id, "forgot stored pairing");
+                s.state.forgotten(device_id);
+            }
+            // Not on disk, but on screen: the file changed under us. Removing
+            // the row is still the honest thing to show.
+            Ok(false) => s.state.forgotten(device_id),
+            Err(why) => {
+                tracing::warn!(device_id, "could not forget pairing: {why}");
+                s.state.pairing_error(why);
+            }
         }
     }
 
@@ -417,6 +459,7 @@ impl<'a> App<'a> {
                 SettingsAction::None => {}
                 SettingsAction::Close => self.close_settings(),
                 SettingsAction::Apply(next) => self.apply_settings(previous, next),
+                SettingsAction::Forget(id) => self.forget_pairing(&id),
             }
         }
     }
@@ -635,6 +678,7 @@ impl<'a> App<'a> {
                     SettingsAction::None => {}
                     SettingsAction::Close => self.close_settings(),
                     SettingsAction::Apply(next) => self.apply_settings(previous, next),
+                    SettingsAction::Forget(id) => self.forget_pairing(&id),
                 }
             }
             Screen::Picker(p) => match p.state.on_key(code) {

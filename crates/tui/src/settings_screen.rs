@@ -10,7 +10,9 @@
 //! test rather than an unplugging ritual.
 
 use crossterm::event::KeyCode;
+use openair_client::PairedPeer;
 
+use crate::pairing_list::{ListAction, PairingList};
 use crate::settings::{Settings, LATENCY_MAX_MS, LATENCY_MIN_MS, LATENCY_STEP_MS};
 
 /// Volume adjustment bounds and step, in dB. Matches the range `Settings`
@@ -27,15 +29,20 @@ pub enum SettingsRow {
     Metadata,
     ShowControls,
     AdaptiveResampling,
+    /// Not a setting — opens the list of receivers we hold credentials for.
+    Pairings,
 }
 
-const ROWS: [SettingsRow; 6] = [
+const ROWS: [SettingsRow; 7] = [
     SettingsRow::Handoff,
     SettingsRow::Latency,
     SettingsRow::Volume,
     SettingsRow::Metadata,
     SettingsRow::ShowControls,
     SettingsRow::AdaptiveResampling,
+    // Last, and after a visual gap in the renderer: it is the only row that
+    // goes somewhere rather than changing something.
+    SettingsRow::Pairings,
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -46,6 +53,9 @@ pub enum SettingsAction {
     Close,
     /// The settings changed; the caller should apply and persist them.
     Apply(Settings),
+    /// Forget the stored pairing for this device id, then report back with
+    /// [`SettingsState::forgotten`] or [`SettingsState::pairing_error`].
+    Forget(String),
 }
 
 pub struct SettingsState {
@@ -58,16 +68,35 @@ pub struct SettingsState {
     /// take effect now.
     streaming: bool,
     error: Option<(SettingsRow, String)>,
+    /// Receivers we hold HomeKit credentials for.
+    ///
+    /// Passed in rather than read here: `PairingStore::load` touches the real
+    /// filesystem, and a settings screen that could not be unit-tested without
+    /// one would stop being tested.
+    peers: Vec<PairedPeer>,
+    /// The pairings list, while it is open over the rows.
+    list: Option<PairingList>,
 }
 
 impl SettingsState {
     pub fn new(settings: Settings, handoff_available: bool, streaming: bool) -> Self {
+        Self::with_peers(settings, handoff_available, streaming, Vec::new())
+    }
+
+    pub fn with_peers(
+        settings: Settings,
+        handoff_available: bool,
+        streaming: bool,
+        peers: Vec<PairedPeer>,
+    ) -> Self {
         let mut state = Self {
             settings,
             cursor: 0,
             handoff_available,
             streaming,
             error: None,
+            peers,
+            list: None,
         };
         // A remembered preference cannot switch handoff on where there is no
         // cable to route through — the same rule the picker applies.
@@ -97,6 +126,34 @@ impl SettingsState {
         self.error.as_ref().map(|(_, msg)| msg.as_str())
     }
 
+    /// The pairings list, if it is open.
+    pub fn list(&self) -> Option<&PairingList> {
+        self.list.as_ref()
+    }
+
+    /// How many receivers we hold credentials for — shown on the row.
+    pub fn pairing_count(&self) -> usize {
+        match &self.list {
+            Some(list) => list.peers().len(),
+            None => self.peers.len(),
+        }
+    }
+
+    /// A forget succeeded.
+    pub fn forgotten(&mut self, device_id: &str) {
+        self.peers.retain(|p| p.device_id != device_id);
+        if let Some(list) = self.list.as_mut() {
+            list.forgotten(device_id);
+        }
+    }
+
+    /// A forget failed, and why.
+    pub fn pairing_error(&mut self, msg: impl Into<String>) {
+        if let Some(list) = self.list.as_mut() {
+            list.set_error(msg);
+        }
+    }
+
     /// Which row the current error belongs to, so the renderer can put it there
     /// rather than in a shared status line. With five rows on screen, "which
     /// one failed" is the first question.
@@ -117,6 +174,19 @@ impl SettingsState {
     }
 
     pub fn on_key(&mut self, key: KeyCode) -> SettingsAction {
+        // The list, while it is open, owns every key. Letting the rows keep
+        // `←→` underneath would mean adjusting the latency you cannot see.
+        if let Some(list) = self.list.as_mut() {
+            return match list.on_key(key) {
+                ListAction::None => SettingsAction::None,
+                ListAction::Close => {
+                    self.list = None;
+                    SettingsAction::None
+                }
+                ListAction::Forget(id) => SettingsAction::Forget(id),
+            };
+        }
+
         match key {
             KeyCode::Up => {
                 self.error = None;
@@ -173,6 +243,16 @@ impl SettingsState {
             SettingsRow::ShowControls => self.settings.show_controls = !self.settings.show_controls,
             SettingsRow::AdaptiveResampling => {
                 self.settings.adaptive_resampling = !self.settings.adaptive_resampling
+            }
+            SettingsRow::Pairings => {
+                // Nothing to apply: this row opens a screen rather than
+                // holding a value. Only forwards -- `←` is what closes the
+                // list again, so having it open one too would be a key that
+                // undid itself.
+                if up {
+                    self.list = Some(PairingList::new(self.peers.clone()));
+                }
+                return SettingsAction::None;
             }
         }
         SettingsAction::Apply(self.settings.clone())
@@ -322,6 +402,119 @@ mod tests {
         assert_eq!(s.settings, before, "back to what is in force");
         assert_eq!(s.error(), Some("cable disappeared"));
         assert_eq!(s.error_row(), Some(SettingsRow::Handoff));
+    }
+
+    fn peer(id: &str, name: &str) -> PairedPeer {
+        PairedPeer {
+            device_id: id.to_string(),
+            name: Some(name.to_string()),
+        }
+    }
+
+    /// Settings with two stored pairings, cursor parked on the pairings row.
+    fn with_pairings() -> SettingsState {
+        let mut s = SettingsState::with_peers(
+            Settings::default(),
+            true,
+            false,
+            vec![peer("AA:AA", "Living Room"), peer("BB:BB", "Pool Room")],
+        );
+        while s.rows()[s.cursor()] != SettingsRow::Pairings {
+            s.on_key(KeyCode::Down);
+        }
+        s
+    }
+
+    #[test]
+    fn the_pairings_row_counts_what_is_stored() {
+        assert_eq!(with_pairings().pairing_count(), 2);
+        assert_eq!(state().pairing_count(), 0);
+    }
+
+    #[test]
+    fn the_pairings_row_opens_a_list_rather_than_changing_a_setting() {
+        let mut s = with_pairings();
+        let before = s.settings.clone();
+        assert_eq!(s.on_key(KeyCode::Enter), SettingsAction::None);
+        assert!(s.list().is_some());
+        assert_eq!(s.settings, before, "it holds no value to change");
+    }
+
+    #[test]
+    fn left_does_not_open_the_list() {
+        // `←` is what closes it again; a key that undid itself would be a
+        // trap.
+        let mut s = with_pairings();
+        s.on_key(KeyCode::Left);
+        assert!(s.list().is_none());
+    }
+
+    #[test]
+    fn the_open_list_takes_every_key() {
+        // Otherwise `←→` would adjust a latency the user cannot see, on a
+        // screen that is showing them something else entirely.
+        let mut s = with_pairings();
+        s.on_key(KeyCode::Enter);
+        let latency = s.settings.latency_ms;
+        for key in [KeyCode::Right, KeyCode::Char(' '), KeyCode::Char('>')] {
+            assert_eq!(s.on_key(key), SettingsAction::None);
+        }
+        assert_eq!(s.settings.latency_ms, latency, "nothing underneath moved");
+    }
+
+    #[test]
+    fn esc_closes_the_list_first_and_the_overlay_second() {
+        // One Esc should not throw away both screens: the user who opened the
+        // list to look at it expects to get back to settings.
+        let mut s = with_pairings();
+        s.on_key(KeyCode::Enter);
+        assert_eq!(s.on_key(KeyCode::Esc), SettingsAction::None);
+        assert!(s.list().is_none(), "back to the rows");
+        assert_eq!(s.on_key(KeyCode::Esc), SettingsAction::Close);
+    }
+
+    #[test]
+    fn forgetting_bubbles_up_and_the_count_follows() {
+        let mut s = with_pairings();
+        s.on_key(KeyCode::Enter);
+        s.on_key(KeyCode::Char('d')); // arms
+        assert_eq!(
+            s.on_key(KeyCode::Char('d')),
+            SettingsAction::Forget("AA:AA".into())
+        );
+
+        // The caller does the work, then reports back.
+        s.forgotten("AA:AA");
+        assert_eq!(s.pairing_count(), 1);
+        s.on_key(KeyCode::Esc);
+        assert_eq!(s.pairing_count(), 1, "and the row agrees once closed");
+    }
+
+    #[test]
+    fn a_failed_forget_leaves_the_count_alone() {
+        let mut s = with_pairings();
+        s.on_key(KeyCode::Enter);
+        s.pairing_error("pairings.json is read-only");
+        assert_eq!(s.pairing_count(), 2);
+        assert!(s
+            .list()
+            .unwrap()
+            .status()
+            .unwrap()
+            .contains("read-only"));
+    }
+
+    #[test]
+    fn reopening_the_list_shows_what_survived() {
+        // The list is built from `peers` each time it opens. If forgetting only
+        // updated the open list, closing and reopening would resurrect the row.
+        let mut s = with_pairings();
+        s.on_key(KeyCode::Enter);
+        s.forgotten("AA:AA");
+        s.on_key(KeyCode::Esc);
+        s.on_key(KeyCode::Enter);
+        assert_eq!(s.list().unwrap().peers().len(), 1);
+        assert_eq!(s.list().unwrap().peers()[0].device_id, "BB:BB");
     }
 
     #[test]

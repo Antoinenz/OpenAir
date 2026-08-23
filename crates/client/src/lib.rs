@@ -26,7 +26,7 @@ mod resample;
 mod source;
 mod stats;
 pub use mediaremote::{set_media_handler_fn as set_media_handler, MediaCommand};
-pub use pairings::PairingStore;
+pub use pairings::{PairedPeer, PairingStore};
 pub use source::{CaptureSource, SineSource, WavSource};
 pub use stats::{
     buffer_health, ReceiverStat, ReceiverState, StreamCommand, StreamStats, TRIM_MAX_DB,
