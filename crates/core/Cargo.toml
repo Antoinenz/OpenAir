@@ -15,3 +15,13 @@ if-addrs = "0.13"
 # Bind-before-connect, which std::net::TcpStream doesn't expose.
 socket2 = "0.5"
 tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# MMCSS ("Pro Audio" thread scheduling) for the sender thread, and the registry
+# read that tells us whether Windows is honouring our DSCP marking. 0.54 is
+# already in the lockfile via cpal, so this adds no new major version.
+windows = { version = "0.54", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_Registry",
+] }
