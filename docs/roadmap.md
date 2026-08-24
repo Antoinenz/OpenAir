@@ -60,8 +60,6 @@ instead of failing with a dead end.
   Audio is unaffected.
 - **Multi-room is buffered-only.** The realtime ALAC pipeline streams to one
   receiver. This is a limit of our implementation, not the protocol.
-- **Cover art is re-sent periodically** rather than only on track change, which
-  wastes bandwidth on a stream that has none to spare.
 - **Retransmit turnaround is not measured.** The backlog answers requests, but
   nothing tracks how quickly, so "under 5 ms" is an intention rather than a
   number anyone has checked.
