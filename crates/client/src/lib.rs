@@ -1089,8 +1089,19 @@ struct ArtworkSchedule {
 impl ArtworkSchedule {
     /// A new track: send the art, and arm one restatement.
     fn track_changed(&mut self) -> Artwork {
-        self.resent = false;
+        self.reset();
         Artwork::Include
+    }
+
+    /// The track changed but nothing was sent for it -- metadata is switched
+    /// off.
+    ///
+    /// Still has to re-arm. Without this, turning metadata back on would send
+    /// the new track's *text* and then decide its art had already gone out,
+    /// leaving the receiver showing the previous track's cover until something
+    /// else changed.
+    fn reset(&mut self) {
+        self.resent = false;
     }
 
     /// A periodic re-send of the same track.
@@ -1101,6 +1112,49 @@ impl ArtworkSchedule {
         self.resent = true;
         Artwork::Include
     }
+}
+
+/// What the metadata tick should do this time round the loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetadataPush {
+    /// Send nothing.
+    None,
+    /// Send the track that just arrived, with or without its art.
+    Fresh(Artwork),
+    /// Restate the track we are already on.
+    Resend(Artwork),
+}
+
+/// Decide what this tick does, and advance the artwork schedule to match.
+///
+/// Pulled out of the loop so the decision can be tested. The interesting cases
+/// are all about metadata being switched off and back on, which is exactly
+/// where an in-loop version went wrong and where an in-loop test could not
+/// reach.
+fn plan_metadata(
+    enabled: bool,
+    new_track: bool,
+    have_current: bool,
+    resend_due: bool,
+    schedule: &mut ArtworkSchedule,
+) -> MetadataPush {
+    if !enabled {
+        // Off, but the world still moves. A track that arrives now is one
+        // whose art has not been sent to anybody, so the schedule has to know
+        // it is owed -- otherwise switching back on sends the new text under
+        // the old cover.
+        if new_track {
+            schedule.reset();
+        }
+        return MetadataPush::None;
+    }
+    if new_track {
+        return MetadataPush::Fresh(schedule.track_changed());
+    }
+    if have_current && resend_due {
+        return MetadataPush::Resend(schedule.resend());
+    }
+    MetadataPush::None
 }
 
 /// Push one now-playing update to a receiver.
@@ -1681,24 +1735,31 @@ pub fn stream_audio_buffered_multi(
             // replaying a queue. The watcher itself keeps running; only
             // transmission stops.
             let latest = drain_latest_metadata(rx);
-            if !metadata_enabled {
-                if let Some(np) = latest {
-                    current_metadata = Some(np);
-                }
-            } else if let Some(np) = latest {
+            let plan = plan_metadata(
+                metadata_enabled,
+                latest.is_some(),
+                current_metadata.is_some(),
+                last_metadata_send.elapsed() >= METADATA_RESEND_INTERVAL,
+                &mut art_schedule,
+            );
+            if let Some(np) = latest {
+                current_metadata = Some(np);
+            }
+            if let MetadataPush::Fresh(artwork) = plan {
+                let np = current_metadata
+                    .as_ref()
+                    .expect("Fresh implies a track just arrived");
                 info!(title = %np.title, artist = %np.artist, "sending now-playing metadata");
-                let artwork = art_schedule.track_changed();
                 for r in group.iter_mut() {
                     if r.alive {
-                        send_metadata(r, &np, rtptime, artwork);
+                        send_metadata(r, np, rtptime, artwork);
                     }
                 }
                 if let Some(s) = &stats {
                     s.set_now_playing(np.clone());
                 }
-                current_metadata = Some(np);
                 last_metadata_send = Instant::now();
-            } else if let Some(np) = &current_metadata {
+            } else if let (MetadataPush::Resend(artwork), Some(np)) = (plan, &current_metadata) {
                 // Re-send periodically. The first send happens before a single
                 // audio packet has gone out, and a receiver may reasonably
                 // ignore metadata for a stream it hasn't started rendering.
@@ -1711,16 +1772,13 @@ pub fn stream_audio_buffered_multi(
                 // seconds, in 1024-byte encrypted frames on the same control
                 // channel the audio deadlines run through. A four-minute track
                 // spent megabytes restating a picture the receiver already had.
-                if last_metadata_send.elapsed() >= METADATA_RESEND_INTERVAL {
-                    let artwork = art_schedule.resend();
-                    info!(title = %np.title, ?artwork, "re-sending now-playing metadata");
-                    for r in group.iter_mut() {
-                        if r.alive {
-                            send_metadata(r, np, rtptime, artwork);
-                        }
+                info!(title = %np.title, ?artwork, "re-sending now-playing metadata");
+                for r in group.iter_mut() {
+                    if r.alive {
+                        send_metadata(r, np, rtptime, artwork);
                     }
-                    last_metadata_send = Instant::now();
                 }
+                last_metadata_send = Instant::now();
             }
         }
 
@@ -2006,50 +2064,74 @@ mod tests {
         }
     }
 
+    /// The tick, driven the way the loop drives it.
+    ///
+    /// Tests go through `plan_metadata` rather than `ArtworkSchedule` directly:
+    /// the bug this replaced lived in *when the schedule was advanced*, not in
+    /// the schedule, and a test of the type alone passed happily while the call
+    /// site was wrong.
+    struct Ticker {
+        schedule: ArtworkSchedule,
+        enabled: bool,
+        have_current: bool,
+    }
+
+    impl Ticker {
+        fn new() -> Self {
+            Self {
+                schedule: ArtworkSchedule::default(),
+                enabled: true,
+                have_current: false,
+            }
+        }
+
+        /// A track change arrives.
+        fn track(&mut self) -> MetadataPush {
+            self.have_current = true;
+            plan_metadata(self.enabled, true, true, false, &mut self.schedule)
+        }
+
+        /// The re-send interval elapses with no new track.
+        fn tick(&mut self) -> MetadataPush {
+            plan_metadata(self.enabled, false, self.have_current, true, &mut self.schedule)
+        }
+
+        /// A tick before the interval is up.
+        fn idle(&mut self) -> MetadataPush {
+            plan_metadata(self.enabled, false, self.have_current, false, &mut self.schedule)
+        }
+    }
+
     #[test]
     fn a_new_track_sends_its_art() {
-        let mut s = ArtworkSchedule::default();
-        assert_eq!(s.track_changed(), Artwork::Include);
+        assert_eq!(Ticker::new().track(), MetadataPush::Fresh(Artwork::Include));
     }
 
     #[test]
     fn the_art_is_restated_once_and_then_left_alone() {
         // Once, because the first send happens before playback has started and
         // may be ignored. Not twice, because the receiver has it by then.
-        let mut s = ArtworkSchedule::default();
-        s.track_changed();
-        assert_eq!(s.resend(), Artwork::Include);
+        let mut t = Ticker::new();
+        t.track();
+        assert_eq!(t.tick(), MetadataPush::Resend(Artwork::Include));
         for _ in 0..100 {
-            assert_eq!(s.resend(), Artwork::Skip);
+            assert_eq!(t.tick(), MetadataPush::Resend(Artwork::Skip));
         }
-    }
-
-    #[test]
-    fn a_track_change_arms_one_more_restatement() {
-        // A new track is a new picture, so the count starts again.
-        let mut s = ArtworkSchedule::default();
-        s.track_changed();
-        s.resend();
-        assert_eq!(s.resend(), Artwork::Skip);
-
-        s.track_changed();
-        assert_eq!(s.resend(), Artwork::Include, "the new track gets its turn");
-        assert_eq!(s.resend(), Artwork::Skip);
     }
 
     #[test]
     fn art_goes_out_at_most_twice_per_track() {
-        // The invariant the whole type exists for. At ten seconds a tick and
-        // up to 250 KB a picture, an off-by-one here is megabytes per track on
-        // the same channel the audio deadlines run through.
-        let mut s = ArtworkSchedule::default();
+        // The invariant the type exists for. At ten seconds a tick and up to
+        // 250 KB a picture, an off-by-one here is megabytes per track on the
+        // same channel the audio deadlines run through.
+        let mut t = Ticker::new();
         let mut sent = 0;
-        if s.track_changed() == Artwork::Include {
+        if t.track() == MetadataPush::Fresh(Artwork::Include) {
             sent += 1;
         }
         // A ten-minute track at one tick every ten seconds.
         for _ in 0..60 {
-            if s.resend() == Artwork::Include {
+            if t.tick() == MetadataPush::Resend(Artwork::Include) {
                 sent += 1;
             }
         }
@@ -2057,11 +2139,60 @@ mod tests {
     }
 
     #[test]
-    fn a_track_that_never_reaches_a_resend_still_sent_its_art() {
-        // Short track, or a stream that ends: the art must not depend on the
-        // periodic tick ever firing.
-        let mut s = ArtworkSchedule::default();
-        assert_eq!(s.track_changed(), Artwork::Include);
+    fn a_track_change_arms_one_more_restatement() {
+        let mut t = Ticker::new();
+        t.track();
+        t.tick();
+        assert_eq!(t.tick(), MetadataPush::Resend(Artwork::Skip));
+
+        assert_eq!(t.track(), MetadataPush::Fresh(Artwork::Include));
+        assert_eq!(t.tick(), MetadataPush::Resend(Artwork::Include));
+        assert_eq!(t.tick(), MetadataPush::Resend(Artwork::Skip));
+    }
+
+    #[test]
+    fn a_track_that_arrived_while_muted_still_gets_its_art_later() {
+        // Regression. Turning metadata off, letting the track change, and
+        // turning it back on left the new track's art unsent: the schedule
+        // still believed it had restated the *previous* track, so the receiver
+        // showed the old cover until something else changed.
+        let mut t = Ticker::new();
+        t.track();
+        t.tick();
+        assert_eq!(t.tick(), MetadataPush::Resend(Artwork::Skip));
+
+        t.enabled = false;
+        assert_eq!(t.track(), MetadataPush::None, "nothing goes out while off");
+
+        t.enabled = true;
+        assert_eq!(
+            t.tick(),
+            MetadataPush::Resend(Artwork::Include),
+            "the track that arrived while muted is still owed its art"
+        );
+    }
+
+    #[test]
+    fn nothing_is_sent_while_metadata_is_switched_off() {
+        let mut t = Ticker::new();
+        t.enabled = false;
+        assert_eq!(t.track(), MetadataPush::None);
+        assert_eq!(t.tick(), MetadataPush::None);
+    }
+
+    #[test]
+    fn nothing_is_resent_before_the_interval_is_up() {
+        let mut t = Ticker::new();
+        t.track();
+        assert_eq!(t.idle(), MetadataPush::None);
+    }
+
+    #[test]
+    fn nothing_is_resent_before_a_first_track_exists() {
+        // There is nothing to restate, and unwrapping a track we do not have
+        // would panic the stream thread.
+        let mut t = Ticker::new();
+        assert_eq!(t.tick(), MetadataPush::None);
     }
 
     #[test]
