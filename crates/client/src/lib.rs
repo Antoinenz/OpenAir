@@ -389,7 +389,7 @@ pub fn stream_audio(
         sample_rate: SAMPLE_RATE,
     });
     let backlog = control.backlog.clone();
-    let _control_handle = control.spawn_ptp(
+    let control_handle = control.spawn_ptp(
         SocketAddr::new(peer_ip, ports.control_port),
         state.clone(),
         ptp.clock_id,
@@ -475,6 +475,13 @@ pub fn stream_audio(
     }
 
     info!("stream finished, tearing down");
+    // Only the realtime path answers retransmits -- the buffered pipeline runs
+    // over TCP, which does its own recovery -- so this is where the number
+    // exists to report. Silent when the receiver never asked for anything,
+    // which is the good case and does not need a line.
+    if let Some(summary) = control_handle.retransmits().summary() {
+        info!("{summary}");
+    }
     session.set_rate(0).ok();
     session.teardown()?;
     Ok(())

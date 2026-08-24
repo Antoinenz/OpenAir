@@ -228,12 +228,101 @@ enum SyncMode {
     NtpSync,
 }
 
+/// How quickly we answer a receiver's retransmit requests, and how often we
+/// cannot.
+///
+/// # What is and is not measured
+///
+/// The clock starts when `recv_from` hands us the request and stops when the
+/// last reply for it has been written to the socket. That is the part we are
+/// responsible for.
+///
+/// It is deliberately **not** end-to-end. Time the request spent in the kernel
+/// receive buffer before we read it, and the flight time of the reply, are
+/// invisible from here -- measuring those needs timestamps from the receiver,
+/// which the protocol does not give us. Reporting this number as if it were
+/// the round trip would be flattering and wrong.
+///
+/// A **miss** is the more actionable number of the two: it means the receiver
+/// asked for a packet we had already evicted from the backlog, so no answer
+/// was possible at any speed. Misses mean the backlog is too small or the
+/// network is losing enough that recovery has fallen behind.
+#[derive(Debug, Default)]
+pub struct RetransmitStats {
+    requests: AtomicU64,
+    served: AtomicU64,
+    missed: AtomicU64,
+    /// Total handling time in microseconds, for a mean.
+    total_us: AtomicU64,
+    /// Longest single handling time in microseconds.
+    ///
+    /// The worst case is the one that matters: a mean that hides one 40 ms
+    /// stall behind a thousand fast replies describes a stream that dropped
+    /// out as though it were healthy.
+    worst_us: AtomicU64,
+}
+
+impl RetransmitStats {
+    /// Record one handled request: how many packets were found, how many were
+    /// already gone, and how long the whole thing took.
+    pub fn record(&self, served: u64, missed: u64, elapsed: std::time::Duration) {
+        let us = elapsed.as_micros().min(u64::MAX as u128) as u64;
+        self.requests.fetch_add(1, Ordering::Relaxed);
+        self.served.fetch_add(served, Ordering::Relaxed);
+        self.missed.fetch_add(missed, Ordering::Relaxed);
+        self.total_us.fetch_add(us, Ordering::Relaxed);
+        self.worst_us.fetch_max(us, Ordering::Relaxed);
+    }
+
+    pub fn requests(&self) -> u64 {
+        self.requests.load(Ordering::Relaxed)
+    }
+
+    pub fn served(&self) -> u64 {
+        self.served.load(Ordering::Relaxed)
+    }
+
+    /// Packets asked for that had already left the backlog.
+    pub fn missed(&self) -> u64 {
+        self.missed.load(Ordering::Relaxed)
+    }
+
+    /// Longest time taken to answer one request, in microseconds.
+    pub fn worst_us(&self) -> u64 {
+        self.worst_us.load(Ordering::Relaxed)
+    }
+
+    /// Mean time to answer a request, in microseconds. `None` before the first.
+    pub fn mean_us(&self) -> Option<u64> {
+        let n = self.requests();
+        if n == 0 {
+            return None;
+        }
+        Some(self.total_us.load(Ordering::Relaxed) / n)
+    }
+
+    /// A one-line summary, or `None` if the receiver never asked for anything
+    /// -- which is the good case and does not need a line.
+    pub fn summary(&self) -> Option<String> {
+        let mean = self.mean_us()?;
+        Some(format!(
+            "{} retransmit requests, {} packets resent, {} missed, {:.1} ms mean / {:.1} ms worst",
+            self.requests(),
+            self.served(),
+            self.missed(),
+            mean as f64 / 1000.0,
+            self.worst_us() as f64 / 1000.0,
+        ))
+    }
+}
+
 /// Control channel: sends 1 Hz sync packets and answers retransmit requests.
 pub struct ControlChannel {
     socket: UdpSocket,
     pub port: u16,
     stop: Arc<AtomicBool>,
     pub backlog: Arc<Mutex<PacketBacklog>>,
+    pub retransmits: Arc<RetransmitStats>,
 }
 
 impl ControlChannel {
@@ -249,6 +338,7 @@ impl ControlChannel {
             port,
             stop: Arc::new(AtomicBool::new(false)),
             backlog: Arc::new(Mutex::new(PacketBacklog::new(1000))),
+            retransmits: Arc::new(RetransmitStats::default()),
         })
     }
 
@@ -267,6 +357,7 @@ impl ControlChannel {
     fn spawn_inner(self, dest: SocketAddr, state: Arc<SyncState>, mode: SyncMode) -> ControlHandle {
         let stop = self.stop.clone();
         let backlog = self.backlog.clone();
+        let retransmits = self.retransmits.clone();
         let socket = self.socket;
         socket
             .set_read_timeout(Some(std::time::Duration::from_millis(100)))
@@ -324,21 +415,41 @@ impl ControlChannel {
                 // Retransmit requests
                 match socket.recv_from(&mut buf) {
                     Ok((len, peer)) if len >= 8 && buf[1] & 0x7F == 0x55 => {
+                        // Started here, not before the recv: time spent
+                        // blocked waiting for a request is not time spent
+                        // answering one.
+                        let began = std::time::Instant::now();
                         let lost_seq = u16::from_be_bytes([buf[4], buf[5]]);
                         let count = u16::from_be_bytes([buf[6], buf[7]]);
-                        let backlog = backlog.lock().unwrap();
-                        for i in 0..count {
-                            let seq = lost_seq.wrapping_add(i);
-                            if let Some(pkt) = backlog.get(seq) {
-                                let mut resp = Vec::with_capacity(4 + pkt.len());
-                                resp.extend_from_slice(&[0x80, 0xD6]);
-                                resp.extend_from_slice(&seq.to_be_bytes());
-                                resp.extend_from_slice(pkt);
-                                let _ = socket.send_to(&resp, peer);
-                            } else {
-                                debug!(seq, "retransmit miss (not in backlog)");
+                        let mut served = 0u64;
+                        let mut missed = 0u64;
+                        {
+                            let backlog = backlog.lock().unwrap();
+                            for i in 0..count {
+                                let seq = lost_seq.wrapping_add(i);
+                                if let Some(pkt) = backlog.get(seq) {
+                                    let mut resp = Vec::with_capacity(4 + pkt.len());
+                                    resp.extend_from_slice(&[0x80, 0xD6]);
+                                    resp.extend_from_slice(&seq.to_be_bytes());
+                                    resp.extend_from_slice(pkt);
+                                    let _ = socket.send_to(&resp, peer);
+                                    served += 1;
+                                } else {
+                                    missed += 1;
+                                    debug!(seq, "retransmit miss (not in backlog)");
+                                }
                             }
                         }
+                        let elapsed = began.elapsed();
+                        retransmits.record(served, missed, elapsed);
+                        debug!(
+                            first_seq = lost_seq,
+                            count,
+                            served,
+                            missed,
+                            us = elapsed.as_micros() as u64,
+                            "answered a retransmit request"
+                        );
                     }
                     Ok(_) => {}
                     Err(e)
@@ -351,7 +462,11 @@ impl ControlChannel {
                 }
             }
         });
-        ControlHandle { stop: self.stop, thread: Some(thread) }
+        ControlHandle {
+            stop: self.stop,
+            thread: Some(thread),
+            retransmits: self.retransmits,
+        }
     }
 }
 
@@ -359,6 +474,14 @@ impl ControlChannel {
 pub struct ControlHandle {
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
+    retransmits: Arc<RetransmitStats>,
+}
+
+impl ControlHandle {
+    /// How the retransmit answering has been going.
+    pub fn retransmits(&self) -> &Arc<RetransmitStats> {
+        &self.retransmits
+    }
 }
 
 impl Drop for ControlHandle {
@@ -460,6 +583,120 @@ mod tests {
         assert_eq!(&p[8..12], &0xAABB_CCDDu32.to_be_bytes());
         assert_eq!(&p[12..16], &0x1122_3344u32.to_be_bytes());
         assert_eq!(&p[16..20], &100_000u32.to_be_bytes());
+    }
+
+    #[test]
+    fn nothing_is_reported_before_the_first_request() {
+        // A receiver that never asks for anything is the good case, and a
+        // summary line claiming "0.0 ms mean" would imply we measured one.
+        let s = RetransmitStats::default();
+        assert_eq!(s.mean_us(), None);
+        assert_eq!(s.summary(), None);
+    }
+
+    #[test]
+    fn served_and_missed_are_counted_separately() {
+        // A miss is the actionable one: the packet was already evicted, so no
+        // answer was possible at any speed. Folding it into "served" would
+        // hide a backlog that is too small.
+        let s = RetransmitStats::default();
+        s.record(3, 1, std::time::Duration::from_micros(200));
+        assert_eq!(s.requests(), 1);
+        assert_eq!(s.served(), 3);
+        assert_eq!(s.missed(), 1);
+    }
+
+    #[test]
+    fn the_worst_case_survives_a_flood_of_fast_ones() {
+        // The whole reason worst is tracked next to the mean: one 40 ms stall
+        // behind a thousand fast replies is a dropout the mean would hide.
+        let s = RetransmitStats::default();
+        s.record(1, 0, std::time::Duration::from_millis(40));
+        for _ in 0..1000 {
+            s.record(1, 0, std::time::Duration::from_micros(100));
+        }
+        assert_eq!(s.worst_us(), 40_000);
+        assert!(
+            s.mean_us().unwrap() < 1_000,
+            "the mean should look healthy: {:?}",
+            s.mean_us()
+        );
+    }
+
+    #[test]
+    fn the_mean_is_over_requests_not_packets() {
+        // One request can carry many sequence numbers. Dividing by packets
+        // would report a per-request cost several times lower than the truth.
+        let s = RetransmitStats::default();
+        s.record(10, 0, std::time::Duration::from_micros(500));
+        s.record(10, 0, std::time::Duration::from_micros(1500));
+        assert_eq!(s.mean_us(), Some(1000));
+    }
+
+    /// A live control channel answers a real retransmit request, and the time
+    /// it took is recorded.
+    ///
+    /// Worth the socket: the counters are trivial, but "the handler actually
+    /// calls record, on the path a receiver triggers" is the part that could
+    /// silently stop being true.
+    #[test]
+    fn a_real_request_is_answered_and_timed() {
+        let channel = ControlChannel::bind().unwrap();
+        let control_port = channel.port;
+        // One packet in the backlog, and one sequence number that is not.
+        channel.backlog.lock().unwrap().insert(7, vec![0xAAu8; 64]);
+
+        let receiver = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        receiver
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let dest = receiver.local_addr().unwrap();
+
+        let state = Arc::new(SyncState {
+            head_ts: AtomicU64::new(0),
+            start_ts: AtomicU64::new(0),
+            latency: AtomicU64::new(0),
+            t0_ns: AtomicU64::new(0),
+            timeline_gm: AtomicU64::new(0),
+            timeline_offset_ns: std::sync::atomic::AtomicI64::new(0),
+            sample_rate: 44100,
+        });
+        let handle = channel.spawn(dest, state);
+        let stats = handle.retransmits().clone();
+
+        // PT 0x55: "resend two packets starting at 7". Seven is held; eight
+        // is not, so this exercises both arms in one exchange.
+        let mut req = vec![0x80, 0x55, 0x00, 0x01];
+        req.extend_from_slice(&7u16.to_be_bytes());
+        req.extend_from_slice(&2u16.to_be_bytes());
+        receiver
+            .send_to(&req, ("127.0.0.1", control_port))
+            .unwrap();
+
+        // Read until the resend arrives -- the channel also sends 1 Hz sync
+        // packets to this address, so the first packet back may not be ours.
+        let mut buf = [0u8; 256];
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut resent = None;
+        while std::time::Instant::now() < deadline {
+            let Ok((len, _)) = receiver.recv_from(&mut buf) else {
+                break;
+            };
+            if len > 4 && buf[1] == 0xD6 {
+                resent = Some(buf[..len].to_vec());
+                break;
+            }
+        }
+
+        let resent = resent.expect("the held packet should have come back");
+        assert_eq!(u16::from_be_bytes([resent[2], resent[3]]), 7);
+        assert_eq!(&resent[4..], &[0xAAu8; 64], "the payload should be intact");
+
+        assert_eq!(stats.requests(), 1, "one request");
+        assert_eq!(stats.served(), 1, "seven was held");
+        assert_eq!(stats.missed(), 1, "eight was not");
+        assert!(stats.summary().is_some());
+        drop(handle);
     }
 
     #[test]
