@@ -129,6 +129,33 @@ impl PickerState {
         true
     }
 
+    /// Whether we hold credentials for this device id.
+    ///
+    /// Exposed so a caller can check the picker agrees with the store, rather
+    /// than inferring it from a row that may not exist yet -- receivers appear
+    /// as mDNS answers arrive, so "no row" and "not paired" are different
+    /// things.
+    pub fn holds_pairing(&self, device_id: &str) -> bool {
+        self.paired.contains(device_id)
+    }
+
+    /// Forget a stored pairing, so the rows stop claiming that receiver is
+    /// ready to stream to.
+    ///
+    /// The picker takes a snapshot of what is paired when it opens, and the
+    /// settings overlay can delete a pairing on top of it. Without this the
+    /// stale snapshot survives the overlay closing, `needs_pairing` stays
+    /// false, and selecting that receiver skips the PIN prompt entirely --
+    /// which does not fail cleanly. With no credentials the connection falls
+    /// back to Transient pairing, an Apple TV answers 470, and the user is
+    /// told "connection failed" moments after being told the pairing was
+    /// forgotten.
+    pub fn forget_pairing(&mut self, device_id: &str) {
+        if self.paired.remove(device_id) {
+            self.rebuild_rows();
+        }
+    }
+
     fn rebuild_rows(&mut self) {
         // Remember what the cursor was pointing at: rows re-sort as devices
         // arrive, and a cursor pinned to an index would drift onto a different
@@ -374,6 +401,58 @@ mod tests {
 
     fn picker() -> PickerState {
         PickerState::new(Settings::default(), Vec::new(), true)
+    }
+
+    #[test]
+    fn forgetting_a_pairing_makes_the_receiver_ask_for_a_pin_again() {
+        // Regression. The picker snapshots what is paired when it opens, and
+        // the settings overlay can delete a pairing on top of it. A stale
+        // snapshot left `needs_pairing` false, so selecting that receiver
+        // skipped the PIN prompt -- and with no credentials the connection
+        // falls back to Transient, an Apple TV answers 470, and the user is
+        // told "connection failed" moments after being told it was forgotten.
+        let mut p = PickerState::new(
+            Settings::default(),
+            vec!["AA:BB".to_string()],
+            true,
+        );
+        p.insert(device("Living Room", "192.168.1.64", "AA:BB", NEEDS_PAIRING));
+        assert!(p.rows()[0].paired, "starts paired");
+        assert!(!p.rows()[0].needs_pairing, "so no PIN is wanted");
+
+        p.forget_pairing("AA:BB");
+        assert!(!p.rows()[0].paired);
+        assert!(
+            p.rows()[0].needs_pairing,
+            "after forgetting, it must route through pairing again"
+        );
+    }
+
+    #[test]
+    fn forgetting_a_pairing_we_never_had_changes_nothing() {
+        let mut p = PickerState::new(
+            Settings::default(),
+            vec!["AA:BB".to_string()],
+            true,
+        );
+        p.insert(device("Living Room", "192.168.1.64", "AA:BB", NEEDS_PAIRING));
+        p.forget_pairing("ZZ:ZZ");
+        assert!(p.rows()[0].paired, "the one we do hold is untouched");
+    }
+
+    #[test]
+    fn forgetting_a_transient_receiver_still_needs_no_pin() {
+        // Shairport negotiates keys per session, so a stored credential was
+        // never what made it usable. Forgetting one must not start demanding a
+        // PIN it will never show.
+        let mut p = PickerState::new(
+            Settings::default(),
+            vec!["CC:DD".to_string()],
+            true,
+        );
+        p.insert(device("Pool Room", "192.168.1.51", "CC:DD", TRANSIENT));
+        p.forget_pairing("CC:DD");
+        assert!(!p.rows()[0].needs_pairing);
     }
 
     /// `n` transient devices, named so their sort order is the insertion

@@ -385,21 +385,40 @@ impl<'a> App<'a> {
             .and_then(|mut store| store.forget(device_id))
             .map_err(|e| e.to_string());
 
-        let Screen::Settings(s) = &mut self.screen else {
-            return;
-        };
         match outcome {
             Ok(true) => {
                 tracing::info!(device_id, "forgot stored pairing");
-                s.state.forgotten(device_id);
+                self.pairing_forgotten(device_id);
             }
             // Not on disk, but on screen: the file changed under us. Removing
             // the row is still the honest thing to show.
-            Ok(false) => s.state.forgotten(device_id),
+            Ok(false) => self.pairing_forgotten(device_id),
             Err(why) => {
                 tracing::warn!(device_id, "could not forget pairing: {why}");
-                s.state.pairing_error(why);
+                if let Screen::Settings(s) = &mut self.screen {
+                    s.state.pairing_error(why);
+                }
             }
+        }
+    }
+
+    /// Bring every screen into line with a pairing that is now gone.
+    ///
+    /// Separate from the disk work so it can be tested: a test that went
+    /// through `forget_pairing` would read and rewrite the real
+    /// `pairings.json`, which is not something a test suite should do to
+    /// somebody's machine.
+    fn pairing_forgotten(&mut self, device_id: &str) {
+        let Screen::Settings(s) = &mut self.screen else {
+            return;
+        };
+        s.state.forgotten(device_id);
+        // The picker underneath holds a snapshot of what is paired, taken when
+        // it opened, and that snapshot decides whether selecting a receiver
+        // routes through the PIN prompt. Leaving it stale means no prompt and
+        // a confusing failure instead.
+        if let Screen::Picker(p) = s.origin.as_mut() {
+            p.state.forget_pairing(device_id);
         }
     }
 
@@ -1059,6 +1078,48 @@ mod tests {
             }))
         });
         App::new(Settings::default(), LogBuffer::new(10), false, launch)
+    }
+
+    #[test]
+    fn forgetting_a_pairing_reaches_the_picker_underneath() {
+        // Regression, and the reason this is split from the disk work: the
+        // picker snapshots what is paired when it opens, and that snapshot
+        // decides whether selecting a receiver routes through the PIN prompt.
+        // Forgetting a pairing and leaving the snapshot stale meant no prompt
+        // -- and with no credentials the connection falls back to Transient,
+        // an Apple TV answers 470, and the user is told "connection failed"
+        // moments after being told the pairing was forgotten.
+        let started = std::sync::Mutex::new(Vec::new());
+        let mut app = test_app(&started);
+
+        // A picker that believes this receiver is already paired.
+        app.screen = Screen::Picker(Box::new(PickerScreen {
+            state: PickerState::new(Settings::default(), vec!["AA:BB".into()], false),
+            browse: None,
+        }));
+        app.open_settings();
+
+        app.pairing_forgotten("AA:BB");
+
+        app.close_settings();
+        let Screen::Picker(p) = &app.screen else {
+            panic!("expected the picker");
+        };
+        assert!(
+            !p.state.holds_pairing("AA:BB"),
+            "the picker still believes it is paired"
+        );
+    }
+
+    #[test]
+    fn forgetting_a_pairing_with_no_picker_underneath_is_harmless() {
+        // Settings can be opened from the dashboard too, where there is no
+        // picker to update.
+        let started = std::sync::Mutex::new(Vec::new());
+        let mut app = test_app(&started);
+        app.open_settings();
+        app.pairing_forgotten("AA:BB");
+        assert_eq!(app.screen().name(), "settings");
     }
 
     #[test]
