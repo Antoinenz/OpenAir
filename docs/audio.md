@@ -109,6 +109,32 @@ samples are passed through untouched. On Windows you can set this per device in
 Sound Control Panel → device → Properties → Advanced, and it is worth doing:
 set the virtual cable to 44.1 kHz if you use `--handoff`.
 
+## Network priority and scheduling
+
+Two things are done automatically to keep the audio on time. Neither has a
+flag; both log what they did at `--debug`.
+
+**Packets are marked DSCP EF** (Expedited Forwarding, codepoint 46) — the
+standard marking for real-time media, and the one Wi-Fi access points map to
+the 802.11e voice category, so the frames contend for the air sooner on a busy
+network. Every socket carrying audio gets it, including the control channel
+that carries retransmits: a resent frame arriving after its play time is worth
+nothing.
+
+> **On Windows this is usually ignored, and OpenAir says so.** Windows has
+> silently refused application TOS marking since XP SP2 — the call succeeds and
+> the packets go out unmarked. Setting `DisableUserTOSSetting` to `0` under
+> `HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters` re-enables it,
+> and OpenAir reads that value so `--debug` tells you which case you are in
+> rather than claiming a success it did not get.
+
+**The sending thread runs at audio priority.** On Windows it registers with
+MMCSS under "Pro Audio", the same mechanism audio applications use. The sender
+wakes every ~23 ms to send a frame with a deadline attached, so a late wake-up
+is not a slowdown, it is a dropout — and at normal priority a busy desktop can
+cause one. Linux would want `SCHED_FIFO`, which needs privileges, so it is
+part of the Linux work rather than half-done now.
+
 ## Multi-room timing
 
 Every receiver in a group is anchored at one shared instant, on the clock it

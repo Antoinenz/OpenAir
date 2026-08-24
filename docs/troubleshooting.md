@@ -62,6 +62,10 @@ problem, which usually means Wi-Fi.
 
 See [audio.md](audio.md) for what the latency setting actually buys you.
 
+If you want the Wi-Fi prioritisation to actually apply on Windows, `--debug`
+will tell you whether it does — see the DSCP note in
+[audio.md](audio.md#network-priority-and-scheduling).
+
 ## One room is late
 
 Some receivers add their own delay downstream of AirPlay — a soundbar's DSP, an

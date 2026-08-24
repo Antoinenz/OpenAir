@@ -24,11 +24,6 @@ with a boomy soundbar want different curves, and the receiver is the only place
 that distinction exists. Applied per receiver before encoding, adjustable on
 that receiver's row.
 
-**Real-time hardening.** DSCP EF marking so Wi-Fi access points treat the audio
-as the real-time traffic it is, sender thread priority, and tighter retransmit
-turnaround. This is the difference between "usually fine" and "fine on a busy
-network".
-
 ## After that
 
 **Linux.** PipeWire capture, plus the privileged helper that PTP needs — ports
@@ -50,6 +45,18 @@ nothing left to explain away. AirPlay video is a separate protocol layered on
 the same discovery and pairing, so the foundations carry over; the work is
 H.264 encoding, its own timing model, and FairPlay.
 
+## Done recently
+
+**Real-time hardening.** DSCP EF marking on every socket carrying audio, and
+the sender thread registered with the platform's audio scheduler. See
+[audio.md](audio.md) — including the honest caveat that Windows ignores the
+marking unless a registry value is set, which OpenAir reads and reports rather
+than assuming.
+
+**Pairing management.** See and forget stored pairings from settings, and a
+receiver that rejects credentials it once accepted now offers to pair again
+instead of failing with a dead end.
+
 ## Known gaps
 
 - **An Apple TV shows no AirPlay UI at all** for any session after the first
@@ -61,6 +68,9 @@ H.264 encoding, its own timing model, and FairPlay.
   receiver. This is a limit of our implementation, not the protocol.
 - **Cover art is re-sent periodically** rather than only on track change, which
   wastes bandwidth on a stream that has none to spare.
+- **Retransmit turnaround is not measured.** The backlog answers requests, but
+  nothing tracks how quickly, so "under 5 ms" is an intention rather than a
+  number anyone has checked.
 
 ## Not planned
 

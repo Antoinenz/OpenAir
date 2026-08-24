@@ -30,6 +30,9 @@ pairing, encrypted RTSP, PTP timing, the lot.
   the receiver's screen, and an Apple TV's remote controls your music.
 - **Per-receiver trim.** Volume and play offset per room, adjustable while
   streaming, so a slow soundbar or a bright speaker can be corrected in place.
+- **Pairings you can manage.** See what you are paired with and forget one from
+  settings; a receiver that was reset offers to pair again rather than just
+  failing.
 
 Hardware-verified against **Apple TV** (HD and 4K) and **Shairport Sync**.
 
@@ -91,9 +94,9 @@ is nothing yet to capture *from*. See [the roadmap](docs/roadmap.md).
 
 ## Roadmap
 
-Next up: published binaries, managing stored pairings from the TUI, **Apple TV
-remote control built in** (drive the Apple TV itself, not just receive what its
-remote sends), **per-receiver graphic EQ**, and real-time network hardening.
+Next up: published binaries, **Apple TV remote control built in** (drive the
+Apple TV itself, not just receive what its remote sends), and **per-receiver
+graphic EQ**.
 
 After that, Linux (PipeWire capture and the privileged PTP helper) and HomePod
 verification.
