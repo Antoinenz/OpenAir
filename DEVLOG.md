@@ -4,6 +4,138 @@
 
 ---
 
+## 2026-08-24 — Session 22: discoverability, pairing management, hardening
+
+Four strands, and one bug I put in and took back out an hour later.
+
+### `--help`, and a test that makes drift impossible
+
+Every flag was documented only in the README, so you had to have found the
+repository to learn what the program accepts. Three flags
+(`--no-media-controls`, `--random-sender-id`, `--impersonate-iphone`) were not
+even there.
+
+Argument handling here is hand-rolled — flags are extracted from anywhere in
+the command line — so there is no parser to derive help from, and help text
+drifts from reality silently. The test reads `main.rs` with `include_str!`,
+scans for every `"--flag"` literal the parser matches on, and asserts each
+appears in the help. **An undocumented flag is now a build failure.** It caught
+those three immediately.
+
+### The README was doing six jobs
+
+339 lines: introduction, flag reference, TUI manual, pipeline explainer,
+Windows setup, roadmap. Someone arriving had to read a manual to find out
+whether they wanted the program. Now 123 lines, with six pages under `docs/`.
+
+Two things it had never said and should have: there is no binary release, and
+building needs a C toolchain because the AAC and ALAC encoders compile from
+source. Someone without VS Build Tools would have hit a wall with no
+explanation.
+
+`audio.md` also answers "is it lossless" honestly, including the two things
+upstream of the encoder that stop it being bit-exact by default — the −8 dB
+default volume and 48 kHz resampling — and that the TUI always uses the lossy
+pipeline, which was previously discoverable only by reading the source.
+
+### Pairing management
+
+The only way to drop a pairing was to edit `pairings.json` by hand. The store
+now records the receiver's *name* alongside its credentials — without that, the
+only handle a person has on a stored pairing is a MAC address, and a list
+screen is close to pointless.
+
+Two decisions worth keeping:
+
+- The arming for a delete is held as a **device id, not a row index**. An index
+  survives a list that shifts underneath it, and the next `d` forgets a
+  different receiver, silently.
+- The disk work stays in `app.rs`, which reports back whether it happened. A
+  row that vanished while the file still held the credentials would be a lie
+  the user only discovers next time the receiver connects without asking for a
+  PIN.
+
+### A rejected pairing is not a failed connection
+
+A reset Apple TV fails forever, and it looked exactly like "connection
+refused" — worse, the connect path then attached a `--bind` hint suggesting the
+network interface was at fault, sending the user to change something that was
+never wrong.
+
+`PairingError::is_authentication` covers both shapes a reset accessory
+presents: the Authentication TLV code, and `PeerMismatch`, where it answers
+with an identity that is not the one we stored. Only in pair-verify — the same
+code during pair-setup means a mistyped PIN.
+
+The connecting screen now routes those receivers back through the PIN prompt,
+carrying the whole group so the retry rebuilds it. **Offered once per receiver
+per run**: skipping leaves the stale credentials in place, so the next attempt
+fails identically, and without the guard the two screens hand the user back and
+forth with no way out but quitting. Verified by deleting the guard and watching
+the test fail.
+
+`needs_repairing` walks the error's source chain rather than checking its head,
+because the call site sees whatever the setup closure boxed up. Also verified
+by mutation: breaking the walk fails the wrapped-error test.
+
+### Real-time hardening (phase 9)
+
+**Thread priority works.** MMCSS "Pro Audio" on the two pacing loops, verified
+`Raised` on real hardware. The sender wakes every ~23 ms with a play deadline
+attached, so a delayed wake-up is a dropout, not a slowdown. HIGH rather than
+CRITICAL — our duty cycle is milliseconds, not microseconds, and CRITICAL would
+be rude to the actual audio driver.
+
+**DSCP EF mostly does not.** Windows has silently refused application TOS
+marking since XP SP2: `setsockopt` returns success and the packets go out
+marked zero. So the module reads `DisableUserTOSSetting` and reports `Ignored`
+*with the reason*. On this machine it is Ignored, as predicted before writing
+it.
+
+A QoS feature that quietly does nothing is worse than none, because it moves
+the problem from "unsolved" to "believed solved". `Marking::effective` is that
+distinction, and only `Applied` passes.
+
+Retransmit turnaround is now measured — phase 9 had claimed "<5 ms" since it
+was written with nothing timing it. Deliberately **not** end-to-end: the clock
+runs from `recv_from` to the last reply written. Time in the kernel buffer is
+invisible from here, and reporting it as a round trip would be flattering and
+wrong. Misses are counted separately, being the actionable half. Realtime path
+only — the buffered pipeline is TCP.
+
+### Cover art, and the bug I wrote
+
+The periodic metadata re-send called `send_metadata`, which sends the artwork.
+Its own comment claimed the re-send "costs ~90 bytes" — true of the DMAP
+bundle, wrong by three orders of magnitude about what the call did. Every ten
+seconds, all track long, OpenAir restated a 70–250 KB picture the receiver
+already had, in 1024-byte encrypted frames on the same control channel the
+audio deadlines run through. A four-minute track spent megabytes on it.
+
+Then, reviewing my own commit an hour later: the schedule was only advanced
+where something was actually sent, so a track arriving while metadata was
+switched *off* left it believing it had restated the previous track. Turning
+metadata back on sent the new text under the old cover.
+
+The first regression test for that was worse than useless — it drove
+`ArtworkSchedule` directly and passed just as happily with the call-site fix
+deleted. It documented the rule without protecting it, which is the same
+weakness that let the bug in. The decision moved out of the loop into
+`plan_metadata`, the tests drive that, and deleting the fix now fails.
+
+**The lesson, restated:** the bug lived in *when* the schedule was advanced,
+not in the schedule. A test has to be able to reach the thing that was wrong.
+Mutation-testing each of the three guards this session took one build apiece
+and caught one worthless test.
+
+### Process note
+
+`cargo fmt --all` reformatted 34 files — the repo has never been rustfmt-clean.
+Reverted; that is its own decision, not something to smuggle into a feature
+commit.
+
+---
+
 ## 2026-08-23 — Session 21: three bugs behind one symptom
 
 A three-room dinner party, 2 s buffer, `--log` on. Reported as: the music
