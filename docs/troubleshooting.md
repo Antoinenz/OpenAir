@@ -40,12 +40,22 @@ OpenAir will usually suggest the address to try in the error.
 ## A receiver that used to work now refuses
 
 Its stored credentials are no longer valid — a factory reset or a tvOS update
-will do it. Until re-pairing lands in the TUI, delete that receiver's entry
-from `%APPDATA%\OpenAir\pairings.json` and pair again:
+will do it.
+
+OpenAir detects this and offers to pair again: the receiver goes back to the
+PIN prompt, and once you have typed the four digits the stream starts. Each
+receiver is offered this once per run, so skipping it does not trap you in a
+loop.
+
+From the command line, or if you would rather do it yourself:
 
 ```console
 openair pair "Living Room"
 ```
+
+You can also drop the stored pairing outright — settings (`s`) → **pairings**,
+then `d` twice on the row. That is the same as deleting its entry from
+`%APPDATA%\OpenAir\pairings.json` by hand.
 
 ## The audio keeps cutting out
 

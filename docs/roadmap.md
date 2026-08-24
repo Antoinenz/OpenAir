@@ -8,12 +8,6 @@ date attached.
 **Published binaries.** There is no release yet — everything is built from
 source. Windows first, since that is the platform that works end to end.
 
-**Pairing management.** See which receivers you have credentials for and forget
-one, from settings. Today the only way to drop a pairing is to edit
-`pairings.json` by hand. Alongside it: when a receiver rejects credentials it
-previously accepted (an Apple TV that has been factory reset, say), offer to
-re-pair from the TUI instead of failing with an error.
-
 **Apple TV remote control, built in.** Drive the Apple TV *itself* from the
 OpenAir TUI — navigation, playback, the lot — rather than only receiving what
 its remote sends us. This is a different protocol from AirPlay (MRP/Companion),
