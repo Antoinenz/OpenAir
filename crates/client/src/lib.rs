@@ -1051,12 +1051,57 @@ fn drain_latest_metadata(
     latest
 }
 
+/// Whether a metadata push should carry the cover art with it.
+///
+/// Worth a type rather than a bool at the call site: the text bundle is ~90
+/// bytes and the artwork is 70-250 KB, sent as 1024-byte encrypted frames on
+/// the same control channel the audio deadlines depend on. The difference
+/// between the two is three orders of magnitude, and it should be impossible
+/// to pick the wrong one by accident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Artwork {
+    Include,
+    Skip,
+}
+
+/// Decides whether a given metadata push carries the cover art.
+///
+/// The rule is "at most twice per track": once when the track changes, and
+/// once more on the first periodic re-send, because the first send happens
+/// before a single audio packet has gone out and a receiver may reasonably
+/// ignore metadata for a stream it has not started rendering.
+///
+/// A type rather than a loose bool so the invariant is checkable. The cost of
+/// getting it wrong is not a wrong picture, it is megabytes of control-channel
+/// traffic competing with the audio deadlines.
+#[derive(Debug, Default)]
+struct ArtworkSchedule {
+    resent: bool,
+}
+
+impl ArtworkSchedule {
+    /// A new track: send the art, and arm one restatement.
+    fn track_changed(&mut self) -> Artwork {
+        self.resent = false;
+        Artwork::Include
+    }
+
+    /// A periodic re-send of the same track.
+    fn resend(&mut self) -> Artwork {
+        if self.resent {
+            return Artwork::Skip;
+        }
+        self.resent = true;
+        Artwork::Include
+    }
+}
+
 /// Push one now-playing update to a receiver.
 ///
 /// Failures are logged and swallowed: a receiver that rejects metadata (or
 /// artwork specifically — Shairport may not accept images) must keep playing
 /// audio. The screen is never worth the stream.
-fn send_metadata(r: &mut BufferedReceiver, np: &NowPlaying, rtptime: u32) {
+fn send_metadata(r: &mut BufferedReceiver, np: &NowPlaying, rtptime: u32, artwork: Artwork) {
     let dmap = openair_rtsp::dmap::encode_now_playing(&np.title, &np.artist, &np.album);
     // Log the exact bundle: the receiver answers 200 OK even when it declines to
     // display, so the wire bytes are the only way to tell a content problem from
@@ -1073,6 +1118,9 @@ fn send_metadata(r: &mut BufferedReceiver, np: &NowPlaying, rtptime: u32) {
     );
     if let Err(e) = r.session.set_metadata(&dmap, rtptime) {
         warn!(receiver = %r.name, "set_metadata failed (continuing): {e}");
+    }
+    if artwork == Artwork::Skip {
+        return;
     }
     if let Some((bytes, mime)) = &np.art {
         if let Err(e) = r.session.set_artwork(bytes, mime, rtptime) {
@@ -1493,6 +1541,7 @@ pub fn stream_audio_buffered_multi(
     // Gates transmission only; the watcher upstream keeps running either way.
     let mut metadata_enabled = metadata_rx.is_some();
     let mut last_metadata_send = Instant::now();
+    let mut art_schedule = ArtworkSchedule::default();
 
     // Auto-latency: track the minimum play-deadline lead over each window; if
     // it stays under the floor, step the latency up (bump-only, capped).
@@ -1521,7 +1570,9 @@ pub fn stream_audio_buffered_multi(
                         ) {
                             // Bring the newcomer's screen up to date too.
                             if let Some(np) = &current_metadata {
-                                send_metadata(&mut br, np, rtptime);
+                                // A newcomer has never seen this track, so it
+                                // gets the art as well as the text.
+                                send_metadata(&mut br, np, rtptime, Artwork::Include);
                             }
                             group.push(br);
                         }
@@ -1629,9 +1680,10 @@ pub fn stream_audio_buffered_multi(
                 }
             } else if let Some(np) = latest {
                 info!(title = %np.title, artist = %np.artist, "sending now-playing metadata");
+                let artwork = art_schedule.track_changed();
                 for r in group.iter_mut() {
                     if r.alive {
-                        send_metadata(r, &np, rtptime);
+                        send_metadata(r, &np, rtptime, artwork);
                     }
                 }
                 if let Some(s) = &stats {
@@ -1643,12 +1695,21 @@ pub fn stream_audio_buffered_multi(
                 // Re-send periodically. The first send happens before a single
                 // audio packet has gone out, and a receiver may reasonably
                 // ignore metadata for a stream it hasn't started rendering.
-                // Re-stating it once playback is established costs ~90 bytes.
+                //
+                // The art goes out on the *first* re-send only, for the same
+                // reason the text does, and never again for this track. Every
+                // later tick is the ~90-byte text bundle.
+                //
+                // It used to carry the art every time: 70-250 KB, every ten
+                // seconds, in 1024-byte encrypted frames on the same control
+                // channel the audio deadlines run through. A four-minute track
+                // spent megabytes restating a picture the receiver already had.
                 if last_metadata_send.elapsed() >= METADATA_RESEND_INTERVAL {
-                    info!(title = %np.title, "re-sending now-playing metadata");
+                    let artwork = art_schedule.resend();
+                    info!(title = %np.title, ?artwork, "re-sending now-playing metadata");
                     for r in group.iter_mut() {
                         if r.alive {
-                            send_metadata(r, np, rtptime);
+                            send_metadata(r, np, rtptime, artwork);
                         }
                     }
                     last_metadata_send = Instant::now();
@@ -1936,6 +1997,64 @@ mod tests {
         fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
             Some(self.0.as_ref())
         }
+    }
+
+    #[test]
+    fn a_new_track_sends_its_art() {
+        let mut s = ArtworkSchedule::default();
+        assert_eq!(s.track_changed(), Artwork::Include);
+    }
+
+    #[test]
+    fn the_art_is_restated_once_and_then_left_alone() {
+        // Once, because the first send happens before playback has started and
+        // may be ignored. Not twice, because the receiver has it by then.
+        let mut s = ArtworkSchedule::default();
+        s.track_changed();
+        assert_eq!(s.resend(), Artwork::Include);
+        for _ in 0..100 {
+            assert_eq!(s.resend(), Artwork::Skip);
+        }
+    }
+
+    #[test]
+    fn a_track_change_arms_one_more_restatement() {
+        // A new track is a new picture, so the count starts again.
+        let mut s = ArtworkSchedule::default();
+        s.track_changed();
+        s.resend();
+        assert_eq!(s.resend(), Artwork::Skip);
+
+        s.track_changed();
+        assert_eq!(s.resend(), Artwork::Include, "the new track gets its turn");
+        assert_eq!(s.resend(), Artwork::Skip);
+    }
+
+    #[test]
+    fn art_goes_out_at_most_twice_per_track() {
+        // The invariant the whole type exists for. At ten seconds a tick and
+        // up to 250 KB a picture, an off-by-one here is megabytes per track on
+        // the same channel the audio deadlines run through.
+        let mut s = ArtworkSchedule::default();
+        let mut sent = 0;
+        if s.track_changed() == Artwork::Include {
+            sent += 1;
+        }
+        // A ten-minute track at one tick every ten seconds.
+        for _ in 0..60 {
+            if s.resend() == Artwork::Include {
+                sent += 1;
+            }
+        }
+        assert_eq!(sent, 2, "art was sent {sent} times over one track");
+    }
+
+    #[test]
+    fn a_track_that_never_reaches_a_resend_still_sent_its_art() {
+        // Short track, or a stream that ends: the art must not depend on the
+        // periodic tick ever firing.
+        let mut s = ArtworkSchedule::default();
+        assert_eq!(s.track_changed(), Artwork::Include);
     }
 
     #[test]
