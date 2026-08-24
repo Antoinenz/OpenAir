@@ -24,8 +24,6 @@
 //! configured to honour it, because a QoS feature that quietly does nothing is
 //! worse than no QoS feature at all: it moves the problem from "unsolved" to
 //! "believed solved".
-use std::net::UdpSocket;
-
 use socket2::SockRef;
 
 /// Expedited Forwarding: DSCP 46, in the top six bits of the TOS byte.
@@ -54,12 +52,26 @@ impl Marking {
     }
 }
 
-/// Ask for EF marking on an already-connected UDP socket.
+/// Ask for EF marking on a socket.
+///
+/// Generic over the platform's socket handle so it takes both a `TcpStream`
+/// (buffered pipeline) and a `UdpSocket` (realtime), which carry the audio on
+/// different transports but want the same treatment from the network.
 ///
 /// Never fails outward. A stream that refused to start because it could not
 /// set a QoS hint would be trading the whole feature for a nicety.
-pub fn mark_ef(socket: &UdpSocket) -> Marking {
-    let sock = SockRef::from(socket);
+#[cfg(windows)]
+pub fn mark_ef<S: std::os::windows::io::AsSocket>(socket: &S) -> Marking {
+    mark(SockRef::from(socket))
+}
+
+/// See the Windows definition above.
+#[cfg(unix)]
+pub fn mark_ef<S: std::os::fd::AsFd>(socket: &S) -> Marking {
+    mark(SockRef::from(socket))
+}
+
+fn mark(sock: SockRef<'_>) -> Marking {
     if let Err(e) = sock.set_tos(DSCP_EF) {
         let marking = Marking::Failed(e.to_string());
         tracing::debug!("could not request EF marking: {e}");
@@ -160,13 +172,25 @@ mod tests {
 
     #[test]
     fn marking_a_real_socket_reports_what_happened() {
-        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         match mark_ef(&socket) {
             // On Windows the honest answer is almost always Ignored, and that
             // is the point of reporting it rather than assuming.
             Marking::Applied | Marking::Ignored(_) => {}
             Marking::Failed(why) => assert!(!why.is_empty(), "a refusal must say why"),
         }
+    }
+
+    #[test]
+    fn both_transports_are_accepted() {
+        // The buffered pipeline sends over TCP and the realtime one over UDP.
+        // A helper that only compiled for one of them would be discovered at
+        // the call site instead of here.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let tcp = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let _ = mark_ef(&tcp);
+        let _ = mark_ef(&udp);
     }
 
     #[test]

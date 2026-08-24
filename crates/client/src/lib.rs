@@ -418,6 +418,10 @@ pub fn stream_audio(
     // --- Audio send loop ---
     let audio_sock = UdpSocket::bind(("0.0.0.0", 0))?;
     audio_sock.connect(SocketAddr::new(peer_ip, ports.data_port))?;
+    openair_core::qos::mark_ef(&audio_sock);
+    // Held for the rest of the send loop: dropping it here would revert the
+    // priority immediately and quietly do nothing at all.
+    let _priority = openair_core::realtime::raise_current_thread();
     let mut cipher = AudioCipher::new(&session.shk);
 
     let packet_dur = Duration::from_secs_f64(FRAMES_PER_PACKET as f64 / SAMPLE_RATE as f64);
@@ -720,6 +724,7 @@ fn prepare_receiver(
     let data_stream =
         openair_core::net::connect_from_best_source(SocketAddr::new(peer_ip, session.ports.data_port))?;
     data_stream.set_nodelay(true).ok();
+    openair_core::qos::mark_ef(&data_stream);
     let cipher = AudioCipher::new(&session.shk);
     Ok(PreparedReceiver {
         name,
@@ -1293,6 +1298,11 @@ pub fn stream_audio_buffered_multi(
     if targets.is_empty() {
         return Err("no receivers given".into());
     }
+    // This function *is* the pacing loop: it wakes roughly every 23 ms to send
+    // a frame with a play deadline attached, for the whole life of the stream.
+    // Held to the end of the function, so the priority lasts as long as the
+    // sending does.
+    let _priority = openair_core::realtime::raise_current_thread();
     let group_ips: Vec<std::net::IpAddr> = targets.iter().map(|t| t.addr.ip()).collect();
 
     // One PTP node for the whole group, running before any receiver starts
@@ -1415,6 +1425,7 @@ pub fn stream_audio_buffered_multi(
             let data_stream =
                 openair_core::net::connect_from_best_source(SocketAddr::new(peer_ip, r.session.ports.data_port))?;
             data_stream.set_nodelay(true).ok();
+            openair_core::qos::mark_ef(&data_stream);
             r.session.record(seq as u16, first_rtptime)?;
             let (tx, handle) = spawn_writer(data_stream, r.name.clone());
             r.writer = Some(handle);

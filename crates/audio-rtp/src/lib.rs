@@ -240,6 +240,10 @@ impl ControlChannel {
     pub fn bind() -> std::io::Result<Self> {
         let socket = UdpSocket::bind(("0.0.0.0", 0))?;
         let port = socket.local_addr()?.port();
+        // This channel carries retransmit replies, which are the most
+        // deadline-bound packets we send: a resent frame that arrives after
+        // its play time is worth nothing at all.
+        openair_core::qos::mark_ef(&socket);
         Ok(ControlChannel {
             socket,
             port,
