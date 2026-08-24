@@ -125,8 +125,40 @@ weakness that let the bug in. The decision moved out of the loop into
 
 **The lesson, restated:** the bug lived in *when* the schedule was advanced,
 not in the schedule. A test has to be able to reach the thing that was wrong.
-Mutation-testing each of the three guards this session took one build apiece
-and caught one worthless test.
+
+### And a second one, in this morning's feature
+
+Reviewing further: the picker snapshots which devices are paired when it opens,
+and that snapshot decides whether selecting a receiver routes through the PIN
+prompt. Forgetting a pairing from the settings overlay updated the store and
+the list but not the picker underneath, so pressing Enter on that receiver
+skipped pairing entirely — and then did not fail cleanly, because with no
+credentials the connection falls back to Transient, an Apple TV answers 470,
+and the user is told "connection failed" seconds after being told the pairing
+was forgotten.
+
+Notably this is the one case the new re-pair flow does *not* catch:
+`CredentialsRejected` means the receiver refused a credential we had, and here
+we had none.
+
+Screen updates are now split from the disk work into `pairing_forgotten`, so it
+can be tested — going through `forget_pairing` would read and rewrite the real
+`pairings.json`, which is not something a test suite should do to somebody's
+machine.
+
+### The pattern worth naming
+
+Three times today a test drove the *part* and not the *wiring*, and passed
+happily with the call-site fix deleted:
+
+- `ArtworkSchedule` directly, instead of the tick that advances it
+- `PickerState::forget_pairing` directly, instead of the App path that calls it
+- (caught early) the credentials check on a bare error, instead of a wrapped one
+
+Every one was found the same way: delete the fix, run the tests, see whether
+anything goes red. That costs one build. Two of the three had to be rewritten,
+and the reviews that found the underlying bugs were worth more than the
+features they were reviewing.
 
 ### Process note
 
