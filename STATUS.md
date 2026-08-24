@@ -253,6 +253,7 @@ recovers by restarting the receiver, so a clean session is the precondition.
 | `hap_oracle_server.py` | Local pair-setup M1–M4 server (srptools) for offline differential tests |
 | `mitm_proxy.py` | TCP proxy hex-dumping both directions (wire-level diffing) |
 | `pyatv_probe.py` | Drive pyatv end-to-end with debug logs (needs SelectorEventLoop on Windows) |
+| `atv_trace.py` | Capture a normalised pyatv protocol trace for #29; `capture` twice without rebooting, then `diff` |
 
 ---
 

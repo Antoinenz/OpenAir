@@ -113,6 +113,11 @@ the first session after a reboot and not for later ones. Rebooting it brings
 the display back for one session. Audio and metadata delivery are unaffected —
 this is only about what is drawn on the television.
 
+If you want to help pin it down, `tools/atv_trace.py` captures what pyatv (a
+third-party sender that does get the screen) sends, in a form comparable with
+ours. Running it twice without rebooting the Apple TV answers the question that
+matters — whether the receiver does this to every sender or only to us.
+
 ## Reporting a bug
 
 Run with a log and attach the file rather than pasting a scrollback:
