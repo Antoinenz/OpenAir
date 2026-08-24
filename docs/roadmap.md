@@ -60,9 +60,9 @@ instead of failing with a dead end.
   Audio is unaffected.
 - **Multi-room is buffered-only.** The realtime ALAC pipeline streams to one
   receiver. This is a limit of our implementation, not the protocol.
-- **Retransmit turnaround is not measured.** The backlog answers requests, but
-  nothing tracks how quickly, so "under 5 ms" is an intention rather than a
-  number anyone has checked.
+- **Retransmit turnaround is measured but unproven.** The realtime path now
+  times every request it answers and reports it at teardown, but no receiver
+  has yet been made to lose enough packets to produce a real number.
 
 ## Not planned
 

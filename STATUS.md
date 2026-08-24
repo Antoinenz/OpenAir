@@ -14,7 +14,7 @@
 | 6 | PTP timing (HomePod, BMCA yield) | 🔄 Mostly done | Master (Announce+Sync/Follow_Up) ✅, Delay_Resp ✅, **BMCA yield + foreign-timeline anchoring ✅ (ATV-verified)**; ptp-helper (Linux privileged ports) remains |
 | 7 | Normal pairing (Apple TV + PIN, persist identity) | ✅ Done | Hardware-verified 2026-07-19 on AppleTV5,3 + AppleTV6,2: pair-setup M1–M6 w/ PIN, pair-verify, %APPDATA% persistence, `openair pair` |
 | 8 | Multi-room group streaming | ✅ Done | Hardware-verified 2026-07-20: Shairport + Apple TV synchronized group (buffered); per-receiver timelines anchored at one shared instant; receiver-drop resilience tested live |
-| 9 | Real-time hardening (SCHED_FIFO, DSCP EF, retransmit <5ms) | 🔄 Mostly done | DSCP EF on all audio sockets ✅ (Windows strips it unless DisableUserTOSSetting=0 — detected and reported); MMCSS "Pro Audio" thread priority ✅ (verified Raised on hardware); SCHED_FIFO (Linux) and measured retransmit turnaround remain |
+| 9 | Real-time hardening (SCHED_FIFO, DSCP EF, retransmit <5ms) | 🔄 Mostly done | DSCP EF on all audio sockets ✅ (Windows strips it unless DisableUserTOSSetting=0 — detected and reported); MMCSS "Pro Audio" thread priority ✅ (verified Raised on hardware); retransmit turnaround now timed and reported at teardown (realtime path only — buffered is TCP) ✅; SCHED_FIFO (Linux) remains, and no real-world retransmit figure has been captured yet |
 
 **Legend:** ✅ Done · 🔄 In Progress · ⚠️ Partial / Known Issues · ⬜ Not Started
 
