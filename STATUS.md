@@ -1,6 +1,6 @@
 # OpenAir — Implementation Status
 
-> Updated by Claude at the end of each session. Reflects what is actually working, not just written.
+> Updated at the end of each working session. Reflects what is actually working, not just written.
 
 ## Implementation Phases
 

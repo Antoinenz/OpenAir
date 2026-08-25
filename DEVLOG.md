@@ -797,8 +797,7 @@ run ends with one summary line plus the log path. Several messages that were
 
 **Result:** 8 tasks, 141 TUI tests, workspace green and clippy clean.
 
-**Spec:** `docs/superpowers/specs/2026-08-19-tui-unified-flow-design.md` ·
-**Plan:** `docs/superpowers/plans/2026-08-19-b-unified-tui-flow.md`
+**Spec:** `docs/design/2026-08-19-tui-unified-flow-design.md`
 
 ---
 
@@ -886,8 +885,7 @@ keeps full detail throughout.
 — per-receiver volume and latency, add/remove mid-stream — is designed in the
 spec but deliberately unbuilt.
 
-**Spec:** `docs/superpowers/specs/2026-08-18-tui-design.md` ·
-**Plan:** `docs/superpowers/plans/2026-08-18-tui.md`
+**Spec:** `docs/design/2026-08-18-tui-design.md`
 
 ---
 
@@ -1236,7 +1234,7 @@ Windows master volume onto AirPlay — the slider, volume keys, and the mute key
 all drive the AirPlay volume. `--volume` seeds the initial level; the first
 Windows change hands control over. Restores the original volume/mute on Ctrl+C.
 
-### Approach A (polling) — design doc under `docs/superpowers/specs/`
+### Approach A (polling) — design doc under `docs/design/`
 New `#[cfg(windows)] crates/capture/src/handoff.rs`: a `VolumeBridge` that, on a
 dedicated COM thread, mutes the endpoint (`IAudioEndpointVolume::SetMute`) and
 polls master volume/mute every 50 ms. All the testable logic is pure:
@@ -1490,9 +1488,10 @@ are transmitting at you (the Signaling/Announce spam was the tell).
   i16 samples (not frames); first call(s) return empty output while priming — skip
   them without advancing rtptime.
 
-### Delegation model working well
-Both features implemented one-shot by Sonnet subagents from tight, protocol-complete
-specs; supervisor did research (shairport/nqptp source), hardware tests, and review.
+### Writing the spec first paid off
+Both features went in from tight, protocol-complete specs written up front, with the
+research (shairport/nqptp source), hardware tests and review done separately either
+side of the implementation.
 
 ### Next
 - Step 7: Normal HomeKit pairing (M1–M6 + pair-verify + persisted Ed25519 identity)
@@ -1518,7 +1517,7 @@ ring steady ~27k frames, zero silence-padded frames over the whole run.
 - CLI: `openair capture <ip:port> [seconds]`.
 - Fixed TEARDOWN 451: shairport requires a binary-plist body (empty dict = close
   connection); sessions now end 200.
-- Implementation again delegated to a Sonnet subagent from a tight spec (one-shot).
+- Written straight through from a tight spec again, no rework needed.
 
 ### Gotchas
 - WASAPI loopback captures the post-mix signal: a muted/idle PC yields silence (and
@@ -1542,7 +1541,7 @@ ring steady ~27k frames, zero silence-padded frames over the whole run.
   minimal linear-interpolation resampler; streams incrementally (no whole-file buffering).
 - CLI: `openair play <ip:port> <file.wav>`; 6 new unit tests (43 total).
 - Hardware-verified with a 48 kHz stereo melody WAV (exercises the resampler) on Pool Room.
-- Implementation delegated to a Sonnet subagent from a tight spec — clean one-shot delivery.
+- Written straight through from a tight spec — no rework needed.
 
 ### Next
 - System audio capture (WASAPI loopback via cpal + 48k→44.1k resample) — the "stream what my

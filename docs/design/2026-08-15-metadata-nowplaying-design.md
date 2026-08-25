@@ -27,7 +27,7 @@ that gap and is the last obvious "feels like real AirPlay" gap for v1.
   capture timeline, not the song's, so a naively-derived bar would disagree with
   the actual track. Deferred until the text path is proven.
 - Transport controls (receiver-side play/pause/skip driving the PC) — that is
-  DACP remote control, explicitly out of scope for v1 per CLAUDE.md.
+  DACP remote control, explicitly out of scope for v1.
 - Non-Windows platforms (Linux would read MPRIS over D-Bus).
 - `play` / `tone` metadata (a WAV file has no meaningful now-playing state).
 

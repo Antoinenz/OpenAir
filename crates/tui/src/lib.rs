@@ -3,7 +3,7 @@
 //!
 //! This is a library, not a binary — `openair` is the single binary and it
 //! drives these screens directly. See
-//! `docs/superpowers/specs/2026-08-18-tui-design.md`.
+//! `docs/design/2026-08-18-tui-design.md`.
 //!
 //! Deliberately does **not** depend on `openair-capture`: platform-specific
 //! concerns (`--handoff`, Windows now-playing) stay behind the CLI's `cfg`

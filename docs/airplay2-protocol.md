@@ -1,6 +1,8 @@
 # Cross-Platform AirPlay 2 Transmitter — Research Brief
 
-> A technical handoff document summarizing the AirPlay 2 protocol stack, reference open-source projects, and an implementation plan for a cross-platform sender (transmitter).
+> Background reading for this repository: the AirPlay 2 protocol stack, the reference
+> open-source projects worth reading, and the implementation order OpenAir follows.
+> Written before any code existed; kept because the protocol notes are still accurate.
 
 ---
 
@@ -534,18 +536,9 @@ A minimal multi-room signature is `0x40000a00,0x80300` (bits 9, 11, 30, 40, 41, 
 
 ---
 
-## 20. Starting Point
+## 20. Verifying Against Real Hardware
 
-When kicking this off in Claude Code, the natural first commands are:
-
-```bash
-# scaffold a Rust workspace (recommended)
-cargo new --lib airplay2-sender
-cd airplay2-sender
-# add the per-crate split from §12 above
-
-# OR scaffold a Go module
-go mod init github.com/<you>/airplay2-sender
-```
-
-Then implement §16 step 1 (mDNS discovery + feature-bit decoding) as the first vertical slice. Use real devices on your LAN for verification — `dns-sd -B _airplay._tcp .` on macOS or `avahi-browse -r _airplay._tcp` on Linux will show you what you're up against.
+Implement §16 step 1 (mDNS discovery + feature-bit decoding) as the first vertical
+slice, and check every later step against real devices on the LAN rather than against
+this document. `dns-sd -B _airplay._tcp .` on macOS or `avahi-browse -r _airplay._tcp`
+on Linux will show you what you are up against.
