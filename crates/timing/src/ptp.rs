@@ -249,7 +249,15 @@ pub struct PtpMaster {
     pub clock_id: u64,
     foreign: Arc<SharedForeign>,
     stop: Arc<AtomicBool>,
-    thread: Option<std::thread::JoinHandle<()>>,
+    /// The sender thread, and the two receive threads.
+    ///
+    /// All three are joined on drop, and the receive threads are the reason
+    /// this is a list rather than one handle. They hold `try_clone`d handles
+    /// to ports 319 and 320, so those ports stay bound until *they* exit, not
+    /// until the sender does. Leaving them detached meant `drop` returned
+    /// while the sockets were still open, and a stream stopped and restarted
+    /// inside their 250 ms read timeout failed to bind.
+    threads: Vec<std::thread::JoinHandle<()>>,
 }
 
 impl PtpMaster {
@@ -299,6 +307,7 @@ impl PtpMaster {
         );
 
         let foreign = Arc::new(SharedForeign::default());
+        let mut rx_threads: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(2);
 
         // Local receive-times of foreign masters' Sync messages, keyed by
         // (source clock, sequence) — two masters in a group can collide on
@@ -318,7 +327,7 @@ impl PtpMaster {
             let stop_rx = stop.clone();
             let sync_times = sync_rx_times.clone();
             rx_event.set_read_timeout(Some(Duration::from_millis(250)))?;
-            std::thread::spawn(move || {
+            rx_threads.push(std::thread::spawn(move || {
                 let mut buf = [0u8; 128];
                 while !stop_rx.load(Ordering::Relaxed) {
                     let Ok((n, src)) = rx_event.recv_from(&mut buf) else {
@@ -353,7 +362,7 @@ impl PtpMaster {
                         other => debug!(msg_type = other, src = %src, "PTP event rx (ignored)"),
                     }
                 }
-            });
+            }));
         }
         // General socket (320): the foreign master's Announce (grandmaster
         // identity) and Follow_Up (Sync origin timestamps → clock offset).
@@ -363,7 +372,7 @@ impl PtpMaster {
             let sync_times = sync_rx_times.clone();
             let foreign_rx = foreign.clone();
             rx_general.set_read_timeout(Some(Duration::from_millis(250)))?;
-            std::thread::spawn(move || {
+            rx_threads.push(std::thread::spawn(move || {
                 let mut buf = [0u8; 128];
                 while !stop_rx.load(Ordering::Relaxed) {
                     let Ok((n, src)) = rx_general.recv_from(&mut buf) else {
@@ -451,7 +460,7 @@ impl PtpMaster {
                         other => debug!(msg_type = other, src = %src, "PTP general rx"),
                     }
                 }
-            });
+            }));
         }
 
         let foreign_tx = foreign.clone();
@@ -532,7 +541,8 @@ impl PtpMaster {
             }
         });
 
-        Ok(PtpMaster { clock_id, foreign, stop, thread: Some(thread) })
+        rx_threads.push(thread);
+        Ok(PtpMaster { clock_id, foreign, stop, threads: rx_threads })
     }
 
     /// The timeline anchors for `peer` must be expressed on right now.
@@ -561,7 +571,12 @@ impl PtpMaster {
 impl Drop for PtpMaster {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(t) = self.thread.take() {
+        // Every thread, not just the sender: the receive threads hold the
+        // only other references to ports 319 and 320, so returning before they
+        // exit means returning while the ports are still bound. Costs up to
+        // their 250 ms read timeout, which is the price of `drop` meaning what
+        // it says.
+        for t in self.threads.drain(..) {
             let _ = t.join();
         }
     }
@@ -576,6 +591,25 @@ mod tests {
     fn temp_clock_path(tag: &str) -> std::path::PathBuf {
         let unique = format!("{}-{}-{}", tag, std::process::id(), ptp_now_ns());
         std::env::temp_dir().join("openair-test").join(unique)
+    }
+
+    #[test]
+    fn the_ptp_ports_are_free_the_moment_the_node_is_dropped() {
+        // Ports 319 and 320 are fixed by the standard, so there is exactly one
+        // PTP node per machine and a new stream cannot start until the old
+        // one's sockets are gone. `drop` used to join only the sender thread
+        // while two receive threads still held clones of both sockets, so it
+        // returned with the ports still bound for up to their 250 ms read
+        // timeout -- long enough that stopping a stream and starting another
+        // failed to bind.
+        let peer = IpAddr::from([127, 0, 0, 1]);
+        let Ok(first) = PtpMaster::start(peer) else {
+            // Something else on this machine owns 319/320; nothing to prove.
+            return;
+        };
+        drop(first);
+
+        PtpMaster::start(peer).expect("the ports should be free as soon as drop returns");
     }
 
     #[test]
