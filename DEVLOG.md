@@ -4,6 +4,112 @@
 
 ---
 
+## 2026-08-25 — Session 23: a bug-hunting pass, and one finding I got wrong
+
+No feature work. A read of the codebase looking for defects, six found, six
+fixed. Every fix was mutation-verified — delete it, watch a test go red — and
+one of the six turned out not to be the bug I said it was.
+
+### The one that was actually hurting people
+
+`CaptureSource` in blocking mode waits for the capture ring to fill before
+padding silence. The ceiling was a flat 60 ms. A `fill()` produces a
+1024-frame block, which is **23.2 ms of audio**. So when the ring is dry the
+source produces audio at 36% of real time — measured, not estimated.
+
+The ring goes dry whenever Windows playback stops, because WASAPI loopback
+stops delivering rather than sending silence. Two comments in the tree already
+said so. And `PAUSE_AFTER_SILENCE` is 30 seconds, raised there deliberately in
+session 20 because pausing at 1.5 s fired on the gap between tracks and broke
+playback 37 times over one dinner party.
+
+That fix opened this hole. For up to half a minute after the music stops,
+receivers were fed at a third of the rate they play at. Headroom drained at
+0.64x wall clock, gone in under a second from the 500 ms default. Auto-latency
+read the collapse as a network fault and stepped the anchor +250 ms every five
+seconds, and `adopt_stream_latency` wrote each step to `settings.json`.
+
+**Pausing your music permanently raised the latency your next session started
+at**, a little more each time, until it pinned at the 4 s ceiling. Neither half
+is wrong alone. Together they are a ratchet.
+
+The ceiling is now derived from the block being filled rather than fixed, so
+the property that matters — never wait longer than the audio you are about to
+produce — holds whatever the block size. Pacing goes back to the send-ahead
+window, which is where it belongs.
+
+The test measures the rate against a genuinely empty ring. A test of the
+constant would pass with the ratio wrong in either direction.
+
+### The one with hardware evidence sitting in this file
+
+`read_encrypted_response` read exactly one frame and returned it as the whole
+response. Session 19 recorded, from a capture, an Apple TV sending ~2518 bytes
+as three frames each opening `00 04` — little-endian 1024. The event-channel
+reader was built to reassemble because of that observation. The RTSP response
+reader kept its own copy that did not.
+
+Anything over 1024 bytes was cut to its first frame, and the rest stayed in the
+socket — so the next response read the previous one's tail and every reply
+after that was shifted by one. It has never bitten because everything
+operational fits; the largest response on record is a 701-byte `GET /info` from
+Shairport. An Apple TV's is bigger.
+
+The framing helpers now live in `openair_rtsp::message` and both readers use
+them. The duplication *was* the bug: two copies of the same question with
+different answers.
+
+### Two writes that were not atomic, and one drop that was not
+
+`PairingStore::save` used `fs::write`, which truncates and then writes. A
+reader running alongside 300 saves caught the store mid-write on **109 of 329
+reads**. `load` refuses to parse a corrupt store — deliberately — and the file
+holds the controller identity every accessory in the house has recorded against
+us, so a torn write is not "retry", it is "pair everything again". Written
+beside and renamed over now.
+
+`PtpMaster::drop` joined the sender thread and left two receive threads
+detached, holding clones of ports 319 and 320. Those ports are fixed by the
+standard, so one node per machine — and `drop` returned with them still bound
+for up to 250 ms. Stop a stream, start another quickly, and the second one
+fails to bind. Reproduced: `AddrInUse`, os error 10048.
+
+### The one I got wrong
+
+I reported the retransmit handler as a real-time hazard: replies sent while
+holding the backlog mutex, with a `count` the network chooses, up to 65535.
+
+Then I wrote a test — the audio thread never waits 8 ms for the backlog — and
+it **passed with the sends put back under the lock**. So I wrote a second one
+on the miss accounting, and that passed uncapped too, because I had made the
+accounting identical on purpose so the counter stays truthful.
+
+Two tests, neither measuring the change. I deleted both. The honest numbers:
+65535 hash lookups is a millisecond or two, inside the 8 ms deadline, and 1000
+loopback sends is under a millisecond. It is not a stall. What the cap actually
+bounds is the `debug!` in the miss arm — at `--debug`, 65535 lines through the
+tracing layer off one datagram — and the lock hoisting is shape, not repair.
+
+Kept both, with comments saying exactly that. The commit message leads with it.
+**Three sessions running now, the tests I write first have been the ones that
+pass with the bug present.** Deleting the fix before believing the test is not
+optional.
+
+### Also
+
+`needs_pairing` was set by the stream, carried through `receiver_stats`,
+delivered to the dashboard, and read by nobody — only the connecting screen
+looked at it. So in a group where some receivers connect, a rejected one showed
+a bare failure and `r` retried into the same rejection forever. The row now
+points at forgetting the pairing, and `r` declines.
+
+`--latency` parsed with `unwrap_or(default)`. `--offset "Pool Room=+80ms"` has
+always taken an `ms` suffix, so `--latency 1500ms` is a reasonable thing to
+type — and it quietly meant 500. Accepts the suffix now, and reports what it
+cannot use.
+
+---
+
 ## 2026-08-24 — Session 22: discoverability, pairing management, hardening
 
 Four strands, and one bug I put in and took back out an hour later.
