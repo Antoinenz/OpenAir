@@ -7,6 +7,8 @@ use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 use openair_crypto::ChaChaChannel;
+
+use crate::message;
 use tracing::debug;
 
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
@@ -204,13 +206,51 @@ impl RtspConnection {
         Ok(out)
     }
 
+    /// Read one encrypted RTSP response, across as many frames as it takes.
+    ///
+    /// **A response is not a frame.** The channel carries at most 1024 bytes of
+    /// plaintext per frame, and receivers chunk their side at exactly that:
+    /// DEVLOG session 19 records an Apple TV sending ~2518 bytes on the event
+    /// channel as three frames, each opening `00 04`.
+    ///
+    /// This used to read a single frame and return it. Anything longer than
+    /// 1024 bytes was silently cut to its first frame, and — worse — the rest
+    /// stayed in the socket, so the *next* response read the tail of the
+    /// previous one and every reply after that was shifted by one. It never
+    /// bit because everything operational fits: the largest recorded response
+    /// is a 701-byte `GET /info` from Shairport. An Apple TV's is bigger.
     fn read_encrypted_response(&mut self) -> io::Result<Vec<u8>> {
-        // Read the 2-byte little-endian length prefix, then ciphertext + 16-byte tag.
+        let mut msg = Vec::new();
+        loop {
+            msg.extend_from_slice(&self.read_encrypted_frame()?);
+            let Some(head) = message::header_block_end(&msg) else {
+                continue; // headers still arriving
+            };
+            match message::declared_body_len(&msg[..head]) {
+                Some(len) if msg.len() < head + len => continue,
+                // Complete. Trim anything past the declared end rather than
+                // hand it back as body: responses are answers to requests we
+                // send one at a time, so there should be nothing there, and
+                // passing it on would put one message's tail inside another.
+                Some(len) => {
+                    msg.truncate(head + len);
+                    return Ok(msg);
+                }
+                // No Content-Length. Nothing says how much more is coming, and
+                // this stream cannot be un-read, so one frame is all we can
+                // honestly claim -- which is what the plaintext reader does
+                // with the same situation.
+                None => return Ok(msg),
+            }
+        }
+    }
+
+    /// Read and decrypt one frame: `u16 LE length || ciphertext || 16-byte tag`.
+    fn read_encrypted_frame(&mut self) -> io::Result<Vec<u8>> {
         let mut len_buf = [0u8; 2];
         self.stream.read_exact(&mut len_buf)?;
         let payload_len = u16::from_le_bytes(len_buf) as usize;
-        let total = 2 + payload_len + 16;
-        let mut frame = vec![0u8; total];
+        let mut frame = vec![0u8; 2 + payload_len + 16];
         frame[0] = len_buf[0];
         frame[1] = len_buf[1];
         self.stream.read_exact(&mut frame[2..])?;
@@ -276,4 +316,79 @@ fn new_session_id() -> String {
     format!("{:08X}-{:04X}-{:04X}-{:04X}-{:012X}",
         t, t >> 16, 0x4000 | (t >> 12 & 0x0FFF),
         0x8000 | (t >> 10 & 0x3FFF), t as u64 * 0x1234567)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openair_crypto::chacha::MAX_FRAME_PLAINTEXT;
+    use std::net::TcpListener;
+
+    /// Stand in for a receiver: accept one connection, swallow whatever the
+    /// client sends, then write `response` through an encrypted channel keyed
+    /// the way the client expects to read.
+    fn fake_receiver(response: Vec<u8>) -> (SocketAddr, std::thread::JoinHandle<()>, [u8; 32]) {
+        let key = [0x5Au8; 32];
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            // The request arrives first and we do not care what it says; read
+            // one frame's worth so the client's write completes.
+            let mut scratch = [0u8; 4096];
+            let _ = sock.read(&mut scratch);
+            let mut tx = ChaChaChannel::new(&key);
+            // `encrypt` chunks at MAX_FRAME_PLAINTEXT on its own, which is
+            // exactly what a real receiver does.
+            let framed = tx.encrypt(&response).unwrap();
+            sock.write_all(&framed).unwrap();
+            // Hold the connection open so the client is reading from a live
+            // socket rather than racing a close.
+            std::thread::sleep(Duration::from_millis(300));
+        });
+        (addr, handle, key)
+    }
+
+    /// A response longer than one frame comes back whole.
+    ///
+    /// The regression: this read exactly one frame, so anything past 1024
+    /// bytes of plaintext was cut off and — the part that would have been hard
+    /// to diagnose — left in the socket, shifting every later response by one.
+    #[test]
+    fn a_response_spanning_several_frames_is_reassembled() {
+        let body = vec![b'x'; MAX_FRAME_PLAINTEXT * 3 + 17];
+        let mut response =
+            format!("RTSP/1.0 200 OK\r\nCSeq: 1\r\nContent-Length: {}\r\n\r\n", body.len())
+                .into_bytes();
+        response.extend_from_slice(&body);
+        assert!(
+            response.len() > MAX_FRAME_PLAINTEXT,
+            "the test is pointless if it fits in one frame"
+        );
+
+        let (addr, server, key) = fake_receiver(response.clone());
+        let mut conn = RtspConnection::connect(addr, "AA:BB:CC:DD:EE:FF").unwrap();
+        // Only the read direction is exercised; the write key is unused by the
+        // receiver stub above.
+        conn.enable_encryption(&[0x11u8; 32], &key);
+
+        let got = conn.request("GET", "/info", &[], &[], None).unwrap();
+        assert_eq!(got.len(), response.len(), "truncated to its first frame");
+        assert_eq!(extract_body(&got), &body[..], "body came back mangled");
+        server.join().unwrap();
+    }
+
+    /// A response that fits in one frame still works, unchanged.
+    #[test]
+    fn a_single_frame_response_is_unaffected() {
+        let response = b"RTSP/1.0 200 OK\r\nCSeq: 1\r\nContent-Length: 4\r\n\r\nokay".to_vec();
+        let (addr, server, key) = fake_receiver(response.clone());
+        let mut conn = RtspConnection::connect(addr, "AA:BB:CC:DD:EE:FF").unwrap();
+        conn.enable_encryption(&[0x11u8; 32], &key);
+
+        let got = conn.request("GET", "/info", &[], &[], None).unwrap();
+        assert_eq!(status_code(&got), Some(200));
+        assert_eq!(extract_body(&got), b"okay");
+        server.join().unwrap();
+    }
 }

@@ -104,33 +104,11 @@ fn open_event_channel(
     }
 }
 
-/// End of the header block (index just past the blank line), if present.
-fn header_block_end(msg: &[u8]) -> Option<usize> {
-    msg.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
-}
-
-/// Value of a header, case-insensitively, from a header block.
-fn header_value<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
-    let want = name.to_ascii_lowercase();
-    headers.lines().find_map(|l| {
-        let (k, v) = l.split_once(':')?;
-        (k.trim().to_ascii_lowercase() == want).then(|| v.trim())
-    })
-}
-
-/// Total length of the RTSP message at the front of `msg`, once fully arrived.
-///
-/// Returns `None` while the message is still incomplete — event messages span
-/// several encrypted frames (the observed `POST /command` is 2519 bytes across
-/// three), so a reply must wait for the whole thing.
-fn rtsp_message_len(msg: &[u8]) -> Option<usize> {
-    let head = header_block_end(msg)?;
-    let headers = String::from_utf8_lossy(&msg[..head]);
-    let body_len = header_value(&headers, "Content-Length")
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(0);
-    (msg.len() >= head + body_len).then_some(head + body_len)
-}
+// Message framing (`header_block_end`, `header_value`, `message_len`) lives in
+// `openair_rtsp::message`. It used to live here too, in a second copy, and the
+// two copies disagreed: this one reassembled a message across encrypted frames
+// and the RTSP response reader did not. One implementation, so they cannot.
+use openair_rtsp::message::{header_block_end, header_value, message_len as rtsp_message_len};
 
 /// Build the RTSP response to an event-channel request.
 ///
@@ -2306,51 +2284,11 @@ mod tests {
     }
 
     #[test]
-    fn rtsp_message_len_waits_for_the_whole_body() {
-        let full = sample_request(2414);
-        // Header block alone is not a complete message.
-        let head_only = header_block_end(&full).unwrap();
-        assert_eq!(rtsp_message_len(&full[..head_only]), None);
-        // One byte short is still incomplete — the real message spans 3 frames.
-        assert_eq!(rtsp_message_len(&full[..full.len() - 1]), None);
-        assert_eq!(rtsp_message_len(&full), Some(full.len()));
-    }
-
-    #[test]
-    fn rtsp_message_len_none_until_headers_complete() {
-        assert_eq!(rtsp_message_len(b"POST /command RTSP/1.0\r\nCSeq: 1"), None);
-    }
-
-    #[test]
-    fn rtsp_message_len_handles_bodyless_request() {
-        let msg = b"POST /command RTSP/1.0\r\nCSeq: 3\r\n\r\n";
-        assert_eq!(rtsp_message_len(msg), Some(msg.len()));
-    }
-
-    #[test]
     fn event_response_echoes_cseq() {
         let resp = String::from_utf8(event_response(&sample_request(10))).unwrap();
         assert!(resp.starts_with("RTSP/1.0 200 OK\r\n"));
         assert!(resp.contains("CSeq: 7\r\n"), "CSeq must be echoed: {resp}");
         assert!(resp.ends_with("\r\n\r\n"));
-    }
-
-    #[test]
-    fn header_value_is_case_insensitive() {
-        let h = "POST / RTSP/1.0\r\ncontent-length: 42\r\nCSEQ: 9\r\n\r\n";
-        assert_eq!(header_value(h, "Content-Length"), Some("42"));
-        assert_eq!(header_value(h, "CSeq"), Some("9"));
-        assert_eq!(header_value(h, "Missing"), None);
-    }
-
-    #[test]
-    fn two_messages_in_one_buffer_are_split() {
-        // Frames don't align to messages, so a buffer can hold more than one.
-        let mut buf = sample_request(4);
-        buf.extend(sample_request(6));
-        let first = rtsp_message_len(&buf).unwrap();
-        assert_eq!(first, sample_request(4).len());
-        assert_eq!(rtsp_message_len(&buf[first..]), Some(sample_request(6).len()));
     }
 
     #[test]
