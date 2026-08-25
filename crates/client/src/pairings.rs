@@ -183,12 +183,36 @@ impl PairingStore {
         Ok(true)
     }
 
+    /// Write the store, atomically.
+    ///
+    /// Beside-then-rename rather than straight over the top, because of what
+    /// this file is. `load` refuses to parse a corrupt store — deliberately,
+    /// since silently starting fresh would throw away every pairing without
+    /// saying so — and a store that will not parse takes the controller
+    /// identity with it, which is the key every accessory in the house has
+    /// recorded against us. Re-pairing all of them is the recovery.
+    ///
+    /// `fs::write` truncates first and then writes, so anything reading in
+    /// between sees a partial file, and anything interrupted in between leaves
+    /// one. A rename is a single atomic step: afterwards the path is either the
+    /// old store or the new one, never half of either.
     fn save(&self) -> io::Result<()> {
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir)?;
         }
         let text = serde_json::to_string_pretty(&self.file).map_err(io::Error::other)?;
-        std::fs::write(&self.path, text)
+        let tmp = self.path.with_extension("json.new");
+        std::fs::write(&tmp, text)?;
+        // Best effort cleanup: on the platforms where rename can fail with the
+        // target present, leaving the temp file behind is tidier than leaving
+        // the store missing.
+        match std::fs::rename(&tmp, &self.path) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                Err(e)
+            }
+        }
     }
 
     /// Persist the store even if no peer was added yet (e.g. to pin the
@@ -227,6 +251,8 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
 
     #[test]
     fn hex_roundtrip() {
@@ -369,6 +395,83 @@ mod tests {
         assert_eq!(on_disk.ltsk, hex_encode(&[7u8; 32]));
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_reader_never_catches_the_store_half_written() {
+        // The property, driven the only way it shows: something else reading
+        // the file while it is being rewritten.
+        //
+        // `load` will not parse a corrupt store -- on purpose, because
+        // silently starting fresh would discard every pairing without saying
+        // so -- and the store holds the controller identity that every
+        // accessory in the house has recorded against us. So a torn write is
+        // not "retry"; it is "pair everything again".
+        //
+        // A truncate-then-write leaves a window where the file is empty or
+        // partial. A rename has no such window.
+        let dir = std::env::temp_dir().join(format!("openair-atomic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pairings.json");
+
+        let mut s = PairingStore {
+            path: path.clone(),
+            file: StoreFile {
+                pairing_id: "uuid-here".into(),
+                ltsk: hex_encode(&[7u8; 32]),
+                peers: BTreeMap::new(),
+            },
+        };
+        // Enough entries that the write is not a single small buffer.
+        for i in 0..400 {
+            s.file
+                .peers
+                .insert(format!("AA:{i:04}"), entry(Some("Some Receiver Name")));
+        }
+        s.save().unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader_stop = stop.clone();
+        let reader_path = path.clone();
+        let reader = std::thread::spawn(move || {
+            let mut torn = 0usize;
+            let mut reads = 0usize;
+            while !reader_stop.load(Ordering::Relaxed) {
+                match std::fs::read_to_string(&reader_path) {
+                    Ok(text) => {
+                        reads += 1;
+                        if serde_json::from_str::<StoreFile>(&text).is_err() {
+                            torn += 1;
+                        }
+                    }
+                    // The file being briefly absent is the same defect wearing
+                    // a different hat, and it is what a rename cannot cause.
+                    Err(_) => torn += 1,
+                }
+            }
+            (reads, torn)
+        });
+
+        for i in 0..300 {
+            s.file.pairing_id = format!("uuid-{i}");
+            s.save().unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        let (reads, torn) = reader.join().unwrap();
+
+        assert!(reads > 0, "the reader never got a look in");
+        assert_eq!(torn, 0, "a reader saw {torn} of {reads} reads mid-write");
+
+        // And nothing is left lying about afterwards.
+        let strays: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "pairings.json")
+            .collect();
+        assert!(strays.is_empty(), "left behind {strays:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
