@@ -163,11 +163,28 @@ const PREBUFFER_MS: u32 = 200;
 /// active playback), give up and stream silence rather than hang forever.
 const PREBUFFER_MAX_WAIT_MS: u32 = 500;
 const PREBUFFER_POLL_MS: u64 = 5;
-/// Ceiling on how long a single blocking-mode `fill()` waits for live ring
-/// data before giving up and padding silence. Long enough to cover normal
-/// capture-callback jitter (WASAPI delivers in ~10 ms chunks), short enough
-/// that a paused source is noticed within a couple of packets.
-const BLOCKING_WAIT_MS: u64 = 60;
+/// How much of the audio a blocking `fill()` is about to produce it may spend
+/// waiting for that audio to arrive.
+///
+/// **This has to be below 1.0, and that is the whole point of it.** A `fill()`
+/// producing a 1024-frame block is producing 23.2 ms of audio; if it may block
+/// for longer than 23.2 ms, then a source that has gone dry is fed to the
+/// receivers *slower than they play it*, and their buffers drain.
+///
+/// It used to be a flat 60 ms ceiling, which is 2.6x the block. Measured, that
+/// produced audio at **36% of real time** — so every silent gap drained the
+/// group's headroom at two thirds of wall clock, and with the pause threshold
+/// at 30 s there was half a minute of it available. Auto-latency read the
+/// collapsing lead as a network problem and ratcheted the anchor deeper every
+/// five seconds; the TUI then wrote that number to `settings.json`, so pausing
+/// the music permanently raised the latency the next session started at.
+///
+/// At 0.5 a dry source is fed at up to twice real time, and the send-ahead
+/// window in the stream loop — not this — becomes the thing that paces it,
+/// which is where pacing belongs. Still comfortably longer than the ~10 ms
+/// WASAPI callback period, so ordinary jitter is still absorbed by waiting
+/// rather than by silence.
+const BLOCKING_WAIT_FRACTION: f64 = 0.5;
 
 /// Ring exceeding this many ms of buffered audio indicates the sender is
 /// falling behind the device's capture rate; without drift trim, the ring is
@@ -344,19 +361,20 @@ impl CaptureSource {
     /// In blocking mode: wait (short polls, bounded) until the ring holds
     /// enough device-rate samples to produce `frames` output frames.
     ///
-    /// The bound is short (`BLOCKING_WAIT_MS`): when live audio is flowing the
-    /// data is there within one packet time so this returns promptly and
-    /// rate-limits the send loop to real time; when the source has gone dry
-    /// (playback paused — WASAPI loopback stops delivering) it must give up
-    /// quickly and let the caller pad silence, so the pipeline's pause/resume
-    /// state machine stays responsive instead of stalling ~1 s per fill.
+    /// When live audio is flowing the data is there within a fraction of a
+    /// packet time, so this returns promptly and rate-limits the send loop to
+    /// the capture rate. When the source has gone dry (playback paused —
+    /// WASAPI loopback stops delivering) it gives up inside
+    /// [`BLOCKING_WAIT_FRACTION`] of the block it is filling and lets the
+    /// caller pad silence, so a dry source is still fed to the receivers at
+    /// or above real time.
     fn wait_for_frames(&self, frames: usize) {
         // Output frames → device-rate samples (stereo interleaved), plus one
         // spare frame for the resampler bracket.
         let needed =
             ((frames as f64 * f64::from(self.device_rate) / f64::from(SAMPLE_RATE)) as usize + 2)
                 * 2;
-        let deadline = Instant::now() + Duration::from_millis(BLOCKING_WAIT_MS);
+        let deadline = Instant::now() + self.wait_budget(frames);
         loop {
             if self.ring.lock().unwrap().len() >= needed || Instant::now() >= deadline {
                 break;
@@ -368,6 +386,18 @@ impl CaptureSource {
             }
             std::thread::sleep(Duration::from_millis(PREBUFFER_POLL_MS));
         }
+    }
+
+    /// How long a blocking `fill()` producing `frames` output frames may spend
+    /// waiting for them.
+    ///
+    /// Derived from the block rather than fixed, because the property that
+    /// matters is a *ratio*: the wait has to stay under the duration of the
+    /// audio the call produces, or a dry source is fed slower than it is
+    /// played. A constant cannot hold that for a block size it does not know.
+    fn wait_budget(&self, frames: usize) -> Duration {
+        let produces = Duration::from_secs_f64(frames as f64 / f64::from(SAMPLE_RATE));
+        produces.mul_f64(BLOCKING_WAIT_FRACTION)
     }
 
     /// Pulls one interleaved stereo frame from the front of the ring, if
@@ -914,6 +944,67 @@ mod tests {
             tail.iter().all(|&v| v == 0),
             "expected silence padding at tail once ring ran dry"
         );
+    }
+
+    #[test]
+    fn a_dry_source_is_still_fed_at_least_as_fast_as_it_plays() {
+        // The regression this exists for, and the reason it is a *measurement*
+        // rather than an assertion about a constant.
+        //
+        // The buffered pipeline pulls from here and hands each block to
+        // receivers with a play deadline attached. Receivers play out at real
+        // time whatever we do. So if a `fill()` that produces 23.2 ms of audio
+        // can block for longer than 23.2 ms, a source that has gone dry —
+        // which is what a paused Windows endpoint looks like, since WASAPI
+        // loopback simply stops delivering — drains every receiver's buffer
+        // for as long as the silence lasts. Auto-latency then reads that as a
+        // network fault and ratchets the anchor deeper, and the TUI writes the
+        // inflated number to settings.json.
+        //
+        // Measured at the old 60 ms ceiling: 36% of real time.
+        //
+        // A test of `BLOCKING_WAIT_FRACTION` alone would pass with the ratio
+        // wrong in either direction. This drives the real `fill()` against a
+        // genuinely empty ring and times it.
+        let ring = Arc::new(Mutex::new(VecDeque::new()));
+        let mut src = CaptureSource::new(ring, 48_000, None, None).with_blocking();
+        src.prebuffer_done = true;
+
+        const BLOCK: usize = 1024; // AAC_FRAMES_PER_PACKET, what the buffered loop asks for
+        let mut buf = [0i16; BLOCK * 2];
+        let began = Instant::now();
+        let mut produced = 0u64;
+        for _ in 0..12 {
+            produced += src.fill(&mut buf) as u64;
+        }
+        let wall = began.elapsed().as_secs_f64();
+        let audio = produced as f64 / f64::from(SAMPLE_RATE);
+
+        assert!(
+            audio >= wall,
+            "a dry source produced {audio:.3}s of audio in {wall:.3}s of wall clock \
+             ({:.0}% of real time) — receivers play it out faster than we make it, \
+             so their buffers drain for the whole silence",
+            audio / wall * 100.0,
+        );
+    }
+
+    #[test]
+    fn the_wait_never_outlasts_the_audio_it_is_waiting_for() {
+        // The property behind the measurement above, stated directly so a
+        // future block size cannot quietly break it: whatever the caller asks
+        // for, the time we may spend waiting stays under the time that much
+        // audio takes to play.
+        let ring = Arc::new(Mutex::new(VecDeque::new()));
+        let src = CaptureSource::new(ring, 48_000, None, None).with_blocking();
+        for frames in [256usize, 352, 1024, 4096] {
+            let plays = Duration::from_secs_f64(frames as f64 / f64::from(SAMPLE_RATE));
+            assert!(
+                src.wait_budget(frames) < plays,
+                "waiting {:?} for {frames} frames, which only play for {plays:?}",
+                src.wait_budget(frames),
+            );
+        }
     }
 
     #[test]
