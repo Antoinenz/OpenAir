@@ -192,10 +192,20 @@ mod util {
     }
 
     /// Extracts an optional `--latency <ms>` flag (buffered pipeline anchor
-    /// lead / end-to-end latency). Same semantics as `extract_volume`.
-    pub fn extract_latency(args: &[String], default: u64) -> (Vec<String>, u64) {
+    /// lead / end-to-end latency).
+    ///
+    /// The third return is a value that was present and unusable, for the
+    /// caller to complain about. It used to silently fall back to the default,
+    /// which made `--latency 1500ms` -- a reasonable thing to type, since
+    /// `--offset` takes exactly that suffix -- quietly mean 500. A flag that
+    /// ignores what you asked for without saying so is worse than one that
+    /// refuses.
+    ///
+    /// A trailing `ms` is now accepted, so the two flags agree.
+    pub fn extract_latency(args: &[String], default: u64) -> (Vec<String>, u64, Option<String>) {
         let mut remaining = Vec::with_capacity(args.len());
         let mut latency = default;
+        let mut rejected = None;
         let mut skip_next = false;
         for (i, arg) in args.iter().enumerate() {
             if skip_next {
@@ -203,15 +213,28 @@ mod util {
                 continue;
             }
             if arg == "--latency" {
-                if let Some(v) = args.get(i + 1) {
-                    latency = v.parse().unwrap_or(default);
-                    skip_next = true;
+                match args.get(i + 1) {
+                    Some(v) => {
+                        match parse_millis(v) {
+                            Some(ms) => latency = ms,
+                            None => rejected = Some(v.clone()),
+                        }
+                        skip_next = true;
+                    }
+                    // Trailing `--latency` with nothing after it. Also worth
+                    // saying, rather than dropping the flag on the floor.
+                    None => rejected = Some(String::new()),
                 }
                 continue;
             }
             remaining.push(arg.clone());
         }
-        (remaining, latency)
+        (remaining, latency, rejected)
+    }
+
+    /// A millisecond count, with an optional `ms` suffix and surrounding space.
+    fn parse_millis(v: &str) -> Option<u64> {
+        v.trim().trim_end_matches("ms").trim().parse().ok()
     }
 
     use std::collections::HashMap;
@@ -271,6 +294,50 @@ mod util {
             assert_eq!(rest, vec!["capture".to_string(), "pool".to_string()]);
             assert_eq!(offs.get("pool room"), Some(&80));
             assert_eq!(offs.get("test"), Some(&-15));
+        }
+
+        #[test]
+        fn latency_takes_the_same_ms_suffix_offset_does() {
+            // `--offset "Pool Room=+80ms"` has always accepted it, so typing
+            // `--latency 1500ms` is a reasonable thing to do. It used to mean
+            // 500 and say nothing.
+            let args = vec!["capture".into(), "pool".into(), "--latency".into(), "1500ms".into()];
+            let (rest, ms, bad) = extract_latency(&args, 500);
+            assert_eq!(rest, vec!["capture".to_string(), "pool".to_string()]);
+            assert_eq!(ms, 1500);
+            assert_eq!(bad, None);
+        }
+
+        #[test]
+        fn a_plain_number_still_works() {
+            let args = vec!["capture".into(), "--latency".into(), "800".into()];
+            let (_, ms, bad) = extract_latency(&args, 500);
+            assert_eq!(ms, 800);
+            assert_eq!(bad, None);
+        }
+
+        #[test]
+        fn an_unusable_latency_is_reported_rather_than_ignored() {
+            let args = vec!["capture".into(), "--latency".into(), "soon".into()];
+            let (_, ms, bad) = extract_latency(&args, 500);
+            assert_eq!(ms, 500, "the default still applies");
+            assert_eq!(bad.as_deref(), Some("soon"), "and the caller gets to say so");
+        }
+
+        #[test]
+        fn a_latency_flag_with_nothing_after_it_is_reported() {
+            let args = vec!["capture".into(), "--latency".into()];
+            let (_, _, bad) = extract_latency(&args, 500);
+            assert!(bad.is_some(), "a flag that ate itself must not pass silently");
+        }
+
+        #[test]
+        fn absent_latency_uses_the_default_quietly() {
+            let args = vec!["capture".into(), "pool".into()];
+            let (rest, ms, bad) = extract_latency(&args, 500);
+            assert_eq!(rest, args);
+            assert_eq!(ms, 500);
+            assert_eq!(bad, None, "not asking for something is not an error");
         }
 
         #[test]
@@ -997,7 +1064,11 @@ async fn main() -> Result<()> {
     let log_path = init_logging(debug_level, want_log, log_panel.clone())?;
 
     let (raw_args, volume_db) = extract_volume(&raw_args, DEFAULT_VOLUME_DB);
-    let (raw_args, latency_ms) = util::extract_latency(&raw_args, 500);
+    let (raw_args, latency_ms, bad_latency) = util::extract_latency(&raw_args, 500);
+    if let Some(spec) = &bad_latency {
+        println!("--latency expects milliseconds (e.g. 500 or 500ms), got '{}'", spec);
+        return Ok(());
+    }
     let (raw_args, offsets) = util::extract_offsets(&raw_args);
     // --bind <ip> forces the local source address for receiver connections,
     // for setups where our interface selection guesses wrong.

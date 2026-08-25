@@ -88,8 +88,9 @@ AUDIO
   --buffered            Use the AAC pipeline, whose latency you choose,
                         instead of realtime ALAC's fixed ~2 s. Implied by
                         --handoff and by naming more than one receiver.
-  --latency <ms>        Starting buffered latency; default 500. Raised
-                        automatically, in steps, if the stream cuts out.
+  --latency <ms>        Starting buffered latency; default 500. An `ms`
+                        suffix is fine. Raised automatically, in steps,
+                        if the stream cuts out.
   --volume <dBFS>       Playback volume; 0 is full scale, default -8.
   --offset <name=ms>    Per-receiver play delay, e.g. --offset pool=+80ms.
                         Repeatable. Lines rooms up when one has a slow amp.
