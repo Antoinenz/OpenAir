@@ -92,6 +92,14 @@ is nothing yet to capture *from*. See [the roadmap](docs/roadmap.md).
 | [docs/troubleshooting.md](docs/troubleshooting.md) | When it does not work |
 | [docs/roadmap.md](docs/roadmap.md) | What is coming, and what is missing |
 
+Working on the protocol itself:
+
+| | |
+|---|---|
+| [docs/airplay2-protocol.md](docs/airplay2-protocol.md) | The AirPlay 2 stack: pairing, RTSP, timing, codecs, feature bits |
+| [docs/design/](docs/design/) | Design notes arguing the trade-offs behind each subsystem |
+| [DEVLOG.md](DEVLOG.md) | What broke, what fixed it, and what the hardware actually did |
+
 ## Roadmap
 
 Next up: published binaries, **Apple TV remote control built in** (drive the
