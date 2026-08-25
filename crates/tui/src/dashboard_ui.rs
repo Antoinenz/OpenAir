@@ -405,6 +405,16 @@ fn render_receivers(frame: &mut Frame, area: Rect, state: &DashboardState) {
                 if let Some(why) = &r.error {
                     spans.push(Span::styled(format!("  {why}"), row.fg(Color::Red)));
                 }
+                // The one failure with a route out of it. Without this the row
+                // says the pairing was rejected and stops, and `r` looks like
+                // the thing to press -- which retries into the same rejection
+                // for as long as the user is willing to keep pressing it.
+                if r.needs_pairing {
+                    spans.push(Span::styled(
+                        "  — forget it in settings (s) and add it again",
+                        row.fg(Color::Yellow),
+                    ));
+                }
                 Line::from(spans)
             })
             .collect()

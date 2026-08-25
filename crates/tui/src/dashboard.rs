@@ -269,6 +269,14 @@ impl DashboardState {
         if r.state != ReceiverState::Failed && r.state != ReceiverState::Dead {
             return DashAction::None;
         }
+        // Rejected credentials are the one failure a retry cannot touch: the
+        // reconnect path uses the same stored pairing and gets the same answer.
+        // Queueing it anyway spends several seconds looking like it is doing
+        // something and lands back here, which reads as "retry is broken"
+        // rather than "this needs pairing again".
+        if r.needs_pairing {
+            return DashAction::None;
+        }
         DashAction::Command(StreamCommand::Add {
             addr: r.addr,
             device_id: self
@@ -697,6 +705,35 @@ mod tests {
                 device_id: DEFAULT_DEVICE_ID.into()
             })
         );
+    }
+
+    #[test]
+    fn r_on_a_rejected_pairing_does_nothing() {
+        // The reconnect path uses the same stored credentials the receiver
+        // just refused, so a retry cannot come out differently. Queueing it
+        // spends seconds looking busy and lands back on the same row, which
+        // reads as a broken retry rather than as "this needs pairing again".
+        let mut rejected = receiver(51, "Pool");
+        rejected.state = ReceiverState::Failed;
+        rejected.needs_pairing = true;
+        let (mut d, _) = dash_with(vec![rejected]);
+
+        assert_eq!(d.on_key(KeyCode::Char('r')), DashAction::None);
+    }
+
+    #[test]
+    fn r_still_retries_an_ordinary_failure() {
+        // The guard above must not swallow the case retry is for: a receiver
+        // that was asleep or briefly off the network.
+        let mut failed = receiver(51, "Pool");
+        failed.state = ReceiverState::Failed;
+        failed.needs_pairing = false;
+        let (mut d, _) = dash_with(vec![failed]);
+
+        assert!(matches!(
+            d.on_key(KeyCode::Char('r')),
+            DashAction::Command(StreamCommand::Add { .. })
+        ));
     }
 
     #[test]
