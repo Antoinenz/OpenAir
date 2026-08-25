@@ -185,6 +185,23 @@ impl PacketBacklog {
     pub fn get(&self, seq: u16) -> Option<&Vec<u8>> {
         self.map.get(&seq)
     }
+
+    /// How many packets back this can reach.
+    ///
+    /// Exposed because it is also the longest run a retransmit request can
+    /// usefully be answered from. `count` arrives on the wire as a `u16`, so a
+    /// receiver may ask for 65535 packets; everything past this depth is a miss
+    /// by definition, and walking it is pure waste.
+    ///
+    /// **Honest about what capping that buys.** 65535 hash lookups is a
+    /// millisecond or two, which the 8 ms packet deadline absorbs, so this is
+    /// not the fix for a stall anybody has measured. What it bounds is a loop
+    /// whose length a remote peer chooses, and the `debug!` inside it: at
+    /// `--debug` an uncapped miss run writes 65535 lines through the tracing
+    /// layer and into the TUI's log buffer, off one UDP datagram.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
 }
 
 /// Shared state the control thread reads to build sync packets.
@@ -423,22 +440,54 @@ impl ControlChannel {
                         let count = u16::from_be_bytes([buf[6], buf[7]]);
                         let mut served = 0u64;
                         let mut missed = 0u64;
+                        // Build the replies under the lock, send them without
+                        // it. The audio thread takes this same mutex once per
+                        // packet, on a deadline it cannot miss, so a loop whose
+                        // length a remote peer chooses does not belong inside
+                        // it. Measured on loopback the difference is under a
+                        // millisecond either way -- this is shape, not a
+                        // repair -- but syscalls under a realtime lock is a
+                        // thing to not do rather than a thing to justify.
+                        let mut replies: Vec<(u16, Vec<u8>)> = Vec::new();
+                        let run;
                         {
                             let backlog = backlog.lock().unwrap();
-                            for i in 0..count {
+                            // The cap is the backlog's own depth, read from it
+                            // rather than kept alongside it: a second constant
+                            // that had to agree would eventually not.
+                            run = usize::from(count).min(backlog.capacity());
+                            replies.reserve(run);
+                            for i in 0..run as u16 {
                                 let seq = lost_seq.wrapping_add(i);
-                                if let Some(pkt) = backlog.get(seq) {
-                                    let mut resp = Vec::with_capacity(4 + pkt.len());
-                                    resp.extend_from_slice(&[0x80, 0xD6]);
-                                    resp.extend_from_slice(&seq.to_be_bytes());
-                                    resp.extend_from_slice(pkt);
-                                    let _ = socket.send_to(&resp, peer);
-                                    served += 1;
-                                } else {
-                                    missed += 1;
-                                    debug!(seq, "retransmit miss (not in backlog)");
+                                match backlog.get(seq) {
+                                    Some(pkt) => replies.push((seq, pkt.clone())),
+                                    None => {
+                                        missed += 1;
+                                        debug!(seq, "retransmit miss (not in backlog)");
+                                    }
                                 }
                             }
+                        }
+                        // Anything past the run we never looked for. It could
+                        // not have been there -- the backlog is smaller than
+                        // the cap -- so counting it as missed is the truth,
+                        // and quietly dropping it would understate how far
+                        // behind recovery had fallen.
+                        let skipped = usize::from(count).saturating_sub(run);
+                        if skipped > 0 {
+                            missed += skipped as u64;
+                            debug!(
+                                count,
+                                run, skipped, "retransmit request larger than the backlog"
+                            );
+                        }
+                        for (seq, pkt) in &replies {
+                            let mut resp = Vec::with_capacity(4 + pkt.len());
+                            resp.extend_from_slice(&[0x80, 0xD6]);
+                            resp.extend_from_slice(&seq.to_be_bytes());
+                            resp.extend_from_slice(pkt);
+                            let _ = socket.send_to(&resp, peer);
+                            served += 1;
                         }
                         let elapsed = began.elapsed();
                         retransmits.record(served, missed, elapsed);
