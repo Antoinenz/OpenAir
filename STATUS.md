@@ -52,18 +52,65 @@
 
 ## Known Issues / Blockers
 
-### ⚠️ Receiver transport buttons (pause/play) are answered but not obeyed
+### ⚠️ An Apple TV shows no AirPlay UI after the first session per reboot
 
-The Apple TV's own pause/play buttons send RTSP `POST /command` on the event
-channel. We answer 200 OK — which keeps the session alive — but ignore the
-content, so the TV pauses its UI while we keep streaming. After a few toggles it
-resets the connection (`10054`, peer reset). Tracked as **#22**; needs the event
-message *body* logged first, then mapping to `set_rate(0)`/re-anchor.
+Audio plays normally — the television simply shows nothing. **The first session
+after a receiver reboot works; every session after it fails, until the next
+reboot.**
+
+One bit predicts it. The receiver's `updateInfo` on the reverse event channel
+carries `flags`, and across nine runs `0x120644` meant the UI appeared while
+`0x20644` alone meant it never did. The difference is `0x100000` —
+`ReceiverSessionIsActive` in the reverse-engineering notes. The correlation is
+9/9 and machine-checkable, which makes it the cheapest triage available: if
+`0x120644` never arrives, the metadata path is not the thing that is broken.
+
+Four theories are dead, each killed by experiment rather than argument:
+orphaned sessions from earlier drops, an unanswered MediaRemote `play`, a stale
+per-sender record keyed to our identity (`--random-sender-id` ruled it out in
+two runs), and anything at all about *what we send* — the RTSP exchange is
+byte-identical between a working run and a failing one. So the state lives
+inside the receiver, is not keyed to our identity, and is cleared only by a
+reboot.
+
+What remains is whether a third-party sender gets a UI where we do not.
+`tools/atv_trace.py` settles it: run `capture` twice without rebooting the
+receiver and diff the traces. Second session still shows the UI → the gap is in
+what we send, and pyatv's trace shows what we omit. Second session shows nothing
+either → the receiver does this to everyone and this closes as upstream
+behaviour. Tracked as **#29**.
 
 ### ⚠️ The TUI only attaches to `capture`
 
 `play` and `tone` still print plain scrolling text. Nothing structural stops
 them — they call the same `stream_fn` — it just wasn't wired up.
+
+<details><summary>RESOLVED 2026-08-21: receiver transport buttons were answered but not obeyed</summary>
+
+The Apple TV's own pause/play buttons send RTSP `POST /command` on the event
+channel. We answered 200 OK — which kept the session alive — but ignored the
+content, so the television paused its UI while we kept streaming.
+
+The payload was decoded during the #29 investigation: `type =
+sendMediaRemoteCommand` wrapping a `modernMediaRemoteCommand`, with
+`kMRMediaRemoteOptionSenderID`, `kMRMediaRemoteOptionCommandID` and
+`kMRMediaRemoteOptionSendOptionsNumber`. `crates/client/src/mediaremote.rs`
+parses it now.
+
+Acting on it does *not* mean pausing our stream. OpenAir streams system audio,
+so there is no OpenAir playback to pause — "play" from the television means
+"play whatever this machine is playing", and the only sensible target is the
+platform's own media session (on Windows, the same SMTC the now-playing
+metadata is read from). Pausing our own stream instead would leave the music
+player running into a void. The handler is process-wide rather than
+per-stream, because a machine has one media session and a command from any
+receiver in a group means the same thing.
+
+Still unconfirmed on hardware: whether obeying the command also stops the
+receiver resetting the connection after a few toggles, which session 14
+observed and which may or may not have shared a cause.
+
+</details>
 
 <details><summary>RESOLVED 2026-08-20: pairing required leaving the TUI</summary>
 
@@ -152,12 +199,15 @@ without `TEARDOWN`), so ours stopped being the foreground session. A best-effort
 
 </details>
 
+### Minor, known and accepted
 
-
-- Timeline offset to a foreign grandmaster is captured once at session start; sender/receiver
-  crystal drift (~ppm) accumulates over very long sessions (hours). Fine for typical use.
-- Bare `openair` scan mode still tries Transient against everything (does not consult the
-  pairing store) — cosmetic; `tone`/`play`/`capture` dispatch correctly.
+- **Long-session drift.** The timeline offset to a foreign grandmaster is
+  captured once at session start, so sender/receiver crystal drift (~ppm)
+  accumulates over sessions measured in hours. Fine for typical use.
+- **`--no-tui` scan mode still tries Transient against everything**, without
+  consulting the pairing store. That is the pre-picker behaviour, kept
+  deliberately as a diagnostic; the default path and `tone`/`play`/`capture`
+  all dispatch correctly.
 
 ---
 
@@ -211,8 +261,9 @@ all display, and survive track changes. Verified over a 4m33s session with five
 consecutive track changes, every one carrying art, with no
 `set_metadata`/`set_artwork` failures.
 
-Note the display still breaks if the session is disrupted (see #22) — it only
-recovers by restarting the receiver, so a clean session is the precondition.
+Note the display still depends on the receiver having attached a screen to the
+session at all — see #29 above, which only a receiver reboot clears. A session
+that gets the AirPlay UI is the precondition.
 
 - **Text** — play a track; title/artist/album appear on the Apple TV.
 - **Cover art** — album image appears alongside (slight compression visible).
@@ -227,21 +278,19 @@ recovers by restarting the receiver, so a clean session is the precondition.
 
 ## Next Steps
 
-0. ~~**Project A — audio quality.**~~ **Done.** Confirmed on hardware (setting
-   the capture device to 44.1 kHz by hand sounded materially better), then
-   fixed: `crates/client/src/resample.rs` uses a 256-tap windowed sinc via
-   rubato, with an untouched passthrough at 44.1 kHz. Still worth a listening
-   test at the Windows default of 48 kHz to confirm it in the living room.
-1. ~~**#22 media controls**~~ **Done** (needs a hardware test). The payload was
-   decoded during the #29 investigation and is now parsed and forwarded to
-   SMTC. Still to confirm on hardware: whether acting on the command also stops
-   the receiver resetting the connection after a few toggles, which session 14
-   observed and which may or may not have shared a cause.
-2. **Step 9** — hardening (DSCP EF, thread priority, retransmit tuning)
-3. **#19** Pool Room (Shairport) refuses connections from the Wi-Fi subnet —
-   server-side, reproducible without OpenAir
-4. Linux capture (PipeWire) + ptp-helper for privileged ports
-5. HomePod hardware test when available; realtime-ALAC multi-room (buffered-only today)
+1. **#29** — run `python tools/atv_trace.py capture` twice without rebooting the
+   Apple TV, watching the television both times, then `diff` the two traces.
+   One experiment, and it decides whether there is any work left here at all.
+2. **Linux** — PipeWire capture, `ptp-helper` for the privileged PTP ports, and
+   `SCHED_FIFO`. The largest gap between what the project promises and what it
+   ships: today it captures on Windows only.
+3. **A real-world retransmit figure.** The turnaround is timed and reported at
+   teardown on the realtime path, but no number has been captured from a lossy
+   network yet, so the <5 ms target is still unmeasured rather than met.
+4. **HomePod**, when hardware is available — expected to take the Apple TV path
+   (PTP, no NTP fallback).
+5. **Realtime-ALAC multi-room.** Grouping is buffered-only today.
+6. **Attach the TUI to `play` and `tone`**, which still print scrolling text.
 
 ---
 
