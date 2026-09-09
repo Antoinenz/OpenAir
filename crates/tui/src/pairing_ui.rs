@@ -1,6 +1,6 @@
 //! Drawing the pairing screen. Decisions live in [`crate::pairing`].
 
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
@@ -9,39 +9,49 @@ use ratatui::Frame;
 use crate::pairing::{PairPhase, PairingState, MAX_ATTEMPTS, PIN_LEN};
 
 pub fn render(frame: &mut Frame, state: &PairingState) {
-    let area = centred_area(frame.area());
     let Some(current) = state.current() else {
         return;
     };
 
-    let [header, pin_area, status, footer] = Layout::vertical([
-        Constraint::Length(4),
+    // Full frame, not a floating box. This screen has exactly one thing to
+    // do -- take four digits the user is reading off a television -- and a
+    // panel in the middle leaves the dead screen behind it visible and
+    // competing for attention.
+    let outer = Block::default().borders(Borders::ALL).title(" OpenAir ");
+    let inner = outer.inner(frame.area());
+    frame.render_widget(outer, frame.area());
+
+    // Two flexible gaps put the prompt near the middle while the key hints
+    // stay pinned to the bottom edge, where they are out of the way.
+    let [_, header, pin_area, status, _, footer] = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(3),
         Constraint::Length(3),
         Constraint::Length(2),
+        Constraint::Min(0),
         Constraint::Length(1),
     ])
-    .areas(area);
+    .areas(inner);
 
     let queued = state.remaining();
     let mut header_lines = vec![
         Line::from(Span::styled(
-            format!("  pairing with {}", current.name),
+            format!("pairing with {}", current.name),
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
-            "  enter the PIN shown on the device",
+            "enter the PIN shown on the device",
             Style::default().fg(Color::DarkGray),
         )),
     ];
     if queued > 0 {
         header_lines.push(Line::from(Span::styled(
-            format!("  {queued} more after this one"),
+            format!("{queued} more after this one"),
             Style::default().fg(Color::DarkGray),
         )));
     }
     frame.render_widget(
-        Paragraph::new(header_lines)
-            .block(Block::default().borders(Borders::ALL).title(" OpenAir ")),
+        Paragraph::new(header_lines).alignment(Alignment::Center),
         header,
     );
 
@@ -49,8 +59,8 @@ pub fn render(frame: &mut Frame, state: &PairingState) {
     // shift under the cursor as digits are typed.
     let filled = state.pin().chars().count();
     let cells: String = (0..PIN_LEN)
-        .map(|i| if i < filled { '●' } else { '○' })
-        .map(|c| format!(" {c} "))
+        .map(|i| if i < filled { '\u{25cf}' } else { '\u{25cb}' })
+        .map(|c| format!("  {c}  "))
         .collect();
     let pin_style = if state.phase() == PairPhase::Verifying {
         Style::default().fg(Color::DarkGray)
@@ -60,49 +70,43 @@ pub fn render(frame: &mut Frame, state: &PairingState) {
             .add_modifier(Modifier::BOLD)
     };
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(format!("   {cells}"), pin_style))),
+        Paragraph::new(Line::from(Span::styled(cells, pin_style)))
+            .alignment(Alignment::Center),
         pin_area,
     );
 
     let status_line = match (state.phase(), state.error()) {
         (PairPhase::Verifying, _) => Line::from(Span::styled(
-            "  checking…",
+            "checking\u{2026}",
             Style::default().fg(Color::Yellow),
         )),
         (_, Some(err)) => Line::from(Span::styled(
-            format!("  {err}"),
+            err.to_string(),
             Style::default().fg(Color::Red),
         )),
         _ => Line::from(""),
     };
     let attempts = if state.attempts_left() < MAX_ATTEMPTS {
         Line::from(Span::styled(
-            format!("  {} attempt(s) left", state.attempts_left()),
+            format!("{} attempt(s) left", state.attempts_left()),
             Style::default().fg(Color::DarkGray),
         ))
     } else {
         Line::from("")
     };
-    frame.render_widget(Paragraph::new(vec![status_line, attempts]), status);
+    frame.render_widget(
+        Paragraph::new(vec![status_line, attempts]).alignment(Alignment::Center),
+        status,
+    );
 
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "  digits to enter · backspace to correct · esc to skip this device",
+            "digits to enter \u{b7} backspace to correct \u{b7} esc to skip this device",
             Style::default().fg(Color::DarkGray),
-        ))),
+        )))
+        .alignment(Alignment::Center),
         footer,
     );
-}
-
-fn centred_area(area: Rect) -> Rect {
-    let width = area.width.min(64);
-    let height = area.height.min(11);
-    Rect {
-        x: area.x + (area.width - width) / 2,
-        y: area.y + (area.height - height) / 2,
-        width,
-        height,
-    }
 }
 
 #[cfg(test)]
@@ -154,6 +158,28 @@ mod tests {
         let out = draw(100, 30, &s);
         assert!(out.contains("new PIN"), "{out}");
         assert!(out.contains("attempt(s) left"));
+    }
+
+    #[test]
+    fn the_pin_prompt_owns_the_whole_terminal() {
+        // Pairing is the one screen with nothing else to do on it: the user
+        // is reading four digits off a television and typing them here. A
+        // small box floating in the middle of a wide terminal leaves the
+        // dead picker behind it competing for attention.
+        let out = draw(100, 30, &state());
+        // `TestBackend` renders each row wrapped in quote marks.
+        let lines: Vec<&str> = out.lines().map(|l| l.trim_matches('"')).collect();
+        assert!(
+            lines[0].starts_with('\u{250c}'),
+            "top-left corner is at the origin, got: {:?}",
+            lines[0]
+        );
+        assert_eq!(lines.len(), 30, "and the frame reaches the bottom");
+        assert!(
+            lines[29].starts_with('\u{2514}'),
+            "bottom-left corner is on the last row, got: {:?}",
+            lines[29]
+        );
     }
 
     #[test]
