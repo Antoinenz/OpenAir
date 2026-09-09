@@ -26,7 +26,7 @@ pub mod settings_screen;
 pub mod settings_ui;
 pub mod term;
 
-pub use app::{App, Screen, SettingsApplier, StartAt, StreamHandle, StreamLauncher};
+pub use app::{App, ReadyHook, Screen, SettingsApplier, StartAt, StreamHandle, StreamLauncher};
 pub use dashboard_ui::Summary;
 pub use logs::{LogBuffer, LogLayer, LogLine};
 pub use pairing_list::{ListAction, PairingList};

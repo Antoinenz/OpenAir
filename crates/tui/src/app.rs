@@ -91,6 +91,17 @@ pub type StreamLauncher<'a> = Box<
 /// which is this one.
 pub type SettingsApplier<'a> = Box<dyn FnMut(&Settings, &Settings) -> Result<(), String> + 'a>;
 
+/// Called once the group is up and audio is about to flow.
+///
+/// Exists for `--handoff`, which silences the speakers by moving the default
+/// output device. That is the last thing that should happen, not the first:
+/// until a receiver is actually ready to play, moving it buys nothing and
+/// costs the user every second of discovery, pairing and connecting.
+///
+/// Like [`SettingsApplier`], the work itself is the caller's -- `openair-tui`
+/// does not depend on `openair-capture`.
+pub type ReadyHook<'a> = Box<dyn FnMut() -> Result<(), String> + 'a>;
+
 /// A running stream.
 pub struct StreamHandle {
     thread: JoinHandle<Result<(), String>>,
@@ -231,6 +242,8 @@ pub struct App<'a> {
     /// [`SettingsApplier`]. `None` in tests and on platforms with nothing to
     /// apply, where a change is simply stored.
     applier: Option<SettingsApplier<'a>>,
+    /// Run when the group first reaches the dashboard. See [`ReadyHook`].
+    on_ready: Option<ReadyHook<'a>>,
     handoff_available: bool,
     /// Device keys the user last chose, so a return to the picker does not
     /// make them pick again.
@@ -267,6 +280,7 @@ impl<'a> App<'a> {
             settings,
             launch,
             applier: None,
+            on_ready: None,
             handoff_available,
             last_selection: Vec::new(),
             receiver_names: HashMap::new(),
@@ -338,6 +352,11 @@ impl<'a> App<'a> {
 
     /// Per-iteration work that isn't input: draining discovery, sampling stats.
     /// Supply the closure that applies platform-side settings changes.
+    pub fn with_ready_hook(mut self, hook: ReadyHook<'a>) -> Self {
+        self.on_ready = Some(hook);
+        self
+    }
+
     pub fn with_applier(mut self, applier: SettingsApplier<'a>) -> Self {
         self.applier = Some(applier);
         self
@@ -717,6 +736,17 @@ impl<'a> App<'a> {
             last_sample: Instant::now(),
             targets: c.targets,
         }));
+
+        // The group is live, so this is the moment --handoff has been waiting
+        // for. A failure here is not fatal: there is a working stream now, and
+        // killing it because the speakers could not be silenced would trade a
+        // real problem for a much larger one. The user hears both instead,
+        // which is visible enough to act on.
+        if let Some(hook) = &mut self.on_ready {
+            if let Err(why) = hook() {
+                tracing::warn!("could not hand the audio over: {why}");
+            }
+        }
     }
 }
 
@@ -1270,6 +1300,45 @@ mod tests {
             calls[0][0].addr,
             "192.168.1.51:7000".parse::<SocketAddr>().unwrap()
         );
+    }
+
+    #[test]
+    fn the_group_going_live_is_what_engages_the_handoff() {
+        // --handoff silences the speakers by moving the default output
+        // device. Doing that before the handshake means silence for the whole
+        // of pairing and connecting -- with a receiver that wants a PIN, for
+        // as long as the human takes to read four digits off a television.
+        let started = std::sync::Mutex::new(Vec::new());
+        let fired = std::cell::Cell::new(0);
+        let mut app = test_app(&started).with_ready_hook(Box::new(|| {
+            fired.set(fired.get() + 1);
+            Ok(())
+        }));
+        app.start_stream(targets_from(&[row("192.168.1.51:7000", None)]));
+        assert_eq!(fired.get(), 0, "speakers stay live while connecting");
+
+        publish(&mut app, ReceiverState::Connected, None);
+
+        assert_eq!(fired.get(), 1, "and hand over once the group is up");
+    }
+
+    #[test]
+    fn a_group_that_never_came_up_leaves_the_speakers_alone() {
+        // The mirror of the case above. Silencing the speakers for a stream
+        // that failed to start would leave the user with no audio anywhere
+        // and a screen asking them for a PIN.
+        let started = std::sync::Mutex::new(Vec::new());
+        let fired = std::cell::Cell::new(0);
+        let mut app = test_app(&started).with_ready_hook(Box::new(|| {
+            fired.set(fired.get() + 1);
+            Ok(())
+        }));
+        app.start_stream(targets_from(&[row("192.168.1.51:7000", None)]));
+
+        publish_rejected(&mut app);
+
+        assert_eq!(app.screen().name(), "pairing");
+        assert_eq!(fired.get(), 0);
     }
 
     #[test]

@@ -706,6 +706,18 @@ struct CaptureRig {
     /// producer was replaced.
     ring: Option<std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<i16>>>>,
     rate: Option<std::sync::Arc<std::sync::atomic::AtomicU32>>,
+    /// Whether this run wants the speakers handed over at all.
+    ///
+    /// Recorded at launch and acted on later, because the handover no longer
+    /// happens when the stream is set up -- it happens when the group goes
+    /// live. See [`Self::engage_handoff`].
+    want_handoff: bool,
+    /// The sending half of the volume-mirror channel.
+    ///
+    /// Made when the stream starts and kept, because the stream needs the
+    /// receiving half before handoff exists to feed it.
+    #[cfg(windows)]
+    volume_tx: Option<std::sync::mpsc::Sender<f32>>,
 }
 
 impl CaptureRig {
@@ -788,6 +800,23 @@ impl CaptureRig {
         self.swap_capture(next.handoff)
     }
 
+    /// Hand the speakers over, now that a receiver is actually playing.
+    ///
+    /// This is what `--handoff` used to do before the handshake. Moving it
+    /// here is the whole point: the old order silenced the speakers for the
+    /// length of discovery, pairing and connecting, which with a receiver
+    /// that wants a PIN is however long the user takes to read four digits
+    /// off a television.
+    ///
+    /// A no-op when the run did not ask for handoff, so the caller can wire
+    /// it unconditionally.
+    fn engage_handoff(&mut self) -> Result<(), String> {
+        if !self.want_handoff {
+            return Ok(());
+        }
+        self.swap_capture(true)
+    }
+
     /// Switch the capture device without rebuilding the consumer.
     ///
     /// The order is about failure, not latency: the new capture is proven
@@ -802,8 +831,18 @@ impl CaptureRig {
 
         // 1. Move the endpoint.
         let (new_handoff, capture_device) = if want_handoff {
-            let (session, _volume_rx) =
-                start_handoff(self.handoff_device.clone()).map_err(|e| e.to_string())?;
+            // Reuse the channel the stream is already listening on. Making a
+            // fresh one here would drop the receiving half on the floor and
+            // silently cost the volume mirroring this mode exists for.
+            let tx = match self.volume_tx.clone() {
+                Some(tx) => tx,
+                None => {
+                    let (tx, _rx) = std::sync::mpsc::channel::<f32>();
+                    tx
+                }
+            };
+            let session =
+                start_handoff(self.handoff_device.clone(), tx).map_err(|e| e.to_string())?;
             let name = session.device_name().to_string();
             (Some(session), Some(name))
         } else {
@@ -873,20 +912,27 @@ impl CaptureRig {
             self.metadata = None;
         }
 
+        // Handoff is deliberately *not* engaged here. Capture starts on
+        // whatever the user is listening on, so the speakers keep playing
+        // through discovery, pairing and the whole RTSP handshake; the
+        // switch happens once a receiver is actually ready for the audio.
+        // See `engage_handoff`.
+        self.want_handoff = settings.handoff;
         #[cfg(windows)]
-        let (volume_rx, capture_device) = if settings.handoff {
-            let (session, rx) =
-                start_handoff(self.handoff_device.clone()).map_err(|e| e.to_string())?;
-            let name = session.device_name().to_string();
-            tracing::info!(device = %name, "system audio routed to virtual device");
-            self.handoff = Some(session);
-            (Some(rx), Some(name))
+        let volume_rx = if settings.handoff {
+            // The channel outlives any one handoff session, so the stream can
+            // hold the receiving half from the start and simply see nothing
+            // on it until the handover happens.
+            let (tx, rx) = std::sync::mpsc::channel::<f32>();
+            self.volume_tx = Some(tx);
+            Some(rx)
         } else {
-            (None, None)
+            self.volume_tx = None;
+            None
         };
         #[cfg(not(windows))]
-        let (volume_rx, capture_device): (Option<std::sync::mpsc::Receiver<f32>>, Option<String>) =
-            (None, None);
+        let volume_rx: Option<std::sync::mpsc::Receiver<f32>> = None;
+        let capture_device: Option<String> = None;
 
         let cap = openair_capture::SystemCapture::start_on(capture_device.as_deref())
             .map_err(|e| format!("could not start system audio capture: {e}"))?;
@@ -1013,22 +1059,22 @@ fn init_logging(
 /// — dropping it restores the original output device) and a receiver of
 /// mirrored dBFS updates.
 ///
-/// `Err` is fatal by design: `--handoff` promises silent speakers, and silently
-/// streaming with them still playing would be worse than refusing.
+/// The caller supplies the channel rather than receiving one, because handoff
+/// now engages *after* the stream has started: the consumer needs its end of
+/// the channel before there is anything to send on it.
+///
+/// `Err` is no longer fatal. It was, when this ran before the handshake and
+/// the only thing lost was a stream that had not started; by the time it runs
+/// now there is a working stream, and tearing that down because the speakers
+/// could not be silenced trades a real problem for a larger one.
 #[cfg(windows)]
 fn start_handoff(
     device_override: Option<String>,
-) -> Result<
-    (
-        openair_capture::handoff::HandoffSession,
-        std::sync::mpsc::Receiver<f32>,
-    ),
-    openair_capture::handoff::HandoffError,
-> {
+    fwd_tx: std::sync::mpsc::Sender<f32>,
+) -> Result<openair_capture::handoff::HandoffSession, openair_capture::handoff::HandoffError> {
     let (session, event_rx) = openair_capture::handoff::HandoffSession::start(device_override)?;
     // Adapt the capture crate's VolumeEvent → plain f32 (dBFS) so the client's
     // stream signature stays platform-independent.
-    let (fwd_tx, fwd_rx) = std::sync::mpsc::channel::<f32>();
     std::thread::spawn(move || {
         for ev in event_rx {
             let openair_capture::handoff::VolumeEvent::Level(db) = ev;
@@ -1037,7 +1083,7 @@ fn start_handoff(
             }
         }
     });
-    Ok((session, fwd_rx))
+    Ok(session)
 }
 
 #[tokio::main]
@@ -1385,6 +1431,9 @@ async fn main() -> Result<()> {
                 handoff: None,
                 #[cfg(windows)]
                 metadata: None,
+                #[cfg(windows)]
+                volume_tx: None,
+                want_handoff: false,
                 capture: None,
                 ring: None,
                 rate: None,
@@ -1404,6 +1453,9 @@ async fn main() -> Result<()> {
             let apply_rig = std::rc::Rc::clone(&rig);
             let applier: openair_tui::SettingsApplier =
                 Box::new(move |old, new| apply_rig.borrow_mut().apply(old, new));
+            let ready_rig = std::rc::Rc::clone(&rig);
+            let ready: openair_tui::ReadyHook =
+                Box::new(move || ready_rig.borrow_mut().engage_handoff());
 
             // CLI flags stand in for the saved preferences on this run, so a
             // named `--latency` still wins over settings.json without
@@ -1416,7 +1468,8 @@ async fn main() -> Result<()> {
             });
             let mut app =
                 openair_tui::App::new(settings, log_panel.clone(), handoff_available, launcher)
-                    .with_applier(applier);
+                    .with_applier(applier)
+                    .with_ready_hook(ready);
             let start = if receivers.is_empty() {
                 openair_tui::StartAt::Picker
             } else {
@@ -1444,10 +1497,17 @@ async fn main() -> Result<()> {
         // starting capture, so we capture the cable rather than the speakers.
         // `_handoff_session` must outlive the stream call — dropping it puts
         // the user's default output device back.
+        //
+        // This path stays eager, unlike the TUI's. Deferring the switch until
+        // a receiver is ready needs something that knows when that happened,
+        // and here the stream call simply blocks until it is over. `--no-tui`
+        // is a diagnostic anyway, so it keeps the simpler ordering and the
+        // silence that comes with it.
         #[cfg(windows)]
         let (_handoff_session, volume_rx, capture_device) = if handoff {
-            match start_handoff(handoff_device.clone()) {
-                Ok((session, rx)) => {
+            let (tx, rx) = std::sync::mpsc::channel::<f32>();
+            match start_handoff(handoff_device.clone(), tx) {
+                Ok(session) => {
                     let name = session.device_name().to_string();
                     println!("  🔀 system audio routed to \"{}\"", name);
                     println!("     speakers are silent; the Windows volume now controls AirPlay");
