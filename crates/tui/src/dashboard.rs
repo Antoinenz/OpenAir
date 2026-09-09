@@ -28,6 +28,13 @@ pub enum DashAction {
     Command(StreamCommand),
     /// Open the add-a-receiver overlay.
     OpenPicker,
+    /// Send this receiver back through pairing.
+    ///
+    /// Distinct from [`Self::Command`] because it cannot be answered by the
+    /// running stream: the credentials it would reconnect with are the ones
+    /// the receiver just refused. Only a new PIN changes the outcome, and
+    /// that needs a screen.
+    Repair(SocketAddr),
 }
 
 /// Fallback device id, matching the CLI, for a receiver that advertised none.
@@ -269,13 +276,12 @@ impl DashboardState {
         if r.state != ReceiverState::Failed && r.state != ReceiverState::Dead {
             return DashAction::None;
         }
-        // Rejected credentials are the one failure a retry cannot touch: the
-        // reconnect path uses the same stored pairing and gets the same answer.
-        // Queueing it anyway spends several seconds looking like it is doing
-        // something and lands back here, which reads as "retry is broken"
-        // rather than "this needs pairing again".
+        // Rejected credentials are the one failure a reconnect cannot touch:
+        // it would offer the same stored pairing and get the same answer. So
+        // `r` means something different on this row -- pair again, which is
+        // the only thing that can change the outcome.
         if r.needs_pairing {
-            return DashAction::None;
+            return DashAction::Repair(r.addr);
         }
         DashAction::Command(StreamCommand::Add {
             addr: r.addr,
@@ -708,17 +714,16 @@ mod tests {
     }
 
     #[test]
-    fn r_on_a_rejected_pairing_does_nothing() {
+    fn r_on_a_rejected_pairing_asks_to_pair_again() {
         // The reconnect path uses the same stored credentials the receiver
-        // just refused, so a retry cannot come out differently. Queueing it
-        // spends seconds looking busy and lands back on the same row, which
-        // reads as a broken retry rather than as "this needs pairing again".
+        // just refused, so retrying cannot come out differently. Pairing
+        // again is the one thing that can, and it is what `r` means here.
         let mut rejected = receiver(51, "Pool");
         rejected.state = ReceiverState::Failed;
         rejected.needs_pairing = true;
         let (mut d, _) = dash_with(vec![rejected]);
 
-        assert_eq!(d.on_key(KeyCode::Char('r')), DashAction::None);
+        assert_eq!(d.on_key(KeyCode::Char('r')), DashAction::Repair(addr(51)));
     }
 
     #[test]

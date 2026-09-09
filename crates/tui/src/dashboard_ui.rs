@@ -405,13 +405,13 @@ fn render_receivers(frame: &mut Frame, area: Rect, state: &DashboardState) {
                 if let Some(why) = &r.error {
                     spans.push(Span::styled(format!("  {why}"), row.fg(Color::Red)));
                 }
-                // The one failure with a route out of it. Without this the row
-                // says the pairing was rejected and stops, and `r` looks like
-                // the thing to press -- which retries into the same rejection
-                // for as long as the user is willing to keep pressing it.
+                // The one failure with a route out of it, and `r` is that
+                // route: on this row it means pair again rather than
+                // reconnect, because reconnecting would offer the same
+                // credentials the receiver just refused.
                 if r.needs_pairing {
                     spans.push(Span::styled(
-                        "  — forget it in settings (s) and add it again",
+                        "  — press r to pair again",
                         row.fg(Color::Yellow),
                     ));
                 }

@@ -212,6 +212,14 @@ pub struct StreamingScreen {
     pub state: DashboardState,
     running: Running,
     last_sample: Instant,
+    /// The group this stream was built from.
+    ///
+    /// Carried so a receiver whose pairing is rejected can be sent back
+    /// through pairing from here. Reconnecting tears down every room, not
+    /// just the rejected one, so the retry has to rebuild the whole group --
+    /// and the dashboard's rows are a *report* of the stream, not the list
+    /// it was started with.
+    targets: Vec<GroupTarget>,
 }
 
 pub struct App<'a> {
@@ -573,6 +581,45 @@ impl<'a> App<'a> {
         self.start_stream(targets);
     }
 
+    /// Send one receiver back through pairing, asked for from the dashboard.
+    ///
+    /// This is the path the automatic offer cannot reach. That offer only
+    /// fires when *every* receiver failed, so a group where one room
+    /// connected and another was rejected lands here instead -- and the more
+    /// rooms there are, the likelier that is.
+    ///
+    /// Unlike the automatic offer this ignores `repair_attempted`. That guard
+    /// exists to stop two screens handing the user back and forth without
+    /// being asked; a key press is the asking.
+    fn repair_from_dashboard(&mut self, addr: SocketAddr) {
+        let Screen::Streaming(s) = &self.screen else {
+            return;
+        };
+        let targets = s.targets.clone();
+        // The device id comes from the target rather than the dashboard row:
+        // the row is a report from the stream, and the target is what we
+        // actually connected with.
+        let device_id = targets
+            .iter()
+            .find(|t| t.addr == addr)
+            .map(|t| t.device_id.clone())
+            .unwrap_or_else(|| DEFAULT_DEVICE_ID.to_string());
+        let name = self
+            .receiver_names
+            .get(&addr)
+            .cloned()
+            .unwrap_or_else(|| addr.to_string());
+        s.running.stop();
+        self.begin_repair(
+            vec![PendingPair {
+                name,
+                addr,
+                device_id,
+            }],
+            targets,
+        );
+    }
+
     /// The receivers on this screen that could be fixed by pairing again.
     ///
     /// Only ever offered once each per run. Skipping the prompt leaves the
@@ -668,6 +715,7 @@ impl<'a> App<'a> {
             state,
             running: c.running,
             last_sample: Instant::now(),
+            targets: c.targets,
         }));
     }
 }
@@ -837,6 +885,7 @@ impl<'a> App<'a> {
                 DashAction::OpenPicker => {
                     dashboard_ui::add_receiver(terminal, &s.running.stats)?;
                 }
+                DashAction::Repair(addr) => self.repair_from_dashboard(addr),
                 DashAction::None => {}
             },
         }
@@ -1398,6 +1447,54 @@ mod tests {
             }]);
         c.state.sample(&c.running.stats);
         app.advance_from_connecting();
+    }
+
+    /// Publish a two-room group where one connected and one was rejected.
+    fn publish_mixed(app: &mut App<'_>) {
+        let Screen::Connecting(c) = &mut app.screen else {
+            panic!("expected connecting");
+        };
+        let stat = |ip: &str, state, needs_pairing| openair_client::ReceiverStat {
+            name: ip.into(),
+            addr: format!("{ip}:7000").parse().unwrap(),
+            state,
+            offset_ms: 0,
+            trim_db: 0.0,
+            lead_ms: None,
+            health: 0.0,
+            error: None,
+            needs_pairing,
+        };
+        c.running.stats.set_receivers(vec![
+            stat("192.168.1.51", ReceiverState::Connected, false),
+            stat("192.168.1.52", ReceiverState::Failed, true),
+        ]);
+        c.state.sample(&c.running.stats);
+        app.advance_from_connecting();
+    }
+
+    #[test]
+    fn pairing_again_from_the_dashboard_rebuilds_the_whole_group() {
+        // A group where one room connected reaches the dashboard, so the
+        // automatic offer never fires -- `r` on the rejected row is the only
+        // way back to pairing. It has to carry every target, not just the
+        // rejected one: reconnecting tears the working room down too.
+        let started = std::sync::Mutex::new(Vec::new());
+        let mut app = test_app(&started);
+        app.start_stream(targets_from(&[
+            row("192.168.1.51:7000", None),
+            row("192.168.1.52:7000", None),
+        ]));
+        publish_mixed(&mut app);
+        assert_eq!(app.screen().name(), "streaming", "a partial group plays on");
+
+        app.repair_from_dashboard("192.168.1.52:7000".parse().unwrap());
+
+        assert_eq!(app.screen().name(), "pairing");
+        let Screen::Pairing(p) = &app.screen else {
+            panic!("expected pairing");
+        };
+        assert_eq!(p.targets.len(), 2, "the whole group is rebuilt");
     }
 
     #[test]
