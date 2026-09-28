@@ -1,0 +1,54 @@
+# Build, test and lint every push and pull request.
+#
+# Windows only, deliberately: system audio capture is WASAPI, and Windows is
+# the only platform OpenAir claims to support today. A Linux job is how the
+# Linux port should *start* -- it would tell us exactly what fails to compile
+# -- but adding one now would only paint CI red for a port nobody has begun.
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+# A second push to the same branch makes the first run's answer worthless.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Backtraces cost nothing here and turn "assertion failed" into something
+  # you can act on without reproducing it locally.
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: build, test, lint
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      # Restores the registry and target dir. The AAC encoder is vendored C
+      # compiled by fdk-aac-sys, and it is the slowest thing in the build, so
+      # caching it is most of the win.
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Build
+        run: cargo build --workspace --all-targets
+
+      - name: Test
+        run: cargo test --workspace
+
+      # Warnings are errors here because the project keeps them at zero; the
+      # only way that stays true is if a warning fails the build.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
