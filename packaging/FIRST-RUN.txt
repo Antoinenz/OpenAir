@@ -1,0 +1,89 @@
+OpenAir — first run
+===================
+
+Stream your PC's audio to AirPlay 2 receivers. No installation: the exe in
+this folder is the whole program.
+
+
+Start it
+--------
+
+Double-click openair.exe. It opens a list of the AirPlay receivers it can
+see on your network. Pick one with the arrow keys, press Enter, and audio
+from your PC starts playing on it.
+
+Prefer a terminal? `openair --help` lists everything it can do.
+
+
+Two prompts on the first run
+----------------------------
+
+1. "Windows protected your PC" (SmartScreen)
+
+   This build is not code-signed, so Windows does not recognise it. Click
+   "More info", then "Run anyway". Signing is planned; certificates that
+   satisfy SmartScreen immediately are expensive, and the free route for
+   open-source projects takes time to arrange.
+
+2. "Allow OpenAir to communicate on these networks"
+
+   Tick PRIVATE networks and allow it. OpenAir has to find receivers and
+   send audio to them, and neither works if this is denied. If you clicked
+   Cancel by accident, remove OpenAir under Windows Security → Firewall &
+   network protection → Allow an app through firewall, then run it again.
+
+
+Pairing
+-------
+
+Apple TVs usually ask to be paired. A four-digit PIN appears on the TV
+screen; OpenAir will show a box for it. Type the PIN and press Enter. It
+is remembered, so this happens once per receiver.
+
+HomePods and most third-party speakers need no PIN.
+
+
+If a receiver does not appear
+-----------------------------
+
+Most often the PC and the receiver are on different networks — a guest
+Wi-Fi network, or a VLAN. They have to be on the same one for discovery
+to work.
+
+You can also name a receiver directly by address, skipping discovery:
+
+    openair capture 192.168.1.50:7000
+
+
+Silencing your PC speakers
+--------------------------
+
+By default audio plays on your PC *and* the receiver. To move it entirely
+to the receiver, and hand the Windows volume slider and volume keys to
+AirPlay, use --handoff:
+
+    openair capture "Living Room" --handoff
+
+This one needs VB-CABLE, a free virtual audio driver, installed first:
+https://vb-audio.com/Cable/
+
+
+Something went wrong
+--------------------
+
+Run with --log to write the session to a file next to the exe, in logs\:
+
+    openair capture "Living Room" --log
+
+docs\troubleshooting.md covers the failures we have seen and what they
+mean. If none of it fits, that log file is the thing to attach to an
+issue at https://github.com/Antoinenz/OpenAir/issues
+
+
+This is a prerelease
+--------------------
+
+It is unsigned, there is no installer, and the interface is a terminal
+one. A desktop app is being designed. The protocol side — multi-room on a
+shared clock, lossless ALAC, AAC, pairing, now-playing metadata — is the
+part that is well tested. Bug reports are genuinely useful right now.
