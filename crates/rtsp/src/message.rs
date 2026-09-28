@@ -88,7 +88,10 @@ mod tests {
         // The caller has to tell these apart: "the body is empty" and "nobody
         // said how long the body is" call for different behaviour on a stream
         // that cannot be re-read.
-        assert_eq!(declared_body_len(b"CSeq: 3\r\nContent-Length: 0\r\n\r\n"), Some(0));
+        assert_eq!(
+            declared_body_len(b"CSeq: 3\r\nContent-Length: 0\r\n\r\n"),
+            Some(0)
+        );
         assert_eq!(declared_body_len(b"CSeq: 3\r\n\r\n"), None);
     }
 

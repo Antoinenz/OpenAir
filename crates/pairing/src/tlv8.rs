@@ -74,7 +74,9 @@ pub fn decode(data: &[u8]) -> HashMap<u8, Vec<u8>> {
         if i + len > data.len() {
             break;
         }
-        map.entry(tag).or_default().extend_from_slice(&data[i..i + len]);
+        map.entry(tag)
+            .or_default()
+            .extend_from_slice(&data[i..i + len]);
         i += len;
     }
     map

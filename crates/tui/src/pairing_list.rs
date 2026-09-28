@@ -176,7 +176,11 @@ mod tests {
         let mut l = list();
         assert_eq!(l.on_key(KeyCode::Char('d')), ListAction::None);
         assert_eq!(l.armed(), Some("AA:AA"));
-        assert!(l.status().unwrap().contains("Living Room"), "{:?}", l.status());
+        assert!(
+            l.status().unwrap().contains("Living Room"),
+            "{:?}",
+            l.status()
+        );
 
         assert_eq!(
             l.on_key(KeyCode::Char('d')),
@@ -221,7 +225,11 @@ mod tests {
         l.forgotten("BB:BB");
         assert_eq!(l.peers().len(), 2);
         assert!(l.peers().iter().all(|p| p.device_id != "BB:BB"));
-        assert!(l.status().unwrap().contains("Pool Room"), "{:?}", l.status());
+        assert!(
+            l.status().unwrap().contains("Pool Room"),
+            "{:?}",
+            l.status()
+        );
         assert_eq!(l.armed(), None);
     }
 

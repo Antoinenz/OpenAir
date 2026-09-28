@@ -173,7 +173,10 @@ pub struct PacketBacklog {
 
 impl PacketBacklog {
     pub fn new(capacity: usize) -> Self {
-        PacketBacklog { map: HashMap::with_capacity(capacity), capacity }
+        PacketBacklog {
+            map: HashMap::with_capacity(capacity),
+            capacity,
+        }
     }
 
     pub fn insert(&mut self, seq: u16, packet: Vec<u8>) {
@@ -361,7 +364,12 @@ impl ControlChannel {
 
     /// Spawn for a PTP session: 1 Hz anchoring announcements (type 215) with
     /// our PTP clock, plus retransmit replies.
-    pub fn spawn_ptp(self, dest: SocketAddr, state: Arc<SyncState>, clock_id: u64) -> ControlHandle {
+    pub fn spawn_ptp(
+        self,
+        dest: SocketAddr,
+        state: Arc<SyncState>,
+        clock_id: u64,
+    ) -> ControlHandle {
         self.spawn_inner(dest, state, SyncMode::PtpAnchor { clock_id })
     }
 
@@ -578,7 +586,13 @@ mod tests {
         nonce[4..].copy_from_slice(&pkt[pkt.len() - 8..]);
         let ct = &pkt[12..pkt.len() - 8];
         let plain = cipher_rx
-            .decrypt(Nonce::from_slice(&nonce), Payload { msg: ct, aad: &pkt[4..12] })
+            .decrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: ct,
+                    aad: &pkt[4..12],
+                },
+            )
             .unwrap();
         assert_eq!(plain, payload);
     }
@@ -590,7 +604,8 @@ mod tests {
         let payload = b"raw aac-lc frame bytes".to_vec();
         let seq: u32 = 0x00ABCDEF; // within 23-bit range
         let rtptime: u32 = 1024;
-        let block = build_buffered_audio_block(&mut cipher, seq, rtptime, AAC_44100_F24_2_SSRC, &payload);
+        let block =
+            build_buffered_audio_block(&mut cipher, seq, rtptime, AAC_44100_F24_2_SSRC, &payload);
 
         // Length prefix includes the 2 length bytes themselves.
         let declared_len = u16::from_be_bytes([block[0], block[1]]) as usize;
@@ -718,9 +733,7 @@ mod tests {
         let mut req = vec![0x80, 0x55, 0x00, 0x01];
         req.extend_from_slice(&7u16.to_be_bytes());
         req.extend_from_slice(&2u16.to_be_bytes());
-        receiver
-            .send_to(&req, ("127.0.0.1", control_port))
-            .unwrap();
+        receiver.send_to(&req, ("127.0.0.1", control_port)).unwrap();
 
         // Read until the resend arrives -- the channel also sends 1 Hz sync
         // packets to this address, so the first packet back may not be ours.

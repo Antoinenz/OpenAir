@@ -100,10 +100,7 @@ pub enum StreamCommand {
     /// Set a receiver's play offset in milliseconds; re-anchors that receiver.
     SetOffset { addr: SocketAddr, ms: i64 },
     /// Bring a new receiver into the group mid-stream.
-    Add {
-        addr: SocketAddr,
-        device_id: String,
-    },
+    Add { addr: SocketAddr, device_id: String },
     /// Remove a receiver: tear it down and do not reconnect.
     Remove { addr: SocketAddr },
     /// Set the group anchor latency in ms and re-anchor every live receiver.
@@ -293,7 +290,11 @@ mod tests {
             Some(180),
             "the dip must survive, not be averaged away"
         );
-        assert_eq!(stats.take_min_lead_ms(), None, "rearmed for the next window");
+        assert_eq!(
+            stats.take_min_lead_ms(),
+            None,
+            "rearmed for the next window"
+        );
 
         stats.record_lead_ms(500);
         assert_eq!(stats.take_min_lead_ms(), Some(500));
@@ -473,10 +474,7 @@ mod tests {
         let addr: SocketAddr = "192.168.1.51:7000".parse().unwrap();
         std::thread::spawn(move || {
             for i in 0..50 {
-                sender.send(StreamCommand::SetTrim {
-                    addr,
-                    db: i as f32,
-                });
+                sender.send(StreamCommand::SetTrim { addr, db: i as f32 });
             }
         })
         .join()
@@ -528,5 +526,4 @@ mod tests {
         );
         assert!(stats.drain_commands().is_empty(), "draining consumes");
     }
-
 }

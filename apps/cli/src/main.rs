@@ -301,7 +301,12 @@ mod util {
             // `--offset "Pool Room=+80ms"` has always accepted it, so typing
             // `--latency 1500ms` is a reasonable thing to do. It used to mean
             // 500 and say nothing.
-            let args = vec!["capture".into(), "pool".into(), "--latency".into(), "1500ms".into()];
+            let args = vec![
+                "capture".into(),
+                "pool".into(),
+                "--latency".into(),
+                "1500ms".into(),
+            ];
             let (rest, ms, bad) = extract_latency(&args, 500);
             assert_eq!(rest, vec!["capture".to_string(), "pool".to_string()]);
             assert_eq!(ms, 1500);
@@ -321,14 +326,21 @@ mod util {
             let args = vec!["capture".into(), "--latency".into(), "soon".into()];
             let (_, ms, bad) = extract_latency(&args, 500);
             assert_eq!(ms, 500, "the default still applies");
-            assert_eq!(bad.as_deref(), Some("soon"), "and the caller gets to say so");
+            assert_eq!(
+                bad.as_deref(),
+                Some("soon"),
+                "and the caller gets to say so"
+            );
         }
 
         #[test]
         fn a_latency_flag_with_nothing_after_it_is_reported() {
             let args = vec!["capture".into(), "--latency".into()];
             let (_, _, bad) = extract_latency(&args, 500);
-            assert!(bad.is_some(), "a flag that ate itself must not pass silently");
+            assert!(
+                bad.is_some(),
+                "a flag that ate itself must not pass silently"
+            );
         }
 
         #[test]
@@ -342,7 +354,11 @@ mod util {
 
         #[test]
         fn extract_volume_present() {
-            let args = vec!["capture".to_string(), "--volume".to_string(), "-12.5".to_string()];
+            let args = vec![
+                "capture".to_string(),
+                "--volume".to_string(),
+                "-12.5".to_string(),
+            ];
             let (rest, vol) = extract_volume(&args, -8.0);
             assert_eq!(rest, vec!["capture".to_string()]);
             assert_eq!(vol, -12.5);
@@ -380,7 +396,11 @@ mod util {
             let (rest, vol) = extract_volume(&args, -8.0);
             assert_eq!(
                 rest,
-                vec!["capture".to_string(), "127.0.0.1:7000".to_string(), "30".to_string()]
+                vec![
+                    "capture".to_string(),
+                    "127.0.0.1:7000".to_string(),
+                    "30".to_string()
+                ]
             );
             assert_eq!(vol, -3.0);
         }
@@ -405,7 +425,11 @@ mod util {
 
         #[test]
         fn extract_flag_present() {
-            let args = vec!["tone".to_string(), "127.0.0.1:7000".to_string(), "--buffered".to_string()];
+            let args = vec![
+                "tone".to_string(),
+                "127.0.0.1:7000".to_string(),
+                "--buffered".to_string(),
+            ];
             let (rest, present) = extract_flag(&args, "--buffered");
             assert_eq!(rest, vec!["tone".to_string(), "127.0.0.1:7000".to_string()]);
             assert!(present);
@@ -437,7 +461,12 @@ mod util {
 
         #[test]
         fn extract_debug_level_explicit_level_is_consumed() {
-            let args = vec!["capture".into(), "test".into(), "--debug".into(), "2".into()];
+            let args = vec![
+                "capture".into(),
+                "test".into(),
+                "--debug".into(),
+                "2".into(),
+            ];
             let (rest, level) = extract_debug_level(&args);
             assert_eq!(rest, vec!["capture".to_string(), "test".to_string()]);
             assert_eq!(level, 2);
@@ -536,7 +565,11 @@ mod util {
             let args = vec!["capture".into(), "--no-tui".into(), "Pool".into()];
             let (rest, found) = extract_flag(&args, "--no-tui");
             assert!(found);
-            assert_eq!(rest, ["capture", "Pool"], "the flag must not reach dispatch");
+            assert_eq!(
+                rest,
+                ["capture", "Pool"],
+                "the flag must not reach dispatch"
+            );
         }
     }
 }
@@ -557,7 +590,10 @@ fn resolve_receiver(arg: &str) -> Option<(SocketAddr, String, Option<String>)> {
         return Some((addr, DEFAULT_DEVICE_ID.to_string(), None));
     }
 
-    println!("'{}' is not an ip:port — searching for a receiver named like it (5s)...", arg);
+    println!(
+        "'{}' is not an ip:port — searching for a receiver named like it (5s)...",
+        arg
+    );
     let mut devices = Vec::new();
     if let Err(e) = openair_discovery::browse(Duration::from_secs(5), |d| devices.push(d)) {
         println!("  ✗ discovery failed: {}", e);
@@ -1112,7 +1148,10 @@ async fn main() -> Result<()> {
     let (raw_args, volume_db) = extract_volume(&raw_args, DEFAULT_VOLUME_DB);
     let (raw_args, latency_ms, bad_latency) = util::extract_latency(&raw_args, 500);
     if let Some(spec) = &bad_latency {
-        println!("--latency expects milliseconds (e.g. 500 or 500ms), got '{}'", spec);
+        println!(
+            "--latency expects milliseconds (e.g. 500 or 500ms), got '{}'",
+            spec
+        );
         return Ok(());
     }
     let (raw_args, offsets) = util::extract_offsets(&raw_args);
@@ -1191,7 +1230,11 @@ async fn main() -> Result<()> {
     let (args, impersonate) = extract_flag(&args, "--impersonate-iphone");
     if impersonate {
         let p = openair_rtsp::identity::impersonate_iphone();
-        tracing::info!(model = p.model, os = p.os_name, "impersonating an iPhone for this run");
+        tracing::info!(
+            model = p.model,
+            os = p.os_name,
+            "impersonating an iPhone for this run"
+        );
     }
 
     // --- Interactive picker -------------------------------------------------
@@ -1267,7 +1310,13 @@ async fn main() -> Result<()> {
         }
         if buffered || targets.len() > 1 {
             openair_client::stream_audio_buffered_multi(
-                targets, source, volume, latency_ms, volume_rx, metadata_rx, stats,
+                targets,
+                source,
+                volume,
+                latency_ms,
+                volume_rx,
+                metadata_rx,
+                stats,
             )
         } else {
             // The realtime ALAC path has neither a metadata channel nor stats.
@@ -1522,8 +1571,10 @@ async fn main() -> Result<()> {
             (None, None, None)
         };
         #[cfg(not(windows))]
-        let (volume_rx, capture_device): (Option<std::sync::mpsc::Receiver<f32>>, Option<String>) =
-            (None, None);
+        let (volume_rx, capture_device): (
+            Option<std::sync::mpsc::Receiver<f32>>,
+            Option<String>,
+        ) = (None, None);
 
         #[cfg(windows)]
         let (_metadata_watcher, metadata_rx) = if no_metadata {
@@ -1541,7 +1592,9 @@ async fn main() -> Result<()> {
             }
         };
         #[cfg(not(windows))]
-        let metadata_rx: Option<std::sync::mpsc::Receiver<openair_core::metadata::NowPlaying>> = {
+        let metadata_rx: Option<
+            std::sync::mpsc::Receiver<openair_core::metadata::NowPlaying>,
+        > = {
             let _ = no_metadata;
             None
         };
@@ -1678,7 +1731,10 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    println!("\nFound {} device(s). Attempting pairing...\n", devices.len());
+    println!(
+        "\nFound {} device(s). Attempting pairing...\n",
+        devices.len()
+    );
 
     for dev in &devices {
         let addr = SocketAddr::new(dev.addr, dev.port);

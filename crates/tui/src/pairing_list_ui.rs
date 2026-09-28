@@ -100,10 +100,7 @@ fn row_line(label: &str, device_id: &str, selected: bool, armed: bool) -> Line<'
         // The device id is what makes two speakers called "HomePod"
         // distinguishable, so it earns its place -- but dimmed, because it is
         // not what anyone is looking for.
-        Span::styled(
-            device_id.to_string(),
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled(device_id.to_string(), Style::default().fg(Color::DarkGray)),
     ])
 }
 

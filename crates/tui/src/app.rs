@@ -856,10 +856,7 @@ impl<'a> App<'a> {
                     if let Err(e) = self.settings.save() {
                         tracing::warn!("could not save settings: {e}");
                     }
-                    self.receiver_names = chosen
-                        .iter()
-                        .map(|r| (r.addr, r.name.clone()))
-                        .collect();
+                    self.receiver_names = chosen.iter().map(|r| (r.addr, r.name.clone())).collect();
                     self.begin(targets_from(&chosen), pending_pairs(&chosen));
                 }
                 PickerAction::None | PickerAction::Hint(_) => {}

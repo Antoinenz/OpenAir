@@ -29,7 +29,10 @@ struct BitWriter {
 
 impl BitWriter {
     fn new(capacity: usize) -> Self {
-        BitWriter { out: Vec::with_capacity(capacity), used: 8 }
+        BitWriter {
+            out: Vec::with_capacity(capacity),
+            used: 8,
+        }
     }
 
     /// Write the lowest `bits` bits of `value`, MSB first.
@@ -217,6 +220,9 @@ mod tests {
                 assert!(out.len() > 8, "frame too small: {}", out.len());
             }
         }
-        assert!(non_empty_count > 0, "expected at least one non-empty AAC frame");
+        assert!(
+            non_empty_count > 0,
+            "expected at least one non-empty AAC frame"
+        );
     }
 }

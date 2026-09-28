@@ -52,7 +52,6 @@ impl AudioSource for SineSource {
     }
 }
 
-
 /// Reads a WAV file and yields interleaved stereo i16 samples at 44100 Hz,
 /// regardless of the file's native format.
 ///
@@ -113,9 +112,8 @@ fn read_stereo_frame(
     channels: u16,
     format: SampleFormat,
 ) -> Option<[i16; 2]> {
-    let to_i16 = |v: f64| -> i16 {
-        v.round().clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i16
-    };
+    let to_i16 =
+        |v: f64| -> i16 { v.round().clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i16 };
 
     match format {
         SampleFormat::Int => {
@@ -148,11 +146,11 @@ impl AudioSource for WavSource {
         let reader = &mut self.reader;
         let src_channels = self.src_channels;
         let sample_format = self.sample_format;
-        self.resampler
-            .fill(buf, || read_stereo_frame(reader, src_channels, sample_format))
+        self.resampler.fill(buf, || {
+            read_stereo_frame(reader, src_channels, sample_format)
+        })
     }
 }
-
 
 /// Minimum amount of device-rate audio (in ms) buffered in the ring before
 /// the first `fill()` call starts producing output. Absorbs startup jitter
@@ -893,7 +891,11 @@ mod tests {
         src.fill(&mut buf);
         let consumed_fast = before - ring.lock().unwrap().len();
 
-        assert_eq!(src.rate_changes(), 1, "the change was observed exactly once");
+        assert_eq!(
+            src.rate_changes(),
+            1,
+            "the change was observed exactly once"
+        );
         assert!(
             consumed_fast > consumed_slow * 3 / 2,
             "the resample ratio did not follow the rate:              {consumed_fast} consumed at 88200 vs {consumed_slow} at 44100"
@@ -913,7 +915,11 @@ mod tests {
         for _ in 0..10 {
             src.fill(&mut buf);
         }
-        assert_eq!(src.rate_changes(), 0, "no change was made, none should be seen");
+        assert_eq!(
+            src.rate_changes(),
+            0,
+            "no change was made, none should be seen"
+        );
     }
 
     #[test]
@@ -1047,7 +1053,11 @@ mod tests {
         src.prebuffer_done = true;
 
         let mut buf = [1i16; 352 * 2];
-        assert_eq!(src.fill(&mut buf), 0, "stop flag set before fill must end the stream");
+        assert_eq!(
+            src.fill(&mut buf),
+            0,
+            "stop flag set before fill must end the stream"
+        );
     }
 
     #[test]
@@ -1067,7 +1077,8 @@ mod tests {
         src.apply_drift_control();
 
         let after = ring.lock().unwrap().len();
-        let target_samples = (device_rate as u64 * 2 * u64::from(DRIFT_DRAIN_TARGET_MS) / 1000) as usize;
+        let target_samples =
+            (device_rate as u64 * 2 * u64::from(DRIFT_DRAIN_TARGET_MS) / 1000) as usize;
         assert_eq!(
             after, target_samples,
             "drift guard should drain ring down to the target watermark"
@@ -1147,7 +1158,10 @@ mod tests {
 
         // Ordinary jitter must not move the ratio, or it would re-ramp
         // constantly for no reason.
-        assert_eq!(src.resampler_trim_for(RING_TARGET_MS + RING_DEADBAND_MS), 1.0);
+        assert_eq!(
+            src.resampler_trim_for(RING_TARGET_MS + RING_DEADBAND_MS),
+            1.0
+        );
         assert_eq!(
             src.resampler_trim_for(RING_TARGET_MS.saturating_sub(RING_DEADBAND_MS)),
             1.0
@@ -1162,5 +1176,4 @@ mod tests {
         let extreme_low = src.resampler_trim_for(0);
         assert!(extreme_low <= 1.0 + MAX_DRIFT_TRIM + 1e-6);
     }
-
 }

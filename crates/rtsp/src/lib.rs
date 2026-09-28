@@ -1,7 +1,7 @@
-pub mod identity;
-pub mod message;
 pub mod connection;
 pub mod dmap;
+pub mod identity;
+pub mod message;
 pub mod session;
 pub mod stream;
 

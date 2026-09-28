@@ -70,8 +70,7 @@ pub fn render(frame: &mut Frame, state: &PairingState) {
             .add_modifier(Modifier::BOLD)
     };
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(cells, pin_style)))
-            .alignment(Alignment::Center),
+        Paragraph::new(Line::from(Span::styled(cells, pin_style))).alignment(Alignment::Center),
         pin_area,
     );
 

@@ -221,9 +221,8 @@ impl PairWorker {
 
         std::thread::spawn(move || {
             let mut provider = || pin_rx.recv().unwrap_or_default();
-            let result =
-                openair_client::pair_device(addr, &device_id, Some(&name), &mut provider)
-                    .map_err(|e| e.to_string());
+            let result = openair_client::pair_device(addr, &device_id, Some(&name), &mut provider)
+                .map_err(|e| e.to_string());
             let _ = result_tx.send(result);
         });
 

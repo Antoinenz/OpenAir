@@ -97,9 +97,7 @@ fn control_inner(action: Transport) -> Result<bool, MetadataError> {
     let accepted = match action {
         Transport::Play => session.TryPlayAsync().and_then(|op| op.get()),
         Transport::Pause => session.TryPauseAsync().and_then(|op| op.get()),
-        Transport::TogglePlayPause => {
-            session.TryTogglePlayPauseAsync().and_then(|op| op.get())
-        }
+        Transport::TogglePlayPause => session.TryTogglePlayPauseAsync().and_then(|op| op.get()),
         Transport::Next => session.TrySkipNextAsync().and_then(|op| op.get()),
         Transport::Previous => session.TrySkipPreviousAsync().and_then(|op| op.get()),
         Transport::Stop => session.TryStopAsync().and_then(|op| op.get()),
@@ -134,7 +132,10 @@ fn read_current(
 
     let title = props.Title().map(|s| s.to_string()).unwrap_or_default();
     let artist = props.Artist().map(|s| s.to_string()).unwrap_or_default();
-    let album = props.AlbumTitle().map(|s| s.to_string()).unwrap_or_default();
+    let album = props
+        .AlbumTitle()
+        .map(|s| s.to_string())
+        .unwrap_or_default();
 
     let art = if want_art {
         props.Thumbnail().ok().and_then(|t| read_thumbnail(&t))
@@ -221,11 +222,7 @@ impl Drop for MetadataWatcher {
 }
 
 /// Watcher thread body: COM init, then poll until stopped.
-fn run(
-    stop: Arc<AtomicBool>,
-    ready_tx: Sender<Result<(), MetadataError>>,
-    tx: Sender<NowPlaying>,
-) {
+fn run(stop: Arc<AtomicBool>, ready_tx: Sender<Result<(), MetadataError>>, tx: Sender<NowPlaying>) {
     unsafe {
         if let Err(e) = CoInitializeEx(None, COINIT_MULTITHREADED).ok() {
             let _ = ready_tx.send(Err(MetadataError::ComInit(e.to_string())));
@@ -293,7 +290,11 @@ mod tests {
     #[test]
     fn rejects_unknown_and_truncated_images() {
         assert_eq!(sniff_image_mime(b"not an image"), None);
-        assert_eq!(sniff_image_mime(&[0xFF, 0xD8]), None, "truncated JPEG magic");
+        assert_eq!(
+            sniff_image_mime(&[0xFF, 0xD8]),
+            None,
+            "truncated JPEG magic"
+        );
         assert_eq!(sniff_image_mime(&[]), None);
     }
 

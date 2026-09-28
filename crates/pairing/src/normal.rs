@@ -55,7 +55,11 @@ impl Identity {
         let s = hex.join("");
         let uuid = format!(
             "{}-{}-{}-{}-{}",
-            &s[0..8], &s[8..12], &s[12..16], &s[16..20], &s[20..32]
+            &s[0..8],
+            &s[8..12],
+            &s[12..16],
+            &s[16..20],
+            &s[20..32]
         );
         Identity {
             pairing_id: uuid.into_bytes(),
@@ -113,7 +117,10 @@ impl NormalPairing {
             .and_then(|v| v.first().copied())
             .ok_or(PairingError::MissingField("State"))?;
         if state != 0x02 {
-            return Err(PairingError::UnexpectedState { got: state, want: 0x02 });
+            return Err(PairingError::UnexpectedState {
+                got: state,
+                want: 0x02,
+            });
         }
         let b_pub = tlv
             .get(&(Tag::PublicKey as u8))
@@ -153,7 +160,10 @@ impl NormalPairing {
             .and_then(|v| v.first().copied())
             .ok_or(PairingError::MissingField("State"))?;
         if state != 0x04 {
-            return Err(PairingError::UnexpectedState { got: state, want: 0x04 });
+            return Err(PairingError::UnexpectedState {
+                got: state,
+                want: 0x04,
+            });
         }
         let m2_proof = tlv
             .get(&(Tag::Proof as u8))
@@ -209,7 +219,10 @@ impl NormalPairing {
             .and_then(|v| v.first().copied())
             .ok_or(PairingError::MissingField("State"))?;
         if state != 0x06 {
-            return Err(PairingError::UnexpectedState { got: state, want: 0x06 });
+            return Err(PairingError::UnexpectedState {
+                got: state,
+                want: 0x06,
+            });
         }
         let sealed = tlv
             .get(&(Tag::EncryptedData as u8))
@@ -302,7 +315,10 @@ impl PairVerify {
             .and_then(|v| v.first().copied())
             .ok_or(PairingError::MissingField("State"))?;
         if state != 0x02 {
-            return Err(PairingError::UnexpectedState { got: state, want: 0x02 });
+            return Err(PairingError::UnexpectedState {
+                got: state,
+                want: 0x02,
+            });
         }
         let their_pub_vec = tlv
             .get(&(Tag::PublicKey as u8))
@@ -394,11 +410,14 @@ impl PairVerify {
             .and_then(|v| v.first().copied())
             .ok_or(PairingError::MissingField("State"))?;
         if state != 0x04 {
-            return Err(PairingError::UnexpectedState { got: state, want: 0x04 });
+            return Err(PairingError::UnexpectedState {
+                got: state,
+                want: 0x04,
+            });
         }
-        let shared = self
-            .shared
-            .ok_or(PairingError::CryptoFailure("no shared secret (M2 not processed)"))?;
+        let shared = self.shared.ok_or(PairingError::CryptoFailure(
+            "no shared secret (M2 not processed)",
+        ))?;
         Ok(crate::transient::derive_channel_keys(&shared))
     }
 }

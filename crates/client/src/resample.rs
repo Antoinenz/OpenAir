@@ -120,7 +120,10 @@ impl Resampler {
     /// whereas one that refuses to start is not.
     pub(crate) fn new(src_rate: u32) -> Self {
         let mode = if src_rate == SAMPLE_RATE {
-            debug!(rate = src_rate, "source is at the pipeline rate — no resampling");
+            debug!(
+                rate = src_rate,
+                "source is at the pipeline rate — no resampling"
+            );
             Mode::Passthrough
         } else {
             match build_sinc(src_rate) {
@@ -293,10 +296,7 @@ impl Resampler {
 
     /// Pull one chunk's worth of input and process it. Returns whether any
     /// output was produced.
-    fn produce_chunk(
-        &mut self,
-        next_source_frame: &mut impl FnMut() -> Option<[i16; 2]>,
-    ) -> bool {
+    fn produce_chunk(&mut self, next_source_frame: &mut impl FnMut() -> Option<[i16; 2]>) -> bool {
         let Mode::Sinc(state) = &mut self.mode else {
             return false;
         };
@@ -381,9 +381,10 @@ impl Resampler {
             }
         };
 
-        let result = state
-            .inner
-            .process_into_buffer(&adapter_in, &mut adapter_out, Some(&indexing));
+        let result =
+            state
+                .inner
+                .process_into_buffer(&adapter_in, &mut adapter_out, Some(&indexing));
         state.input_frames = 0;
 
         let (_, produced) = match result {
@@ -732,5 +733,4 @@ mod tests {
             "a trimmed 15 kHz tone should keep its level, got {level:.1} dBFS"
         );
     }
-
 }

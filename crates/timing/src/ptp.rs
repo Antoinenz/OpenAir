@@ -50,7 +50,10 @@ fn clock_id_from_file(path: &std::path::Path) -> u64 {
         .unwrap_or(Ok(()))
         .and_then(|()| std::fs::write(path, format!("{id:016x}")));
     match write {
-        Ok(()) => info!(clock_id = format!("{id:016x}"), "generated PTP clock identity"),
+        Ok(()) => info!(
+            clock_id = format!("{id:016x}"),
+            "generated PTP clock identity"
+        ),
         Err(e) => warn!("could not persist PTP clock identity (will differ next run): {e}"),
     }
     id
@@ -74,7 +77,9 @@ fn stable_clock_id() -> u64 {
 /// Our PTP clock time: nanoseconds since the Unix epoch.
 /// (The epoch is arbitrary as long as anchor times use the same timeline.)
 pub fn ptp_now_ns() -> u64 {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     now.as_secs() * 1_000_000_000 + u64::from(now.subsec_nanos())
 }
 
@@ -111,7 +116,14 @@ const MSG_FOLLOW_UP: u8 = 0x8;
 const MSG_DELAY_RESP: u8 = 0x9;
 const MSG_ANNOUNCE: u8 = 0xB;
 
-fn header(msg_type: u8, length: u16, flags: u16, clock_id: &[u8; 8], seq: u16, control: u8) -> [u8; 34] {
+fn header(
+    msg_type: u8,
+    length: u16,
+    flags: u16,
+    clock_id: &[u8; 8],
+    seq: u16,
+    control: u8,
+) -> [u8; 34] {
     let mut h = [0u8; 34];
     h[0] = msg_type; // transportSpecific = 0
     h[1] = 0x02; // PTPv2
@@ -136,7 +148,7 @@ fn build_announce(clock_id: &[u8; 8], seq: u16) -> [u8; 64] {
     m[48..52].copy_from_slice(&0xF8FE_FFFFu32.to_be_bytes()); // clockQuality
     m[52] = 248; // grandmasterPriority2
     m[53..61].copy_from_slice(clock_id); // grandmasterIdentity
-    // stepsRemoved 0
+                                         // stepsRemoved 0
     m[63] = 0xA0; // timeSource: internal oscillator
     m
 }
@@ -289,8 +301,7 @@ impl PtpMaster {
         let event = UdpSocket::bind(SocketAddr::new(bind_ip, 319))?;
         let general = UdpSocket::bind(SocketAddr::new(bind_ip, 320))?;
         info!(%bind_ip, "PTP sockets bound");
-        let event_dests: Vec<SocketAddr> =
-            peers.iter().map(|p| SocketAddr::new(*p, 319)).collect();
+        let event_dests: Vec<SocketAddr> = peers.iter().map(|p| SocketAddr::new(*p, 319)).collect();
         let general_dests: Vec<SocketAddr> =
             peers.iter().map(|p| SocketAddr::new(*p, 320)).collect();
 
@@ -314,8 +325,9 @@ impl PtpMaster {
         // sequence numbers — matched against the origin timestamps that
         // arrive in their Follow_Up messages (two-step clocks).
         #[allow(clippy::type_complexity)]
-        let sync_rx_times: Arc<std::sync::Mutex<std::collections::HashMap<(u64, u16), u64>>> =
-            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let sync_rx_times: Arc<
+            std::sync::Mutex<std::collections::HashMap<(u64, u16), u64>>,
+        > = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
         // --- Receive path (Apple receivers need this; nqptp doesn't) ---
         // Event socket (319): the foreign master's Sync messages land here
@@ -542,7 +554,12 @@ impl PtpMaster {
         });
 
         rx_threads.push(thread);
-        Ok(PtpMaster { clock_id, foreign, stop, threads: rx_threads })
+        Ok(PtpMaster {
+            clock_id,
+            foreign,
+            stop,
+            threads: rx_threads,
+        })
     }
 
     /// The timeline anchors for `peer` must be expressed on right now.
@@ -562,9 +579,15 @@ impl PtpMaster {
             })
             .min_by_key(|f| f.bmca_key());
         if let Some(f) = best {
-            return Timeline { gm_id: f.gm_id, offset_ns: f.offset_ns };
+            return Timeline {
+                gm_id: f.gm_id,
+                offset_ns: f.offset_ns,
+            };
         }
-        Timeline { gm_id: self.clock_id, offset_ns: 0 }
+        Timeline {
+            gm_id: self.clock_id,
+            offset_ns: 0,
+        }
     }
 }
 
@@ -704,9 +727,15 @@ mod tests {
         assert_eq!(&resp[8..16], &req[8..16]); // correction mirrored
         assert_eq!(&resp[20..28], &our_id); // our identity as sender
         assert_eq!(&resp[44..54], &req[20..30]); // requestingPortIdentity
-        // receiveTimestamp = 5s + 3ns
-        assert_eq!(u32::from_be_bytes([resp[36], resp[37], resp[38], resp[39]]), 5);
-        assert_eq!(u32::from_be_bytes([resp[40], resp[41], resp[42], resp[43]]), 3);
+                                                 // receiveTimestamp = 5s + 3ns
+        assert_eq!(
+            u32::from_be_bytes([resp[36], resp[37], resp[38], resp[39]]),
+            5
+        );
+        assert_eq!(
+            u32::from_be_bytes([resp[40], resp[41], resp[42], resp[43]]),
+            3
+        );
         // Truncated request → None
         assert!(build_delay_resp(&our_id, &req[..30], 0).is_none());
     }
@@ -719,6 +748,9 @@ mod tests {
         assert_eq!(u16::from_be_bytes([s[6], s[7]]), 0x0200);
         let f = build_follow_up(&id, 1, 1_500_000_000);
         assert_eq!(f[0] & 0x0F, 0x08);
-        assert_eq!(u32::from_be_bytes([f[40], f[41], f[42], f[43]]), 500_000_000);
+        assert_eq!(
+            u32::from_be_bytes([f[40], f[41], f[42], f[43]]),
+            500_000_000
+        );
     }
 }

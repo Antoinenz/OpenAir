@@ -496,12 +496,7 @@ mod tests {
         s.on_key(KeyCode::Enter);
         s.pairing_error("pairings.json is read-only");
         assert_eq!(s.pairing_count(), 2);
-        assert!(s
-            .list()
-            .unwrap()
-            .status()
-            .unwrap()
-            .contains("read-only"));
+        assert!(s.list().unwrap().status().unwrap().contains("read-only"));
     }
 
     #[test]

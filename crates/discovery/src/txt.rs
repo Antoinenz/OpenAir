@@ -89,9 +89,9 @@ mod tests {
         // HomePod signature from the research brief: 0x4A7FCA00,0x3C356BD0
         let f = parse_features("0x4A7FCA00,0x3C356BD0");
         assert_eq!(f.0, 0x3C356BD0_4A7FCA00u64);
-        assert!(f.supports_airplay_audio());   // bit 9
-        assert!(f.supports_buffered_audio());  // bit 40
-        assert!(f.requires_ptp());             // bit 41
+        assert!(f.supports_airplay_audio()); // bit 9
+        assert!(f.supports_buffered_audio()); // bit 40
+        assert!(f.requires_ptp()); // bit 41
     }
 
     #[test]

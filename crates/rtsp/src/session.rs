@@ -54,7 +54,8 @@ pub fn pair(addr: SocketAddr, device_id: &str) -> Result<RtspConnection, Session
     info!("pair-setup M1");
     let m1_body = pairing.build_m1();
     let m2_raw = conn.request(
-        "POST", "/pair-setup",
+        "POST",
+        "/pair-setup",
         &[("X-Apple-HKP", "4")],
         &m1_body,
         Some("application/octet-stream"),
@@ -66,7 +67,8 @@ pub fn pair(addr: SocketAddr, device_id: &str) -> Result<RtspConnection, Session
     info!("pair-setup M3 (sending proof)");
     let (m3_body, m1_proof, session_key) = pairing.process_m2_build_m3(m2_body)?;
     let m4_raw = conn.request(
-        "POST", "/pair-setup",
+        "POST",
+        "/pair-setup",
         &[("X-Apple-HKP", "4")],
         &m3_body,
         Some("application/octet-stream"),
@@ -109,7 +111,8 @@ pub fn pair_setup_normal(
 
     info!("pair-setup M1 (Normal)");
     let m2_raw = conn.request(
-        "POST", "/pair-setup",
+        "POST",
+        "/pair-setup",
         &hkp,
         &pairing.build_m1(),
         Some("application/octet-stream"),
@@ -123,7 +126,8 @@ pub fn pair_setup_normal(
     info!("pair-setup M3 (SRP proof with PIN)");
     let (m3_body, m1_proof, srp_key) = pairing.process_m2_build_m3(&m2_body, pin.trim())?;
     let m4_raw = conn.request(
-        "POST", "/pair-setup",
+        "POST",
+        "/pair-setup",
         &hkp,
         &m3_body,
         Some("application/octet-stream"),
@@ -135,7 +139,8 @@ pub fn pair_setup_normal(
     let (m5_body, encrypt_key) =
         pairing.process_m4_build_m5(m4_body, &m1_proof, &srp_key, identity)?;
     let m6_raw = conn.request(
-        "POST", "/pair-setup",
+        "POST",
+        "/pair-setup",
         &hkp,
         &m5_body,
         Some("application/octet-stream"),
@@ -163,7 +168,8 @@ pub fn pair_verify(
 
     info!("pair-verify M1");
     let m2_raw = conn.request(
-        "POST", "/pair-verify",
+        "POST",
+        "/pair-verify",
         &hkp,
         &pv.build_m1(),
         Some("application/octet-stream"),
@@ -175,7 +181,8 @@ pub fn pair_verify(
         .process_m2_build_m3(connection::extract_body(&m2_raw))
         .map_err(rejected_credentials)?;
     let m4_raw = conn.request(
-        "POST", "/pair-verify",
+        "POST",
+        "/pair-verify",
         &hkp,
         &m3_body,
         Some("application/octet-stream"),
@@ -193,10 +200,7 @@ pub fn pair_verify(
 
 /// Pair with a device using Transient pairing and send an encrypted GET /info.
 /// Returns the raw (decrypted) GET /info response on success.
-pub fn pair_and_get_info(
-    addr: SocketAddr,
-    device_id: &str,
-) -> Result<Vec<u8>, SessionError> {
+pub fn pair_and_get_info(addr: SocketAddr, device_id: &str) -> Result<Vec<u8>, SessionError> {
     let mut conn = pair(addr, device_id)?;
     info!("GET /info (encrypted)");
     let info_raw = conn.request("GET", "/info", &[], &[], None)?;

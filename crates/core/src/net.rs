@@ -78,7 +78,11 @@ fn is_unusable(ip: Ipv4Addr) -> bool {
 /// address (see the module docs: subnet matching cannot reliably separate
 /// interfaces with overlapping masks, and the routing table already knows
 /// better). It exists to turn an opaque connection reset into a next step.
-pub fn alternative_sources(candidates: &[LocalIpv4], dest: Ipv4Addr, in_use: Ipv4Addr) -> Vec<Ipv4Addr> {
+pub fn alternative_sources(
+    candidates: &[LocalIpv4],
+    dest: Ipv4Addr,
+    in_use: Ipv4Addr,
+) -> Vec<Ipv4Addr> {
     let mut alts: Vec<&LocalIpv4> = candidates
         .iter()
         .filter(|c| !is_unusable(c.ip))

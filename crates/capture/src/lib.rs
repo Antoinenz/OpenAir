@@ -124,13 +124,21 @@ impl SystemCapture {
         let capacity = device_rate as usize * 2 * RING_CAPACITY_SECONDS as usize;
 
         let stream = match sample_format {
-            SampleFormat::F32 => build_stream::<f32>(&device, &config, channels, ring.clone(), capacity)?,
-            SampleFormat::I16 => build_stream::<i16>(&device, &config, channels, ring.clone(), capacity)?,
-            SampleFormat::U16 => build_stream::<u16>(&device, &config, channels, ring.clone(), capacity)?,
+            SampleFormat::F32 => {
+                build_stream::<f32>(&device, &config, channels, ring.clone(), capacity)?
+            }
+            SampleFormat::I16 => {
+                build_stream::<i16>(&device, &config, channels, ring.clone(), capacity)?
+            }
+            SampleFormat::U16 => {
+                build_stream::<u16>(&device, &config, channels, ring.clone(), capacity)?
+            }
             other => return Err(CaptureError::UnsupportedFormat(other)),
         };
 
-        stream.play().map_err(|e| CaptureError::Play(e.to_string()))?;
+        stream
+            .play()
+            .map_err(|e| CaptureError::Play(e.to_string()))?;
 
         Ok(SystemCapture {
             ring,
@@ -229,8 +237,10 @@ mod ring_tests {
         // handed in is the ring the SystemCapture reports back — the property
         // a live device swap depends on.
         let ring: Arc<Mutex<VecDeque<i16>>> = Arc::new(Mutex::new(VecDeque::new()));
-        match SystemCapture::start_on_ring(Some("no such device exists anywhere"), Arc::clone(&ring))
-        {
+        match SystemCapture::start_on_ring(
+            Some("no such device exists anywhere"),
+            Arc::clone(&ring),
+        ) {
             Ok(cap) => assert!(
                 Arc::ptr_eq(&cap.ring, &ring),
                 "capture must write into the ring it was given, not a fresh one"

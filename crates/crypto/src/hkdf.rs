@@ -9,7 +9,8 @@ use sha2::Sha512;
 pub fn derive(ikm: &[u8], salt: &[u8], info: &[u8]) -> [u8; 32] {
     let hk = Hkdf::<Sha512>::new(Some(salt), ikm);
     let mut out = [0u8; 32];
-    hk.expand(info, &mut out).expect("HKDF output length is valid");
+    hk.expand(info, &mut out)
+        .expect("HKDF output length is valid");
     out
 }
 

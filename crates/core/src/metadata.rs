@@ -22,11 +22,7 @@ impl NowPlaying {
     /// Art is deliberately excluded: it is fetched only *because* this triple
     /// changed, so including it would be circular.
     pub fn key(&self) -> (String, String, String) {
-        (
-            self.title.clone(),
-            self.artist.clone(),
-            self.album.clone(),
-        )
+        (self.title.clone(), self.artist.clone(), self.album.clone())
     }
 
     /// True when there is nothing worth sending to a receiver.

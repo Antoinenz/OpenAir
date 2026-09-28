@@ -30,8 +30,8 @@ impl DeviceSet {
             // Upgrade an existing IPv6 entry when IPv4 shows up. Never the
             // reverse: link-local IPv6 is what we fall back to, not prefer.
             Some(existing) => {
-                let upgrade = matches!(existing.addr, IpAddr::V6(_))
-                    && matches!(device.addr, IpAddr::V4(_));
+                let upgrade =
+                    matches!(existing.addr, IpAddr::V6(_)) && matches!(device.addr, IpAddr::V4(_));
                 if upgrade {
                     self.by_key.insert(key, device);
                 }

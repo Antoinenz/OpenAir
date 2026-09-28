@@ -80,7 +80,13 @@ impl ChaChaChannel {
         let nonce = self.nonce();
         let ct = self
             .cipher
-            .encrypt(&nonce, Payload { msg: plaintext, aad: &len_bytes })
+            .encrypt(
+                &nonce,
+                Payload {
+                    msg: plaintext,
+                    aad: &len_bytes,
+                },
+            )
             .map_err(|_| ChaChaError::Encrypt)?;
         self.counter += 1;
 
@@ -105,7 +111,13 @@ impl ChaChaChannel {
         let nonce = self.nonce();
         let pt = self
             .cipher
-            .decrypt(&nonce, Payload { msg: ct_and_tag, aad: &frame[..2] })
+            .decrypt(
+                &nonce,
+                Payload {
+                    msg: ct_and_tag,
+                    aad: &frame[..2],
+                },
+            )
             .map_err(|_| ChaChaError::Decrypt)?;
         self.counter += 1;
         Ok(pt)

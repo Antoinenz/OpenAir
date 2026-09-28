@@ -130,12 +130,21 @@ impl StreamSession {
         dict.insert("sourceVersion".into(), "690.7.1".into());
         dict.insert("statsCollectionEnabled".into(), false.into());
 
-        info!(?timing, sender_id, model = profile.model, os = profile.os_name, "SETUP phase 1 (timing)");
+        info!(
+            ?timing,
+            sender_id,
+            model = profile.model,
+            os = profile.os_name,
+            "SETUP phase 1 (timing)"
+        );
         let resp = self.request_plist("SETUP", None, plist::Value::Dictionary(dict))?;
         self.ports.event_port = get_port(&resp, "eventPort")?;
         self.ports.timing_port = get_port(&resp, "timingPort").unwrap_or(0);
-        info!(event_port = self.ports.event_port, timing_port = self.ports.timing_port,
-              "SETUP 1 ok");
+        info!(
+            event_port = self.ports.event_port,
+            timing_port = self.ports.timing_port,
+            "SETUP 1 ok"
+        );
         Ok(())
     }
 
@@ -271,7 +280,9 @@ impl StreamSession {
             .ok_or(SessionError::MissingPlistField("streams[0]"))?;
         self.ports.data_port = dict_port(streams, "dataPort")?;
         self.ports.control_port = dict_port(streams, "controlPort")?;
-        self.ports.audio_buffer_size = streams.get("audioBufferSize").and_then(|v| v.as_unsigned_integer());
+        self.ports.audio_buffer_size = streams
+            .get("audioBufferSize")
+            .and_then(|v| v.as_unsigned_integer());
         info!(data_port = self.ports.data_port, control_port = self.ports.control_port,
               audio_buffer_size = ?self.ports.audio_buffer_size, "SETUP 2 ok");
         Ok(())
@@ -413,8 +424,11 @@ impl StreamSession {
     pub fn teardown(&mut self) -> Result<(), SessionError> {
         info!("TEARDOWN");
         let mut buf = Vec::new();
-        plist::to_writer_binary(&mut buf, &plist::Value::Dictionary(plist::Dictionary::new()))
-            .map_err(|_| SessionError::PlistEncode)?;
+        plist::to_writer_binary(
+            &mut buf,
+            &plist::Value::Dictionary(plist::Dictionary::new()),
+        )
+        .map_err(|_| SessionError::PlistEncode)?;
         let raw = self.conn.request(
             "TEARDOWN",
             &self.uri.clone(),

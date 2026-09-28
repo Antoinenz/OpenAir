@@ -189,7 +189,7 @@ fn compute_m1(
     let xor: Vec<u8> = h_n.iter().zip(h_g.iter()).map(|(a, b)| a ^ b).collect();
     let h_i = sha512(username);
     // update_hash_n → BN_bn2bin = to_bytes_be() (unpadded)
-    let s_bytes = salt;               // salt is passed as raw bytes, not a bnum
+    let s_bytes = salt; // salt is passed as raw bytes, not a bnum
     let a_bytes = a_pub.to_bytes_be();
     let b_bytes = b_pub.to_bytes_be();
     sha512(&[xor.as_slice(), &h_i, s_bytes, &a_bytes, &b_bytes, k].concat())
@@ -289,8 +289,7 @@ mod n_integrity {
         let digest = Sha256::digest(&bytes);
         let hex: String = digest.iter().map(|b| format!("{:02x}", b)).collect();
         assert_eq!(
-            hex,
-            "48cf8b092fbce4359d9871abf74f98e25b6163379eaa15cd9087e800c6d1c55c",
+            hex, "48cf8b092fbce4359d9871abf74f98e25b6163379eaa15cd9087e800c6d1c55c",
             "N does not match the canonical RFC 3526 3072-bit prime"
         );
     }

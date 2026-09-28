@@ -411,12 +411,13 @@ mod tests {
         // skipped the PIN prompt -- and with no credentials the connection
         // falls back to Transient, an Apple TV answers 470, and the user is
         // told "connection failed" moments after being told it was forgotten.
-        let mut p = PickerState::new(
-            Settings::default(),
-            vec!["AA:BB".to_string()],
-            true,
-        );
-        p.insert(device("Living Room", "192.168.1.64", "AA:BB", NEEDS_PAIRING));
+        let mut p = PickerState::new(Settings::default(), vec!["AA:BB".to_string()], true);
+        p.insert(device(
+            "Living Room",
+            "192.168.1.64",
+            "AA:BB",
+            NEEDS_PAIRING,
+        ));
         assert!(p.rows()[0].paired, "starts paired");
         assert!(!p.rows()[0].needs_pairing, "so no PIN is wanted");
 
@@ -430,12 +431,13 @@ mod tests {
 
     #[test]
     fn forgetting_a_pairing_we_never_had_changes_nothing() {
-        let mut p = PickerState::new(
-            Settings::default(),
-            vec!["AA:BB".to_string()],
-            true,
-        );
-        p.insert(device("Living Room", "192.168.1.64", "AA:BB", NEEDS_PAIRING));
+        let mut p = PickerState::new(Settings::default(), vec!["AA:BB".to_string()], true);
+        p.insert(device(
+            "Living Room",
+            "192.168.1.64",
+            "AA:BB",
+            NEEDS_PAIRING,
+        ));
         p.forget_pairing("ZZ:ZZ");
         assert!(p.rows()[0].paired, "the one we do hold is untouched");
     }
@@ -445,11 +447,7 @@ mod tests {
         // Shairport negotiates keys per session, so a stored credential was
         // never what made it usable. Forgetting one must not start demanding a
         // PIN it will never show.
-        let mut p = PickerState::new(
-            Settings::default(),
-            vec!["CC:DD".to_string()],
-            true,
-        );
+        let mut p = PickerState::new(Settings::default(), vec!["CC:DD".to_string()], true);
         p.insert(device("Pool Room", "192.168.1.51", "CC:DD", TRANSIENT));
         p.forget_pairing("CC:DD");
         assert!(!p.rows()[0].needs_pairing);

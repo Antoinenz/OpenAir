@@ -105,7 +105,7 @@ const CLSID_POLICY_CONFIG_CLIENT: windows::core::GUID =
 // must match the vtable, not Rust style) doesn't leak into our own code.
 #[allow(non_snake_case)]
 mod policy_config {
-    use super::{BOOL, ERole, HRESULT, IUnknown, IUnknown_Vtbl, PCWSTR};
+    use super::{ERole, IUnknown, IUnknown_Vtbl, BOOL, HRESULT, PCWSTR};
 
     #[windows::core::interface("f8679f50-850a-41cf-9c72-430f290290c8")]
     pub(super) unsafe trait IPolicyConfig: IUnknown {
@@ -247,9 +247,10 @@ impl Drop for ComGuard {
 /// `None` if it isn't a virtual cable. Lower = better candidate.
 fn cable_rank(name: &str) -> Option<usize> {
     let lower = name.to_lowercase();
-    VIRTUAL_CABLE_PATTERNS.iter().position(|p| lower.contains(p))
+    VIRTUAL_CABLE_PATTERNS
+        .iter()
+        .position(|p| lower.contains(p))
 }
-
 
 /// Pick the device to route through: the first name containing `override_name`
 /// (case-insensitive) if given, otherwise the first virtual cable found.
@@ -564,11 +565,16 @@ fn run(
         std::thread::sleep(POLL_INTERVAL);
 
         let scalar = unsafe { vol.GetMasterVolumeLevelScalar() }.unwrap_or(last_scalar);
-        let muted = unsafe { vol.GetMute() }.map(|b| b.as_bool()).unwrap_or(false);
+        let muted = unsafe { vol.GetMute() }
+            .map(|b| b.as_bool())
+            .unwrap_or(false);
 
         let scalar_changed = !last_scalar.is_finite() || (scalar - last_scalar).abs() > SCALAR_EPS;
         if scalar_changed || Some(muted) != last_muted {
-            if event_tx.send(VolumeEvent::Level(level_for(scalar, muted))).is_err() {
+            if event_tx
+                .send(VolumeEvent::Level(level_for(scalar, muted)))
+                .is_err()
+            {
                 break; // receiver dropped — stream ended
             }
             last_scalar = scalar;
@@ -636,7 +642,10 @@ mod tests {
             dev("{0}.{a}", "CABLE In 16 Ch (VB-Audio Virtual Cable)"),
             dev("{0}.{b}", "Outputs (Omnibus)"),
             dev("{0}.{c}", "CABLE Input (VB-Audio Virtual Cable)"),
-            dev("{0}.{d}", "Surface Omnisonic Speakers (Surface High Definition Audio)"),
+            dev(
+                "{0}.{d}",
+                "Surface Omnisonic Speakers (Surface High Definition Audio)",
+            ),
         ];
         let picked = select_device(&devices, None).expect("should find cable");
         assert_eq!(

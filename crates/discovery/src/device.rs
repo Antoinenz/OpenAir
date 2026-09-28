@@ -18,7 +18,12 @@ pub struct AirPlayDevice {
 
 impl AirPlayDevice {
     pub fn new(name: String, addr: IpAddr, port: u16, txt: AirPlayTxt) -> Self {
-        Self { name, addr, port, txt }
+        Self {
+            name,
+            addr,
+            port,
+            txt,
+        }
     }
 
     pub fn features(&self) -> Features {
@@ -27,7 +32,8 @@ impl AirPlayDevice {
 
     /// Whether this device is HomePod-class (requires PTP, prefers AAC).
     pub fn is_homepod_class(&self) -> bool {
-        self.txt.model
+        self.txt
+            .model
             .as_deref()
             .map(|m| m.starts_with("AudioAccessory"))
             .unwrap_or(false)
@@ -114,7 +120,10 @@ mod tests {
 
     #[test]
     fn strips_the_airplay_service_suffix() {
-        assert_eq!(named("Living Room._airplay._tcp.local.").display_name(), "Living Room");
+        assert_eq!(
+            named("Living Room._airplay._tcp.local.").display_name(),
+            "Living Room"
+        );
     }
 
     #[test]
@@ -138,6 +147,9 @@ mod tests {
             named("AABBCCDDEEFF@Bar@Home._raop._tcp.local.").display_name(),
             "Bar@Home"
         );
-        assert_eq!(named("Bar@Home._airplay._tcp.local.").display_name(), "Bar@Home");
+        assert_eq!(
+            named("Bar@Home._airplay._tcp.local.").display_name(),
+            "Bar@Home"
+        );
     }
 }

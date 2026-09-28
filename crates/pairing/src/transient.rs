@@ -116,9 +116,9 @@ impl TransientPairing {
     /// A is NOT sent in M1 — it goes in M3 alongside the proof.
     pub fn build_m1(&self) -> Vec<u8> {
         tlv8::encode(&[
-            (Tag::Method, &[0x00]),                  // Pair Setup, no MFi
-            (Tag::State,  &[0x01]),                  // M1
-            (Tag::Flags,  &[tlv8::FLAG_TRANSIENT]),  // 0x10 = Transient
+            (Tag::Method, &[0x00]),                // Pair Setup, no MFi
+            (Tag::State, &[0x01]),                 // M1
+            (Tag::Flags, &[tlv8::FLAG_TRANSIENT]), // 0x10 = Transient
         ])
     }
 
@@ -137,7 +137,10 @@ impl TransientPairing {
             .and_then(|v| v.first().copied())
             .ok_or(PairingError::MissingField("State"))?;
         if state != 0x02 {
-            return Err(PairingError::UnexpectedState { got: state, want: 0x02 });
+            return Err(PairingError::UnexpectedState {
+                got: state,
+                want: 0x02,
+            });
         }
 
         let b_pub = tlv
@@ -147,16 +150,16 @@ impl TransientPairing {
             .get(&(Tag::Salt as u8))
             .ok_or(PairingError::MissingField("Salt"))?;
 
-        let (m1_proof, session_key) = self.client.process_challenge(
-            b"Pair-Setup", b"3939", salt, b_pub,
-        )?;
+        let (m1_proof, session_key) =
+            self.client
+                .process_challenge(b"Pair-Setup", b"3939", salt, b_pub)?;
 
         // A is sent here in M3 (not M1), padded to 384 bytes.
         let a_bytes = self.client.a_pub_padded();
         let m3_body = tlv8::encode(&[
-            (Tag::State,     &[0x03]),
+            (Tag::State, &[0x03]),
             (Tag::PublicKey, &a_bytes),
-            (Tag::Proof,     &m1_proof),
+            (Tag::Proof, &m1_proof),
         ]);
 
         Ok((m3_body, m1_proof, session_key))
@@ -180,7 +183,10 @@ impl TransientPairing {
             .and_then(|v| v.first().copied())
             .ok_or(PairingError::MissingField("State"))?;
         if state != 0x04 {
-            return Err(PairingError::UnexpectedState { got: state, want: 0x04 });
+            return Err(PairingError::UnexpectedState {
+                got: state,
+                want: 0x04,
+            });
         }
 
         let m2_proof = tlv
@@ -198,7 +204,9 @@ impl TransientPairing {
 }
 
 impl Default for TransientPairing {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]

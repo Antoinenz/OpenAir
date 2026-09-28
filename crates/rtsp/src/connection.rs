@@ -32,10 +32,9 @@ impl RtspConnection {
         // Bind to the interface that actually reaches the receiver — the OS
         // may otherwise source this from a virtual adapter, and the address we
         // end up with is also what SETPEERS advertises for PTP.
-        let dest = addr
-            .to_socket_addrs()?
-            .next()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no address to connect to"))?;
+        let dest = addr.to_socket_addrs()?.next().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "no address to connect to")
+        })?;
         let stream = openair_core::net::connect_from_best_source(dest)?;
         let peer = stream.peer_addr()?;
         stream.set_read_timeout(Some(READ_TIMEOUT))?;
@@ -66,10 +65,7 @@ impl RtspConnection {
 
     /// Enable encrypted mode after successful pairing.
     pub fn enable_encryption(&mut self, write_key: &[u8; 32], read_key: &[u8; 32]) {
-        self.encrypt = Some((
-            ChaChaChannel::new(write_key),
-            ChaChaChannel::new(read_key),
-        ));
+        self.encrypt = Some((ChaChaChannel::new(write_key), ChaChaChannel::new(read_key)));
     }
 
     /// Remember the reverse event channel's keys so the caller can decrypt what
@@ -117,7 +113,11 @@ impl RtspConnection {
         }
         req.push_str("\r\n");
 
-        let req_bytes: Vec<u8> = req.into_bytes().into_iter().chain(body.iter().copied()).collect();
+        let req_bytes: Vec<u8> = req
+            .into_bytes()
+            .into_iter()
+            .chain(body.iter().copied())
+            .collect();
 
         self.write_bytes(&req_bytes)?;
         self.read_response()
@@ -125,7 +125,8 @@ impl RtspConnection {
 
     fn write_bytes(&mut self, data: &[u8]) -> io::Result<()> {
         if let Some((write_ch, _)) = &mut self.encrypt {
-            let framed = write_ch.encrypt(data)
+            let framed = write_ch
+                .encrypt(data)
                 .map_err(|e| io::Error::other(e.to_string()))?;
             self.stream.write_all(&framed)
         } else {
@@ -186,15 +187,20 @@ impl RtspConnection {
             // the connection open (Shairport Sync / AirTunes/366.0 style).
             // Set a short drain timeout — body arrives immediately after headers;
             // we stop as soon as the server goes quiet.
-            self.stream.set_read_timeout(Some(Duration::from_millis(500)))?;
+            self.stream
+                .set_read_timeout(Some(Duration::from_millis(500)))?;
             let mut body = Vec::new();
             let mut chunk = vec![0u8; 4096];
             loop {
                 match reader.read(&mut chunk) {
                     Ok(0) => break,
                     Ok(n) => body.extend_from_slice(&chunk[..n]),
-                    Err(e) if e.kind() == io::ErrorKind::TimedOut
-                           || e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e)
+                        if e.kind() == io::ErrorKind::TimedOut
+                            || e.kind() == io::ErrorKind::WouldBlock =>
+                    {
+                        break
+                    }
                     Err(e) => return Err(e),
                 }
             }
@@ -256,7 +262,8 @@ impl RtspConnection {
         self.stream.read_exact(&mut frame[2..])?;
 
         if let Some((_, read_ch)) = &mut self.encrypt {
-            read_ch.decrypt(&frame)
+            read_ch
+                .decrypt(&frame)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
         } else {
             unreachable!()
@@ -313,9 +320,14 @@ fn new_session_id() -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .subsec_nanos();
-    format!("{:08X}-{:04X}-{:04X}-{:04X}-{:012X}",
-        t, t >> 16, 0x4000 | (t >> 12 & 0x0FFF),
-        0x8000 | (t >> 10 & 0x3FFF), t as u64 * 0x1234567)
+    format!(
+        "{:08X}-{:04X}-{:04X}-{:04X}-{:012X}",
+        t,
+        t >> 16,
+        0x4000 | (t >> 12 & 0x0FFF),
+        0x8000 | (t >> 10 & 0x3FFF),
+        t as u64 * 0x1234567
+    )
 }
 
 #[cfg(test)]
@@ -357,9 +369,11 @@ mod tests {
     #[test]
     fn a_response_spanning_several_frames_is_reassembled() {
         let body = vec![b'x'; MAX_FRAME_PLAINTEXT * 3 + 17];
-        let mut response =
-            format!("RTSP/1.0 200 OK\r\nCSeq: 1\r\nContent-Length: {}\r\n\r\n", body.len())
-                .into_bytes();
+        let mut response = format!(
+            "RTSP/1.0 200 OK\r\nCSeq: 1\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
         response.extend_from_slice(&body);
         assert!(
             response.len() > MAX_FRAME_PLAINTEXT,

@@ -10,7 +10,9 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use openair_audio_codec::{alac_encode_verbatim, AacEncoder, AAC_FRAMES_PER_PACKET, FRAMES_PER_PACKET};
+use openair_audio_codec::{
+    alac_encode_verbatim, AacEncoder, AAC_FRAMES_PER_PACKET, FRAMES_PER_PACKET,
+};
 use openair_audio_rtp::{
     build_audio_packet, build_buffered_audio_block, AudioCipher, ControlChannel, SyncState,
     AAC_44100_F24_2_SSRC,
@@ -122,10 +124,7 @@ use openair_rtsp::message::{header_block_end, header_value, message_len as rtsp_
 /// not `updateInfo`.
 fn receiver_status_flags(body: &[u8]) -> Option<u64> {
     const NEEDLE: &[u8] = b"flags=0x";
-    let start = body
-        .windows(NEEDLE.len())
-        .position(|w| w == NEEDLE)?
-        + NEEDLE.len();
+    let start = body.windows(NEEDLE.len()).position(|w| w == NEEDLE)? + NEEDLE.len();
     let hex: String = body[start..]
         .iter()
         .take_while(|b| b.is_ascii_hexdigit())
@@ -237,7 +236,9 @@ fn event_reader(mut rdr: TcpStream, mut wtr: TcpStream, event_keys: Option<([u8;
                     let response = event_response(&request);
                     match tx.encrypt(&response) {
                         Ok(framed) => match std::io::Write::write_all(&mut wtr, &framed) {
-                            Ok(()) => info!(request = %first_line, "event channel: answered 200 OK"),
+                            Ok(()) => {
+                                info!(request = %first_line, "event channel: answered 200 OK")
+                            }
                             Err(e) => {
                                 warn!(request = %first_line, "event reply write failed: {e}");
                                 return;
@@ -277,7 +278,10 @@ pub fn pair_device(
     let identity = store.identity()?;
     let peer = openair_rtsp::pair_setup_normal(addr, device_id, &identity, pin_provider)?;
     store.set_peer(device_id, &peer, name)?;
-    info!(device_id, "pairing stored — future connections will use pair-verify");
+    info!(
+        device_id,
+        "pairing stored — future connections will use pair-verify"
+    );
     Ok(())
 }
 
@@ -424,8 +428,14 @@ pub fn stream_audio(
         let payload = alac_encode_verbatim(&samples);
 
         let rtptime = first_rtptime.wrapping_add(n * FRAMES_PER_PACKET as u32);
-        let packet =
-            build_audio_packet(&mut cipher, n == 0, seq, rtptime, session.session_id, &payload);
+        let packet = build_audio_packet(
+            &mut cipher,
+            n == 0,
+            seq,
+            rtptime,
+            session.session_id,
+            &payload,
+        );
         audio_sock.send(&packet)?;
         backlog.lock().unwrap().insert(seq, packet);
         seq = seq.wrapping_add(1);
@@ -706,8 +716,10 @@ fn prepare_receiver(
     if let Err(e) = session.set_peers() {
         warn!("SETPEERS failed (continuing): {e}");
     }
-    let data_stream =
-        openair_core::net::connect_from_best_source(SocketAddr::new(peer_ip, session.ports.data_port))?;
+    let data_stream = openair_core::net::connect_from_best_source(SocketAddr::new(
+        peer_ip,
+        session.ports.data_port,
+    ))?;
     data_stream.set_nodelay(true).ok();
     openair_core::qos::mark_ef(&data_stream);
     let cipher = AudioCipher::new(&session.shk);
@@ -772,7 +784,10 @@ fn spawn_reconnect(
 fn spawn_writer(
     mut stream: TcpStream,
     name: String,
-) -> (std::sync::mpsc::SyncSender<Vec<u8>>, std::thread::JoinHandle<()>) {
+) -> (
+    std::sync::mpsc::SyncSender<Vec<u8>>,
+    std::thread::JoinHandle<()>,
+) {
     // ~256 blocks ≈ 6 s of audio: enough to absorb TCP hiccups, small enough
     // to bound memory and detect a truly dead peer.
     let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(256);
@@ -847,7 +862,11 @@ fn finish_reconnect(
 /// Remove dropped receivers from `group`; for live streams schedule a
 /// background reconnect for each so a receiver that briefly disappears (TV
 /// asleep, Wi-Fi blip) rejoins automatically.
-fn reap_dead(group: &mut Vec<BufferedReceiver>, handles: &mut Vec<ReconnectHandle>, reconnect: bool) {
+fn reap_dead(
+    group: &mut Vec<BufferedReceiver>,
+    handles: &mut Vec<ReconnectHandle>,
+    reconnect: bool,
+) {
     let mut i = 0;
     while i < group.len() {
         if group[i].alive {
@@ -1026,9 +1045,7 @@ fn drain_latest_volume(rx: &std::sync::mpsc::Receiver<f32>) -> Option<f32> {
 /// Drain all pending now-playing updates, returning only the most recent.
 /// Track changes are rare, but coalescing keeps a burst from queueing several
 /// round-trips on the RTSP control channel.
-fn drain_latest_metadata(
-    rx: &std::sync::mpsc::Receiver<NowPlaying>,
-) -> Option<NowPlaying> {
+fn drain_latest_metadata(rx: &std::sync::mpsc::Receiver<NowPlaying>) -> Option<NowPlaying> {
     let mut latest = None;
     while let Ok(v) = rx.try_recv() {
         latest = Some(v);
@@ -1509,8 +1526,10 @@ pub fn stream_audio_buffered_multi(
     for r in &mut group {
         let res = (|| -> Result<(), Box<dyn std::error::Error>> {
             let peer_ip = r.session.peer_ip();
-            let data_stream =
-                openair_core::net::connect_from_best_source(SocketAddr::new(peer_ip, r.session.ports.data_port))?;
+            let data_stream = openair_core::net::connect_from_best_source(SocketAddr::new(
+                peer_ip,
+                r.session.ports.data_port,
+            ))?;
             data_stream.set_nodelay(true).ok();
             openair_core::qos::mark_ef(&data_stream);
             r.session.record(seq as u16, first_rtptime)?;
@@ -1589,7 +1608,10 @@ pub fn stream_audio_buffered_multi(
     let mut last_bump = Instant::now();
     let mut last_lead_log = Instant::now();
 
-    info!(receivers = group.len(), live, "streaming buffered AAC audio");
+    info!(
+        receivers = group.len(),
+        live, "streaming buffered AAC audio"
+    );
 
     let mut rtptime: u32 = first_rtptime;
     let mut paused = false;
@@ -1604,8 +1626,14 @@ pub fn stream_audio_buffered_multi(
                 match h.rx.try_recv() {
                     Ok(Ok(prep)) => {
                         if let Some(mut br) = finish_reconnect(
-                            &ptp, prep, seq, rtptime, anchor_t_local, anchor_rtptime,
-                            current_volume_db, paused,
+                            &ptp,
+                            prep,
+                            seq,
+                            rtptime,
+                            anchor_t_local,
+                            anchor_rtptime,
+                            current_volume_db,
+                            paused,
                         ) {
                             // Bring the newcomer's screen up to date too.
                             if let Some(np) = &current_metadata {
@@ -1763,8 +1791,7 @@ pub fn stream_audio_buffered_multi(
         // Send-ahead pacing (only while actively playing; a paused loop is
         // throttled by the blocking fill() below).
         if !paused {
-            let elapsed_frames =
-                (pace_origin.elapsed().as_secs_f64() * SAMPLE_RATE as f64) as i64;
+            let elapsed_frames = (pace_origin.elapsed().as_secs_f64() * SAMPLE_RATE as f64) as i64;
             if frames_sent - elapsed_frames >= lead_samples_for(current_latency) {
                 std::thread::sleep(Duration::from_millis(10));
                 continue;
@@ -1973,7 +2000,10 @@ pub fn stream_audio_buffered_multi(
     let elapsed = pace_origin.elapsed();
     if played > elapsed {
         let wait = played - elapsed;
-        info!(wait_ms = wait.as_millis() as u64, "draining playout before teardown");
+        info!(
+            wait_ms = wait.as_millis() as u64,
+            "draining playout before teardown"
+        );
         std::thread::sleep(wait);
     }
 
@@ -2071,12 +2101,24 @@ mod tests {
 
         /// The re-send interval elapses with no new track.
         fn tick(&mut self) -> MetadataPush {
-            plan_metadata(self.enabled, false, self.have_current, true, &mut self.schedule)
+            plan_metadata(
+                self.enabled,
+                false,
+                self.have_current,
+                true,
+                &mut self.schedule,
+            )
         }
 
         /// A tick before the interval is up.
         fn idle(&mut self) -> MetadataPush {
-            plan_metadata(self.enabled, false, self.have_current, false, &mut self.schedule)
+            plan_metadata(
+                self.enabled,
+                false,
+                self.have_current,
+                false,
+                &mut self.schedule,
+            )
         }
     }
 
@@ -2351,7 +2393,6 @@ mod tests {
         assert_eq!(receiver_status_flags(b"flags=0x1").unwrap(), 1);
     }
 
-
     #[test]
     fn an_underrun_at_maximum_latency_still_re_anchors() {
         // The bug from the 3-room dinner-party session: latency set to exactly
@@ -2408,7 +2449,6 @@ mod tests {
         assert!(underrun_response(-400_000_000, AUTO_LATENCY_MAX_MS, true).is_some());
     }
 
-
     #[test]
     fn the_send_ahead_window_follows_the_latency() {
         // A hardcoded 2 s capped headroom at 2000 ms no matter how deep the
@@ -2428,5 +2468,4 @@ mod tests {
         assert!(lead_samples_for(0) > 0);
         assert!(lead_samples_for(100) > 0);
     }
-
 }

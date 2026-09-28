@@ -116,7 +116,10 @@ impl TimingResponder {
                 }
             }
         });
-        TimingHandle { stop: self.stop, thread: Some(handle) }
+        TimingHandle {
+            stop: self.stop,
+            thread: Some(handle),
+        }
     }
 }
 
@@ -178,7 +181,7 @@ mod tests {
         let (len, _) = client.recv_from(&mut buf).unwrap();
         assert_eq!(len, 32);
         assert_eq!(buf[1], 0xD3); // 0x53 | 0x80
-        // reftime must echo our sendtime
+                                  // reftime must echo our sendtime
         assert_eq!(&buf[8..12], &0xAABBCCDDu32.to_be_bytes());
         assert_eq!(&buf[12..16], &0x11223344u32.to_be_bytes());
         // recvtime == sendtime (same instant), nonzero

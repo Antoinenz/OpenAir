@@ -33,7 +33,10 @@ static SENDER_ID: OnceLock<String> = OnceLock::new();
 
 /// The sender identity for this run.
 pub fn sender_id() -> &'static str {
-    SENDER_ID.get().map(String::as_str).unwrap_or(DEFAULT_SENDER_ID)
+    SENDER_ID
+        .get()
+        .map(String::as_str)
+        .unwrap_or(DEFAULT_SENDER_ID)
 }
 
 /// Present a freshly generated identity for this run.
@@ -146,7 +149,8 @@ mod tests {
         for p in parts {
             assert_eq!(p.len(), 2, "{mac}");
             assert!(
-                p.chars().all(|c| c.is_ascii_hexdigit() && !c.is_lowercase()),
+                p.chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_lowercase()),
                 "{mac} should be uppercase hex"
             );
         }

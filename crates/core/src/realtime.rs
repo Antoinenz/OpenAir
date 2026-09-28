@@ -102,12 +102,16 @@ fn platform_raise() -> RealtimePriority {
             // actual audio device driver on the same machine.
             // SAFETY: `handle` is the live characteristics handle just
             // returned by MMCSS.
-            if let Err(e) = unsafe { AvSetMmThreadPriority(handle, AVRT_PRIORITY(AVRT_PRIORITY_HIGH.0)) } {
+            if let Err(e) =
+                unsafe { AvSetMmThreadPriority(handle, AVRT_PRIORITY(AVRT_PRIORITY_HIGH.0)) }
+            {
                 // Registered but not promoted: still better than nothing, so
                 // the handle is kept and reverted normally.
                 return RealtimePriority {
                     handle: Some(handle),
-                    outcome: Outcome::Failed(format!("thread registered but priority refused: {e}")),
+                    outcome: Outcome::Failed(format!(
+                        "thread registered but priority refused: {e}"
+                    )),
                 };
             }
             RealtimePriority {
