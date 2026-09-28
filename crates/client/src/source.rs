@@ -953,6 +953,28 @@ mod tests {
     }
 
     #[test]
+    // Not a gate, and deliberately so. This measures wall clock, and wall clock
+    // here is dominated by the OS scheduler rather than by our pacing: run in
+    // parallel with the rest of the suite it fails roughly two runs in three
+    // (observed 70%, 78%, 79%, 94% of real time on an idle developer machine,
+    // against a threshold of 100%), because Windows' default timer granularity
+    // is ~15.6 ms and every sleep overshoots it.
+    //
+    // Loosening the threshold would not rescue it. On an oversubscribed CI
+    // runner the noise floor drops into the same range as the 36% regression
+    // this was written to catch, so no single number separates a broken
+    // implementation from a busy machine.
+    //
+    // The guarantee itself is asserted deterministically by
+    // `the_wait_never_outlasts_the_audio_it_is_waiting_for`, and that test does
+    // catch the historical regression -- verified by mutation, since forcing
+    // BLOCKING_WAIT_FRACTION to 2.0 turns it red.
+    //
+    // Kept because it is still the most direct way to watch the end-to-end
+    // behaviour by hand:
+    //
+    //     cargo test -p openair-client --lib -- --ignored --test-threads=1
+    #[ignore = "wall-clock measurement: run alone, not in a parallel suite"]
     fn a_dry_source_is_still_fed_at_least_as_fast_as_it_plays() {
         // The regression this exists for, and the reason it is a *measurement*
         // rather than an assertion about a constant.
