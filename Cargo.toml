@@ -21,7 +21,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Antoine Rossi <antoinenzrossi@gmail.com>"]
 license = "GPL-3.0-only"
-repository = "https://github.com/anrossi/openair"
+repository = "https://github.com/Antoinenz/OpenAir"
 
 [workspace.dependencies]
 # Async runtime
