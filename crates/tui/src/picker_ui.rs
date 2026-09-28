@@ -170,9 +170,14 @@ fn row_item(row: &PickerRow) -> ListItem<'static> {
                 Color::DarkGray
             }),
         ),
-        Span::raw(format!("{:<20}", truncate(&row.name, 20))),
+        // Padded two wider than they truncate. Truncating and padding to the
+        // same width guarantees no gutter, so a value that filled its column
+        // ran straight into the next one.
+        Span::raw(format!("{:<22}", truncate(&row.name, 20))),
         Span::styled(
-            format!("{:<16}", truncate(&row.model, 16)),
+            // 21 fits "Apple TV 4K (3rd gen)", the longest model name the
+            // prettifier produces.
+            format!("{:<23}", truncate(&row.model, 21)),
             Style::default().fg(Color::DarkGray),
         ),
         Span::styled(row.addr.to_string(), Style::default().fg(Color::DarkGray)),
@@ -411,6 +416,47 @@ mod tests {
             .backend()
             .to_string()
             .contains("nothing connected"));
+    }
+
+    #[test]
+    fn columns_keep_a_gutter_when_their_contents_fill_them() {
+        // `truncate(s, N)` padded to exactly `{:<N}` can never leave a
+        // separator: a value that fills its column butts straight against the
+        // next one. A real Apple TV rendered as
+        // "Apple TV 4K (3r…192.168.1.61:7000" -- unreadable, and in the first
+        // screen anybody sees.
+        let mut raw: HashMap<String, String> = HashMap::new();
+        raw.insert("features".into(), TRANSIENT.into());
+        raw.insert("deviceid".into(), "1".into());
+        raw.insert("model".into(), "AppleTV14,1".into());
+        let dev = AirPlayDevice::new(
+            "A receiver with a long name._airplay._tcp.local.".into(),
+            "192.168.1.61".parse().unwrap(),
+            7000,
+            AirPlayTxt::parse(&raw),
+        );
+        let mut state = PickerState::new(Settings::default(), Vec::new(), true);
+        state.insert(dev);
+
+        let screen = draw(110, 12, &state).backend().to_string();
+        let row = screen
+            .lines()
+            .find(|l| l.contains("192.168.1.61"))
+            .expect("the device row is drawn")
+            .to_string();
+
+        assert!(
+            row.contains("Apple TV 4K (3rd gen)"),
+            "the model column must be wide enough for the models it prints:\n{row}"
+        );
+        assert!(
+            row.contains("  192.168.1.61"),
+            "a gutter must separate the model from the address:\n{row}"
+        );
+        assert!(
+            row.contains("…  "),
+            "a truncated name must still be followed by a gutter:\n{row}"
+        );
     }
 
     #[test]
