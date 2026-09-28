@@ -20,7 +20,7 @@ members = [
 version = "0.1.0"
 edition = "2021"
 authors = ["Antoine Rossi <antoinenzrossi@gmail.com>"]
-license = "MIT"
+license = "GPL-3.0-only"
 repository = "https://github.com/anrossi/openair"
 
 [workspace.dependencies]
