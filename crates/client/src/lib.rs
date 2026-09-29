@@ -969,6 +969,31 @@ fn underrun_response(min_lead_ns: i64, current_latency: u64, cooldown_ok: bool) 
     if min_lead_ns >= UNDERRUN_LEAD_FLOOR.as_nanos() as i64 || !cooldown_ok {
         return None;
     }
+    // A deficit deeper than the whole buffer is not congestion, and raising
+    // the latency is the wrong answer to it.
+    //
+    // Congestion makes the lead decay: it dips below the floor, and a deeper
+    // anchor buys the margin to absorb the next dip. A stall makes the lead
+    // fall off a cliff -- a receiver that stops answering TCP, a capture
+    // device that vanishes -- and the deficit then measures how long the pipe
+    // was blocked, not how much buffer it needed. Stepping 250 ms at a time
+    // cannot recover 19 seconds.
+    //
+    // It matters because the raise is sticky and the stall is not: the TUI
+    // persists whatever latency the stream settles on, so treating one blip as
+    // congestion permanently rewrites the user's setting. Observed on hardware
+    // taking a 400 ms preference to 1500 ms.
+    //
+    // Scaled to the buffer rather than a flat number because the same 600 ms
+    // deficit is a stall for a 500 ms buffer and ordinary congestion for a
+    // 4000 ms one.
+    let stalled = min_lead_ns < -((current_latency as i64) * 1_000_000);
+    if stalled {
+        // Re-anchor at the current depth. The caller re-anchors on any `Some`,
+        // and reads an unchanged value as "recover, do not raise" -- the same
+        // path taken at the ceiling.
+        return Some(current_latency);
+    }
     Some((current_latency + AUTO_LATENCY_STEP_MS).min(AUTO_LATENCY_MAX_MS))
 }
 
@@ -2440,6 +2465,62 @@ mod tests {
         let starved = 0;
         assert_eq!(underrun_response(starved, 500, false), None);
         assert_eq!(underrun_response(starved, AUTO_LATENCY_MAX_MS, false), None);
+    }
+
+    #[test]
+    fn a_stall_sized_deficit_re_anchors_without_raising() {
+        // From the 2026-09-29 hardware session: the Apple TV stopped answering
+        // TCP for roughly 19 seconds, and the window that followed reported
+        // min_lead_ms=-18960 against a latency of 1000 ms. That was read as
+        // congestion, so latency was stepped to 1250 and then 1500 -- and
+        // because the TUI persists whatever the stream settles on, one network
+        // blip permanently rewrote the user's 400 ms setting.
+        //
+        // A deficit deeper than the entire buffer cannot be congestion: no
+        // 250 ms step recovers 19 seconds. Re-anchoring is the only thing that
+        // helps there, and it already happens unconditionally.
+        let stalled = -18_960_000_000i64; // the logged value, in ns
+        assert_eq!(
+            underrun_response(stalled, 1000, true),
+            Some(1000),
+            "must re-anchor at the same latency, not a deeper one"
+        );
+    }
+
+    #[test]
+    fn a_lead_that_merely_dipped_still_raises() {
+        // The other half of the distinction, and the reason the stall check is
+        // scaled to the buffer rather than a flat number: a lead that fell
+        // below the floor but is still within one buffer depth is precisely
+        // what auto-latency exists to correct.
+        let dipped = -50_000_000i64; // -50 ms, well inside a 500 ms buffer
+        assert_eq!(
+            underrun_response(dipped, 500, true),
+            Some(500 + AUTO_LATENCY_STEP_MS),
+            "a shallow dip is congestion and should still buy margin"
+        );
+    }
+
+    #[test]
+    fn the_stall_threshold_scales_with_the_buffer() {
+        // -600 ms is a stall for a 500 ms buffer and ordinary congestion for a
+        // 4000 ms one. A flat threshold could not express both.
+        let deficit = -600_000_000i64;
+        assert_eq!(
+            underrun_response(deficit, 500, true),
+            Some(500),
+            "deeper than the 500 ms buffer: re-anchor only"
+        );
+        assert_eq!(
+            underrun_response(deficit, 4000, true),
+            Some(4000),
+            "within a 4000 ms buffer, but already at the ceiling"
+        );
+        assert_eq!(
+            underrun_response(deficit, 2000, true),
+            Some(2000 + AUTO_LATENCY_STEP_MS),
+            "within a 2000 ms buffer: ordinary congestion, still raises"
+        );
     }
 
     #[test]
