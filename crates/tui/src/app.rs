@@ -233,6 +233,21 @@ pub struct StreamingScreen {
     targets: Vec<GroupTarget>,
 }
 
+/// Whether a latency the stream reports should be persisted.
+///
+/// `stale_echo` is the value the stream was last seen running at *before* the
+/// user changed it. Reports equal to it are the old number arriving late and
+/// must not be written back, which is the bug this exists for.
+fn adopt_report(live: u64, stored: u64, stale_echo: Option<u64>) -> Option<u64> {
+    if live == 0 || live == stored {
+        return None;
+    }
+    if stale_echo == Some(live) {
+        return None;
+    }
+    Some(live)
+}
+
 pub struct App<'a> {
     screen: Screen,
     logs: LogBuffer,
@@ -244,6 +259,12 @@ pub struct App<'a> {
     applier: Option<SettingsApplier<'a>>,
     /// Run when the group first reaches the dashboard. See [`ReadyHook`].
     on_ready: Option<ReadyHook<'a>>,
+    /// The latency the stream was running at when the user last changed it.
+    ///
+    /// The stream's report lags a command by at least a tick, so without this
+    /// the old value arrives after the change and overwrites it. Cleared as
+    /// soon as a report differs from it, so it cannot wedge.
+    stale_latency_echo: Option<u64>,
     handoff_available: bool,
     /// Device keys the user last chose, so a return to the picker does not
     /// make them pick again.
@@ -281,6 +302,7 @@ impl<'a> App<'a> {
             launch,
             applier: None,
             on_ready: None,
+            stale_latency_echo: None,
             handoff_available,
             last_selection: Vec::new(),
             receiver_names: HashMap::new(),
@@ -476,6 +498,10 @@ impl<'a> App<'a> {
                 queue(StreamCommand::SetLatency {
                     ms: next.latency_ms,
                 });
+                // What the stream is running at right now. Until it applies the
+                // command it keeps reporting this, and adopting it would undo
+                // the change that was just made.
+                self.stale_latency_echo = Some(stream.state.latency_ms);
             }
             if next.volume_db != previous.volume_db {
                 queue(StreamCommand::SetMasterVolume { db: next.volume_db });
@@ -551,9 +577,17 @@ impl<'a> App<'a> {
             return;
         };
         let live = stream.state.latency_ms;
-        if live == 0 || live == self.settings.latency_ms {
+        let Some(live) = adopt_report(live, self.settings.latency_ms, self.stale_latency_echo)
+        else {
+            // A report that is neither stale nor news still retires the echo:
+            // once the stream confirms the new value, the guard has done its
+            // job and must not suppress the next genuine change.
+            if live != 0 && self.stale_latency_echo.is_some_and(|s| s != live) {
+                self.stale_latency_echo = None;
+            }
             return;
-        }
+        };
+        self.stale_latency_echo = None;
         tracing::info!(
             from_ms = self.settings.latency_ms,
             to_ms = live,
@@ -1297,6 +1331,69 @@ mod tests {
             calls[0][0].addr,
             "192.168.1.51:7000".parse::<SocketAddr>().unwrap()
         );
+    }
+
+    #[test]
+    fn a_late_echo_of_the_old_latency_is_not_adopted() {
+        // The bug, from the 2026-09-29 session. Holding the latency key logged
+        //
+        //   app: adopting the latency the stream settled on from_ms=500 to_ms=450
+        //   client: latency changed from_ms=450 to_ms=500
+        //
+        // over and over: the user raised it to 500, the stream had not applied
+        // that yet and still reported 450, and the next tick wrote 450 back
+        // over the user's own setting. The stream then applied 500, the tick
+        // after adopted it again, and the two leapfrogged -- with a
+        // settings.json write every time.
+        //
+        // The stream's report lags a command by at least a tick, so a report
+        // equal to the pre-change value says nothing about what the stream
+        // wants; it is an echo.
+        assert_eq!(
+            adopt_report(450, 500, Some(450)),
+            None,
+            "the value from before the change must not overwrite it"
+        );
+    }
+
+    #[test]
+    fn a_latency_the_stream_raised_itself_is_still_adopted() {
+        // The other direction, and the whole point of adopting at all: when
+        // auto-latency deepens the anchor, that number is what this house
+        // actually needed and it should survive a restart. Suppressing it
+        // would re-learn the hard way, with a dropout, every run.
+        assert_eq!(
+            adopt_report(750, 500, None),
+            Some(750),
+            "an unsolicited change is the stream's own and worth keeping"
+        );
+    }
+
+    #[test]
+    fn the_echo_guard_cannot_wedge_adoption() {
+        // The guard suppresses exactly one value. If the stream reports
+        // something that is neither the stored setting nor the stale echo,
+        // auto-latency moved it and it is adopted -- so a missed echo cannot
+        // leave adoption switched off forever.
+        assert_eq!(
+            adopt_report(900, 500, Some(450)),
+            Some(900),
+            "a third value is a real change, not an echo"
+        );
+    }
+
+    #[test]
+    fn nothing_is_adopted_before_the_stream_reports() {
+        // Zero means the dashboard has not sampled yet. Adopting it would
+        // write a latency of 0 to disk.
+        assert_eq!(adopt_report(0, 500, None), None);
+        assert_eq!(adopt_report(0, 500, Some(450)), None);
+    }
+
+    #[test]
+    fn a_report_that_already_matches_is_a_no_op() {
+        assert_eq!(adopt_report(500, 500, None), None);
+        assert_eq!(adopt_report(500, 500, Some(450)), None);
     }
 
     #[test]
