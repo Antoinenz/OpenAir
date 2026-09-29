@@ -754,6 +754,26 @@ mod tests {
         assert_eq!(u16::from_be_bytes([resent[2], resent[3]]), 7);
         assert_eq!(&resent[4..], &[0xAAu8; 64], "the payload should be intact");
 
+        // The handler sends the resend *before* it records the exchange, and
+        // that order is deliberate: `elapsed` is meant to include the send. So
+        // seeing the packet arrive says nothing about whether the counters have
+        // been written -- the handler thread can be descheduled in between.
+        //
+        // That is what failed release run 36510126353, on the same commit where
+        // CI had passed minutes earlier. The test asserted a happens-before that
+        // does not exist.
+        //
+        // All five counters use Relaxed ordering, so waiting on the first one
+        // written would not guarantee the rest are visible. Wait for the whole
+        // tuple, then assert each field individually so a genuinely wrong value
+        // still reports which one.
+        let counters = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < counters
+            && (stats.requests(), stats.served(), stats.missed()) != (1, 1, 1)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
         assert_eq!(stats.requests(), 1, "one request");
         assert_eq!(stats.served(), 1, "seven was held");
         assert_eq!(stats.missed(), 1, "eight was not");
