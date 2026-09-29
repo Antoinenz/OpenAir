@@ -47,9 +47,21 @@ impl AudioCipher {
     }
 }
 
-/// Build one encrypted realtime audio packet (PT=0x60, marker on first).
+/// Build one realtime audio packet (PT=0x60, marker on first).
+///
+/// `cipher` is optional because not every receiver can decrypt. AirPlay 2's
+/// native scheme is ChaCha20-Poly1305 keyed by the `shk` handed over in SETUP,
+/// but a receiver's `_raop._tcp` TXT record advertises which encryption types
+/// it actually implements in `et`, and some licensed third-party receivers
+/// offer only `0,4` -- unencrypted, or an MFi-derived key. A Denon AVR
+/// (AirTunes/366.0) is one: give it ChaCha-encrypted audio and it accepts the
+/// session, reports no error, and plays nothing, because the payload is noise
+/// to it.
+///
+/// With no cipher the packet is `[12-byte header][payload]` -- no tag and no
+/// trailing nonce, since there is nothing to authenticate.
 pub fn build_audio_packet(
-    cipher: &mut AudioCipher,
+    cipher: Option<&mut AudioCipher>,
     first: bool,
     seq: u16,
     timestamp: u32,
@@ -62,6 +74,13 @@ pub fn build_audio_packet(
     header[2..4].copy_from_slice(&seq.to_be_bytes());
     header[4..8].copy_from_slice(&timestamp.to_be_bytes());
     header[8..12].copy_from_slice(&ssrc.to_be_bytes());
+
+    let Some(cipher) = cipher else {
+        let mut packet = Vec::with_capacity(12 + payload.len());
+        packet.extend_from_slice(&header);
+        packet.extend_from_slice(payload);
+        return packet;
+    };
 
     let (ct, nonce8) = cipher.encrypt(payload, &header[4..12]);
 
@@ -558,7 +577,14 @@ mod tests {
     fn audio_packet_layout() {
         let mut cipher = AudioCipher::new(&[7u8; 32]);
         let payload = vec![0xABu8; 100];
-        let pkt = build_audio_packet(&mut cipher, true, 0x1234, 0xDEADBEEF, 0xCAFEBABE, &payload);
+        let pkt = build_audio_packet(
+            Some(&mut cipher),
+            true,
+            0x1234,
+            0xDEADBEEF,
+            0xCAFEBABE,
+            &payload,
+        );
         assert_eq!(pkt.len(), 12 + 100 + 16 + 8);
         assert_eq!(pkt[0], 0x80);
         assert_eq!(pkt[1], 0xE0); // marker set on first packet
@@ -568,9 +594,28 @@ mod tests {
         // First nonce is counter 0
         assert_eq!(&pkt[pkt.len() - 8..], &0u64.to_le_bytes());
 
-        let pkt2 = build_audio_packet(&mut cipher, false, 0x1235, 0, 0, &payload);
+        let pkt2 = build_audio_packet(Some(&mut cipher), false, 0x1235, 0, 0, &payload);
         assert_eq!(pkt2[1], 0x60); // no marker
         assert_eq!(&pkt2[pkt2.len() - 8..], &1u64.to_le_bytes());
+    }
+
+    #[test]
+    fn a_plaintext_packet_carries_no_tag_and_no_nonce() {
+        // The shape a receiver advertising `et: 0` expects: header then payload,
+        // nothing appended. Worth pinning separately from the encrypted layout,
+        // because the difference is only visible in the length -- an accidental
+        // tag or trailing nonce would be read as audio and heard as a click
+        // every packet.
+        let payload = vec![0xABu8; 100];
+        let pkt = build_audio_packet(None, true, 0x1234, 0xDEADBEEF, 0xCAFEBABE, &payload);
+
+        assert_eq!(pkt.len(), 12 + 100, "no 16-byte tag, no 8-byte nonce");
+        assert_eq!(pkt[0], 0x80);
+        assert_eq!(pkt[1], 0xE0, "marker still set on the first packet");
+        assert_eq!(&pkt[2..4], &0x1234u16.to_be_bytes());
+        assert_eq!(&pkt[4..8], &0xDEADBEEFu32.to_be_bytes());
+        assert_eq!(&pkt[8..12], &0xCAFEBABEu32.to_be_bytes());
+        assert_eq!(&pkt[12..], &payload[..], "payload verbatim");
     }
 
     #[test]
@@ -578,7 +623,7 @@ mod tests {
         let shk = [9u8; 32];
         let mut cipher = AudioCipher::new(&shk);
         let payload = b"hello airplay".to_vec();
-        let pkt = build_audio_packet(&mut cipher, false, 1, 42, 99, &payload);
+        let pkt = build_audio_packet(Some(&mut cipher), false, 1, 42, 99, &payload);
 
         // Receiver side: reconstruct nonce from packet tail, AAD from header.
         let cipher_rx = ChaCha20Poly1305::new(Key::from_slice(&shk));

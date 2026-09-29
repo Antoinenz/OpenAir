@@ -59,6 +59,17 @@ fn connect_session(
         Err(_) => StreamSession::connect(addr, device_id)?,
     };
     authorise_if_required(&mut session);
+    // Escape hatch for the Denon investigation, deliberately an env var rather
+    // than a flag: it is a hypothesis under test, not a supported setting.
+    //
+    // Receivers advertising `et: 0,4` implement unencrypted audio or an
+    // MFi-derived key, not AirPlay 2's native ChaCha20-Poly1305 over `shk`.
+    // If this turns the Denon audible, the real fix is to read `et` from the
+    // `_raop._tcp` TXT record and decide per receiver -- see task #58.
+    if std::env::var_os("OPENAIR_PLAINTEXT_AUDIO").is_some() {
+        warn!("OPENAIR_PLAINTEXT_AUDIO set - sending audio unencrypted, no shk in SETUP");
+        session.encrypt_audio = false;
+    }
     Ok(session)
 }
 
@@ -442,7 +453,9 @@ pub fn stream_audio(
     // Held for the rest of the send loop: dropping it here would revert the
     // priority immediately and quietly do nothing at all.
     let _priority = openair_core::realtime::raise_current_thread();
-    let mut cipher = AudioCipher::new(&session.shk);
+    let mut cipher = session
+        .encrypt_audio
+        .then(|| AudioCipher::new(&session.shk));
 
     let packet_dur = Duration::from_secs_f64(FRAMES_PER_PACKET as f64 / SAMPLE_RATE as f64);
     let start_instant = Instant::now();
@@ -467,7 +480,7 @@ pub fn stream_audio(
 
         let rtptime = first_rtptime.wrapping_add(n * FRAMES_PER_PACKET as u32);
         let packet = build_audio_packet(
-            &mut cipher,
+            cipher.as_mut(),
             n == 0,
             seq,
             rtptime,

@@ -54,6 +54,15 @@ pub struct StreamSession {
     active_remote: u32,
     /// AEAD key for RTP audio (we generate it, receiver gets it in SETUP 2).
     pub shk: [u8; 32],
+    /// Whether the audio payload is encrypted with [`Self::shk`].
+    ///
+    /// AirPlay 2's native scheme, and right for every Apple receiver. But a
+    /// receiver's `_raop._tcp` TXT `et` field lists the encryption types it
+    /// actually implements, and licensed third-party receivers are seen
+    /// offering only `0,4`: unencrypted, or an MFi-derived key. Sending such a
+    /// receiver ChaCha-encrypted audio produces a session that looks perfect
+    /// and plays silence.
+    pub encrypt_audio: bool,
     pub ports: NegotiatedPorts,
 }
 
@@ -77,6 +86,7 @@ impl StreamSession {
             dacp_id: format!("{:016X}", rng.next_u64()),
             active_remote: rng.next_u32(),
             shk,
+            encrypt_audio: true,
             ports: NegotiatedPorts::default(),
             conn,
         })
@@ -240,7 +250,11 @@ impl StreamSession {
                 stream.insert("sr".into(), 44100u64.into());
                 stream.insert("latencyMin".into(), 11025u64.into());
                 stream.insert("latencyMax".into(), 88200u64.into());
-                stream.insert("shk".into(), plist::Value::Data(self.shk.to_vec()));
+                // Omitted, not zeroed, when the receiver cannot decrypt: the
+                // absence of a key is how "send it in the clear" is expressed.
+                if self.encrypt_audio {
+                    stream.insert("shk".into(), plist::Value::Data(self.shk.to_vec()));
+                }
                 stream.insert("controlPort".into(), (control_port as u64).into());
                 stream.insert("isMedia".into(), true.into());
                 stream.insert("supportsDynamicStreamID".into(), false.into());
@@ -252,7 +266,11 @@ impl StreamSession {
                 stream.insert("audioFormat".into(), 0x400000u64.into());
                 stream.insert("spf".into(), 1024u64.into());
                 stream.insert("sr".into(), 44100u64.into());
-                stream.insert("shk".into(), plist::Value::Data(self.shk.to_vec()));
+                // Omitted, not zeroed, when the receiver cannot decrypt: the
+                // absence of a key is how "send it in the clear" is expressed.
+                if self.encrypt_audio {
+                    stream.insert("shk".into(), plist::Value::Data(self.shk.to_vec()));
+                }
                 stream.insert("controlPort".into(), (control_port as u64).into());
                 stream.insert("latencyMin".into(), 11025u64.into());
                 stream.insert("latencyMax".into(), 88200u64.into());
