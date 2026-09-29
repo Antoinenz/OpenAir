@@ -18,6 +18,7 @@ use openair_audio_rtp::{
     AAC_44100_F24_2_SSRC,
 };
 use openair_core::metadata::NowPlaying;
+use openair_core::types::Features;
 use openair_rtsp::{StreamFormat, StreamSession, TimingConfig};
 use openair_timing::{ptp_now_ns, ptp_ns_to_secs_frac, PtpMaster};
 use tracing::{debug, info, trace, warn};
@@ -45,15 +46,52 @@ fn connect_session(
     addr: SocketAddr,
     device_id: &str,
 ) -> Result<StreamSession, Box<dyn std::error::Error>> {
-    if let Ok(store) = PairingStore::load() {
-        if let Some(peer) = store.peer(device_id) {
-            let identity = store.identity()?;
-            info!(device_id, "using stored HomeKit pairing (pair-verify)");
-            let conn = openair_rtsp::pair_verify(addr, device_id, identity, peer)?;
-            return Ok(StreamSession::from_connection(conn)?);
+    let mut session = match PairingStore::load() {
+        Ok(store) => match store.peer(device_id) {
+            Some(peer) => {
+                let identity = store.identity()?;
+                info!(device_id, "using stored HomeKit pairing (pair-verify)");
+                let conn = openair_rtsp::pair_verify(addr, device_id, identity, peer)?;
+                StreamSession::from_connection(conn)?
+            }
+            None => StreamSession::connect(addr, device_id)?,
+        },
+        Err(_) => StreamSession::connect(addr, device_id)?,
+    };
+    authorise_if_required(&mut session);
+    Ok(session)
+}
+
+/// Run `/auth-setup` if the receiver says it needs one.
+///
+/// Placed between pairing and SETUP because that is where the exchange
+/// belongs, and done here so every streaming entry point gets it without
+/// having to thread the feature bits down from discovery.
+///
+/// Both halves are non-fatal on purpose. A receiver that does not answer
+/// `GET /info` is one we have never met before, and refusing to stream to it
+/// because a capability probe failed would trade a working session for a
+/// cautious one. A receiver that rejects `/auth-setup` after asking for it is
+/// worth a loud line in the log, not a dead stream -- if the audio then plays
+/// anyway, the log is how we find out the step was never needed.
+fn authorise_if_required(session: &mut StreamSession) {
+    let bits = match session.features() {
+        Ok(bits) => bits,
+        Err(e) => {
+            warn!("could not read receiver features, skipping auth-setup: {e}");
+            return;
         }
+    };
+    // Gated rather than attempted unconditionally: an Apple TV and a Mac both
+    // stream correctly today without it, and posting an unexpected
+    // /auth-setup at a receiver that never asked for one is a change with no
+    // upside and an obvious way to break something that works.
+    if !Features(bits).needs_auth_setup() {
+        return;
     }
-    Ok(StreamSession::connect(addr, device_id)?)
+    if let Err(e) = session.auth_setup() {
+        warn!("auth-setup failed (continuing): {e}");
+    }
 }
 
 /// Whether this failure means "pair with it again" rather than "something
@@ -2254,6 +2292,30 @@ mod tests {
         let inner = Box::new(openair_rtsp::SessionError::CredentialsRejected);
         let outer = Wrapped(Box::new(Wrapped(inner)));
         assert!(needs_repairing(&outer));
+    }
+
+    #[test]
+    fn only_a_receiver_that_asks_for_it_gets_auth_setup() {
+        // Real bitmasks, captured with `openair discover` on 2026-09-29. The
+        // Denon was the only receiver on that network setting bit 26, and the
+        // only one that paired, agreed a SETUP and then played nothing.
+        //
+        // Pinned to the actual hardware values rather than to a hand-built
+        // mask because the point of the gate is that it fires for this amp and
+        // does not fire for the two receivers that already work. Moving the
+        // bit, or widening the check, breaks one half or the other.
+        assert!(
+            Features(0x0801_C340_445F_8A00).needs_auth_setup(),
+            "Denon AVR-X2700H asks for MFi auth-setup"
+        );
+        assert!(
+            !Features(0x3C17_5FDE_4A7F_DFD5).needs_auth_setup(),
+            "AppleTV14,1 streams today and must not be sent one"
+        );
+        assert!(
+            !Features(0x3817_4FDE_4A7F_CFD5).needs_auth_setup(),
+            "MacBookAir10,1 streams today and must not be sent one"
+        );
     }
 
     #[test]

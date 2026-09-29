@@ -13,3 +13,4 @@ thiserror.workspace = true
 tracing.workspace = true
 plist.workspace = true
 rand.workspace = true
+x25519-dalek.workspace = true

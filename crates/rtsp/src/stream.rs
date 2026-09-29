@@ -409,6 +409,65 @@ impl StreamSession {
         check_ok(&raw)
     }
 
+    /// Feature bitmask from an encrypted `GET /info`.
+    ///
+    /// Asked of the receiver rather than taken from the mDNS record we
+    /// discovered it with: the record can be stale, and a receiver naming its
+    /// own capabilities on the connection we are about to stream over is the
+    /// authority.
+    pub fn features(&mut self) -> Result<u64, SessionError> {
+        let raw = self.conn.request("GET", "/info", &[], &[], None)?;
+        check_ok(&raw)?;
+        let body = connection::extract_body(&raw);
+        let value: plist::Value = plist::from_bytes(body).map_err(|_| SessionError::PlistDecode)?;
+        let dict = value.as_dictionary().ok_or(SessionError::PlistDecode)?;
+        // Senders in the wild have seen this both signed and unsigned.
+        let bits = dict.get("features").and_then(|f| {
+            f.as_unsigned_integer()
+                .or_else(|| f.as_signed_integer().map(|s| s as u64))
+        });
+        Ok(bits.unwrap_or(0))
+    }
+
+    /// POST /auth-setup, for receivers advertising feature bit 26.
+    ///
+    /// Such a receiver will complete pairing, agree to a SETUP and then render
+    /// nothing until this exchange has happened -- which is a silence with no
+    /// error anywhere to explain it. Observed on a Denon AVR-X2700H
+    /// (AirTunes/366.0); the documented Sonos behaviour is to reject SETUP
+    /// outright, so the same missing step shows up two different ways.
+    ///
+    /// Only the *receiver* proves anything here: it answers with its MFi
+    /// certificate and a signature over our key. The sender needs no MFi
+    /// credential of its own, which is why this is implementable in the open
+    /// and `/fp-setup` is not. We do not verify the certificate -- there is
+    /// nothing we could do with the answer, and the receiver is satisfied by
+    /// having been asked.
+    pub fn auth_setup(&mut self) -> Result<(), SessionError> {
+        let secret = x25519_dalek::EphemeralSecret::random_from_rng(rand::thread_rng());
+        let public = x25519_dalek::PublicKey::from(&secret);
+        // 0x01 selects the unencrypted variant. 0x02 asks the receiver to
+        // encrypt its reply, which would need a key we have no use for.
+        let mut body = Vec::with_capacity(33);
+        body.push(0x01);
+        body.extend_from_slice(public.as_bytes());
+
+        info!("auth-setup (receiver advertises MFi bit 26)");
+        let raw = self.conn.request(
+            "POST",
+            "/auth-setup",
+            &[],
+            &body,
+            Some("application/octet-stream"),
+        )?;
+        check_ok(&raw)?;
+        debug!(
+            bytes = connection::extract_body(&raw).len(),
+            "auth-setup accepted"
+        );
+        Ok(())
+    }
+
     /// POST /feedback keepalive (send every ~2s while streaming).
     pub fn feedback(&mut self) -> Result<(), SessionError> {
         let raw = self.conn.request("POST", "/feedback", &[], &[], None)?;
