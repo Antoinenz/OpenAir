@@ -201,7 +201,13 @@ where
                         }
                     }
                     2 => {
-                        for frame in data.chunks_exact(2) {
+                        // `as_chunks` rather than `chunks_exact`: a constant
+                        // chunk size yields `[T; 2]`, so the indexing below is
+                        // checked once at compile time instead of on every
+                        // sample. This is the capture callback, so it runs for
+                        // every buffer the device hands us.
+                        let (frames, _) = data.as_chunks::<2>();
+                        for frame in frames {
                             guard.push_back(frame[0].to_i16());
                             guard.push_back(frame[1].to_i16());
                         }

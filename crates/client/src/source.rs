@@ -41,7 +41,10 @@ impl AudioSource for SineSource {
     fn fill(&mut self, buf: &mut [i16]) -> usize {
         let max_frames = buf.len() / 2;
         let frames = max_frames.min(self.frames_left as usize);
-        for frame in buf[..frames * 2].chunks_exact_mut(2) {
+        // `as_chunks_mut` for the constant stereo pair: the writes below are
+        // then bounds-checked at compile time rather than per sample.
+        let (pairs, _) = buf[..frames * 2].as_chunks_mut::<2>();
+        for frame in pairs {
             let v = (self.phase.sin() * 0.6 * f32::from(i16::MAX)) as i16;
             frame[0] = v;
             frame[1] = v;
@@ -774,7 +777,8 @@ mod tests {
         // (source L==R by construction since we wrote the mono value to
         // both channels' worth... actually mono has only 1 channel, so
         // after duplication L must equal R exactly for every output frame).
-        for pair in samples.chunks_exact(2) {
+        let (pairs, _) = samples.as_chunks::<2>();
+        for pair in pairs {
             assert_eq!(pair[0], pair[1], "mono channel duplication mismatch");
         }
         let _ = std::fs::remove_file(&path);
