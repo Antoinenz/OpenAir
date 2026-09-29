@@ -27,6 +27,7 @@ const COMMANDS: &[&str] = &[
     "play",
     "tone",
     "pair",
+    "discover",
     "devices",
     "restore-audio",
     "help",
@@ -80,6 +81,7 @@ COMMANDS
   play <receiver>... <file.wav>      stream a WAV file
   tone <receiver>... [seconds]       stream a 440 Hz test tone
   pair <receiver>                    pair with a receiver that asks for a PIN
+  discover [seconds]                 list receivers and what they advertise
   devices                            list audio output devices (Windows)
   restore-audio                      undo an interrupted --handoff (Windows)
   help [command]                     detail on one command
@@ -128,6 +130,7 @@ fn detail(name: &str) -> &'static str {
         "play" => PLAY,
         "tone" => TONE,
         "pair" => PAIR,
+        "discover" => DISCOVER,
         "devices" => DEVICES,
         "restore-audio" => RESTORE_AUDIO,
         _ => OVERVIEW,
@@ -192,6 +195,22 @@ is needed once per device.
 
 Rarely necessary now: the terminal UI pairs a receiver as part of choosing
 it. Apple TV and HomePod need pairing; Shairport Sync does not.
+";
+
+const DISCOVER: &str = "\
+openair discover — list AirPlay receivers and what they advertise.
+
+Browses for five seconds unless you say otherwise, then prints each
+receiver's address, model, AirTunes version, device id and feature bits.
+Read-only: it connects to nothing.
+
+  openair discover
+  openair discover 15
+
+The feature bits are what a receiver problem gets diagnosed against, so
+include this output in a bug report. Two of them decide how a session is
+set up: PTP-required receivers cannot fall back to NTP, and a receiver
+asking for MFi auth-setup needs a step beyond ordinary pairing.
 ";
 
 const DEVICES: &str = "\

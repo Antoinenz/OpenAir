@@ -1325,6 +1325,64 @@ async fn main() -> Result<()> {
         }
     };
 
+    // `openair discover` — list receivers and what they advertise.
+    //
+    // Read-only. Exists because the features hex is what a receiver bug report
+    // gets diagnosed against, and until now the only way to see it was to read
+    // a debug log. Cross-platform: discovery needs no audio device.
+    if args.first().map(String::as_str) == Some("discover") {
+        let secs = args
+            .get(1)
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(5)
+            .clamp(1, 60);
+        println!(
+            "Browsing for {secs}s\u{2026}
+"
+        );
+        let mut found = 0usize;
+        let mark = |on: bool| if on { "yes" } else { "no" };
+        openair_discovery::browse(std::time::Duration::from_secs(secs), |d| {
+            found += 1;
+            let f = d.features();
+            println!("{}", d.display_name());
+            println!("  address    {}:{}", d.addr, d.port);
+            println!(
+                "  model      {}",
+                d.txt.model.as_deref().unwrap_or("\u{2014}")
+            );
+            println!(
+                "  server     {}",
+                d.txt.src_vers.as_deref().unwrap_or("\u{2014}")
+            );
+            println!(
+                "  device id  {}",
+                d.txt.device_id.as_deref().unwrap_or("\u{2014}")
+            );
+            println!("  features   0x{:016X}", f.0);
+            println!(
+                "    airplay audio {}   ptp required {}   transient pairing {}",
+                mark(f.supports_airplay_audio()),
+                mark(f.requires_ptp()),
+                mark(f.supports_transient_pairing()),
+            );
+            println!(
+                "    prefers buffered AAC {}   MFi auth-setup {}",
+                mark(f.supports_buffered_audio()),
+                mark(f.needs_auth_setup()),
+            );
+            println!();
+        })?;
+        if found == 0 {
+            println!("No AirPlay receivers found.");
+            println!();
+            println!("Most often the PC and the receiver are on different networks \u{2014} a");
+            println!("guest network or a VLAN. They must share one for discovery to work.");
+            println!("You can still name a receiver directly: openair capture 192.168.1.50:7000");
+        }
+        return Ok(());
+    }
+
     // `openair devices` — list output devices and show which one --handoff
     // would route through. Read-only; changes nothing.
     #[cfg(windows)]

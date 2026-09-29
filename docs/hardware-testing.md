@@ -61,7 +61,7 @@ Record the model string first: the 2022 model reports `AppleTV14,1`, the 2021
 `AppleTV5,3` or `AppleTV6,2`.
 
 ```
-openair discover --verbose
+openair discover
 openair capture "<new atv>" --log
 openair capture "<new atv>" --buffered --log
 ```
@@ -94,7 +94,7 @@ The highest-information test in this session. Nothing about our conformance to
 the licensed stack is currently known.
 
 ```
-openair discover --verbose
+openair discover
 openair capture "<denon>" --log
 openair capture "<denon>" --buffered --log
 ```
