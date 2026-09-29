@@ -457,6 +457,16 @@ impl StreamSession {
     ) -> Result<plist::Value, SessionError> {
         let mut buf = Vec::new();
         plist::to_writer_binary(&mut buf, &body).map_err(|_| SessionError::PlistEncode)?;
+        // Both sides of every plist exchange, because what a receiver *grants*
+        // is the only record of what it agreed to. Diagnosing the Denon
+        // AVR-X2700H (AirTunes/366.0), which accepts a realtime session and
+        // renders nothing, came down to not knowing the negotiated audio
+        // format -- the size of the body was logged, never its contents.
+        //
+        // Safe to dump wholesale: artwork and metadata do not come through
+        // here, they go straight to `conn.request` with a raw body, so these
+        // plists are always small control dictionaries.
+        debug!(%method, plist = ?body, "plist request");
         let uri = path.map(str::to_string).unwrap_or_else(|| self.uri.clone());
         let raw = self.conn.request(
             method,
@@ -473,7 +483,10 @@ impl StreamSession {
         check_ok(&raw)?;
         let body = connection::extract_body(&raw);
         debug!(bytes = body.len(), "plist response body");
-        plist::from_bytes(body).map_err(|_| SessionError::PlistDecode)
+        let decoded: plist::Value =
+            plist::from_bytes(body).map_err(|_| SessionError::PlistDecode)?;
+        debug!(%method, plist = ?decoded, "plist response");
+        Ok(decoded)
     }
 }
 
