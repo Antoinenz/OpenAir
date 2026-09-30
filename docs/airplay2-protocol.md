@@ -445,6 +445,9 @@ These are not optional polish — they're what separates "usable" from "drops au
 | Device | Quirk | Workaround |
 |---|---|---|
 | Sonos Beam | Rejects SETUP without `/auth-setup` | Send minimal auth-setup payload first |
+| Denon AVR (AirTunes/366.0) | Accepts SETUP *and* `/auth-setup`, then plays silence | `et: 0,4` — it does not implement AirPlay 2's ChaCha/`shk` audio encryption. Send unencrypted, or derive the key from auth-setup |
+| Denon AVR (AirTunes/366.0) | Agrees `type: 103` then never drains the TCP data connection | `cn: 0,1` — no AAC at all. Never choose buffered AAC for it |
+| Any receiver | `cn` and `et` are only in the `_raop._tcp` record | Do not skip that record: it is the only advertisement of decodable codecs and supported encryption |
 | AirPort Express (firmware ≥ 7.8) | Same | Same |
 | Apple TV 4 | Returns `timingPort=0` in SETUP response | Ignore; use sender's configured port |
 | Sonos volume | Volume `SET_PARAMETER` must be **last** in a sequence | Reorder updates |

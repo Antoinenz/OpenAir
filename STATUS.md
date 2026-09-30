@@ -46,6 +46,8 @@
 |----------|---------|---------------|--------------|-------|
 | Shairport Sync 4.x | Transient | ✅ | ✅ | We are PTP master (nqptp follows us) |
 | Apple TV (AppleTV5,3 + 6,2) | Normal (PIN, one-time) | ✅ | ✅ | Needs SETPEERS + event channel + full anchor + BMCA yield (we follow ITS clock) — see DEVLOG Session 8 |
+| Denon AVR-X2700H | Transient | ⚠️ silent | ❌ | Licensed stack, AirTunes/366.0. `cn: 0,1` (no AAC) and `et: 0,4` (not AirPlay 2 encryption) — see DEVLOG session 24 |
+| macOS (AirPlay Receiver) | — | — | — | Answers 403 to Transient pair-setup; untested past that |
 | HomePod | — | — | — | Untested; expected same path as Apple TV |
 
 ---
@@ -313,3 +315,6 @@ that gets the AirPlay UI is the precondition.
 | Pool Room (Shairport Sync) | `Shairport Sync` | — | ✅ 192.168.1.106:7000 | Software receiver on LAN; PTP + AAC + Transient |
 | Living Room | `AppleTV5,3` | — | ✅ 192.168.1.64:7000 | Apple TV HD; AirTunes/670.5.1; Normal pairing ✅ |
 | test | `AppleTV6,2` | — | ✅ 192.168.1.152:7000 | Apple TV 4K; AirTunes/870.14.1; full streaming ✅ |
+| Living Room | `AppleTV14,1` | `0x3C175FDE4A7FDFD5` | ✅ 192.168.1.165:7000 | Apple TV 4K (3rd gen); AirTunes/980.77.2; Normal pairing ✅ |
+| Denon Amp | `Denon AVR-X2700H` | `0x0801C340445F8A00` | ✅ 192.168.1.100:7000 | AirTunes/366.0; MFi bit 26; control plane ✅, audio ❌ |
+| Antoine's MacBook Air | `MacBookAir10,1` | `0x38174FDE4A7FCFD5` | ✅ 192.168.1.55:7000 | AirPlay Receiver; 403 to Transient; also the reference *sender* |

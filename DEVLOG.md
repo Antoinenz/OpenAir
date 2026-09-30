@@ -4,6 +4,107 @@
 
 ---
 
+## 2026-09-29 — Session 24: a Denon AVR, and two TXT fields we never parsed
+
+First test against a licensed third-party receiver. It found more in an
+afternoon than the Apple TV has in months, which is the argument for owning
+one.
+
+**Device:** Denon AVR-X2700H, `Server: AirTunes/366.0`, features
+`0x0801C340445F8A00`. For comparison the Apple TV 4K reports `870.14.1` and
+the MacBook `980.77.5` — the amp runs a much older licensed stack.
+
+### The symptom, and what it was not
+
+The amp pairs, agrees a SETUP, takes metadata, **displays album art** — and
+plays nothing. No error anywhere. Buffered AAC additionally stops being read
+~9 s in, so our send queue fills, we declare the receiver stalled, and it
+resets the connection.
+
+Two false leads worth recording, because both looked convincing:
+
+- **Rapid re-anchoring.** Three full `SETRATEANCHORTIME`s in 1.3 s preceded
+  one failure. Eliminated by the other run, which had none and failed
+  identically at the same point.
+- **A dry capture source.** Every early session was silence-padded — first
+  because of RDP's "Remote Audio" device, then because nothing was playing on
+  the PC at all. Real, and it cost three sessions, but not this. `openair
+  tone`, which generates a sine and cannot run dry, fails the same way.
+
+`tone` also split the failure in two: **realtime ALAC runs clean for 32 s with
+zero warnings, and buffered AAC stalls at 9 s.** The picker had been hiding
+that, because `start_at_picker` forces buffered.
+
+### What actually explains it
+
+An open issue on AirSend — a GPL-3.0 sibling project — from a Denon
+AVC-X4800H owner includes the mDNS TXT records. Same feature bits, same
+`vs 366.0`. Its `_raop._tcp` record carries the answer:
+
+```
+cn: 0,1     compression: PCM and ALAC. No AAC.
+et: 0,4     encryption: none, or MFi-derived. Not AirPlay 2's own.
+```
+
+- **`cn: 0,1` explains the buffered stall.** The amp cannot decode AAC at all.
+  It agrees to `type: 103` in SETUP and then cannot use it. Nothing to do with
+  backpressure or pacing.
+- **`et: 0,4` explains the silence.** We encrypt realtime audio with
+  ChaCha20-Poly1305 keyed by the random `shk` we hand over in SETUP. That is
+  AirPlay 2's native scheme and right for every Apple receiver. This amp
+  implements neither — only unencrypted, or a key derived from MFi
+  `/auth-setup`. Our payload is noise to it, so it renders nothing and has
+  nothing to complain about.
+
+**Both fields live in the `_raop._tcp` record, which we skip for lacking
+feature bit 9.** We discard the only advertisement of what a receiver can
+actually decode and decrypt. That is the real gap this session found.
+
+### Bit 26 was parsed and ignored for months
+
+`Features::needs_auth_setup()` has existed since session 1 with **not one
+caller**. The bit was documented in this file and in the protocol reference as
+needing `/auth-setup`, and never wired up. The Denon is the only receiver here
+that sets it.
+
+Now implemented. Worth stating plainly because it reads like a FairPlay
+problem and is not: **only the receiver proves anything in `/auth-setup`.** It
+answers with its MFi certificate and a signature over our ephemeral X25519
+key. The sender needs no MFi credential, so the exchange is implementable in
+the open. The amp accepted ours and returned 1076 bytes.
+
+It did not make it audible. Necessary, evidently not sufficient.
+
+### Unverified
+
+The plaintext-audio path is behind `OPENAIR_PLAINTEXT_AUDIO`, untested against
+the amp as of this entry. If it works, the real fix is to parse `et` and decide
+per receiver rather than by env var. If it does not, the next suspect is `et:
+4` proper — deriving the audio key from the auth-setup exchange, whose 1076-byte
+response we currently discard.
+
+### Diagnostics built, and why
+
+Two tools that should have existed already:
+
+- **`openair discover`** prints model, AirTunes version, device id and decoded
+  feature bits. The features hex is what a receiver bug report is diagnosed
+  against, and the only way to see it was to read a debug log. Its first run
+  found bit 26.
+- **Both sides of every plist exchange** are now logged. We recorded
+  `plist response body bytes=104` and threw away the contents — so what a
+  receiver *granted* went unrecorded. That is what stalled this diagnosis.
+
+### Ranking receivers by strictness, confirmed
+
+Shairport Sync is reverse-engineered and tolerant. Apple's own receivers are
+strict but only ever tested against Apple's sender. A licensed third-party
+receiver runs Apple's state machine *without* Apple's freedom to special-case
+its own sender — and advertises its real limits in a record we were ignoring.
+"It only has to play music, it won't be fussy" was exactly backwards.
+
+---
+
 ## 2026-08-25 — Session 23: a bug-hunting pass, and one finding I got wrong
 
 No feature work. A read of the codebase looking for defects, six found, six
